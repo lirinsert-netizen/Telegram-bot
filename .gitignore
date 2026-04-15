@@ -1,0 +1,31 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Secrets and environment variables
+.env
+
+# Telethon session files (contain authentication credentials!)
+*.session
+*.session-journal
+
+# Runtime data directory (databases, JSON data — lives only on the server)
+telegram-bot2/data/*.json
+telegram-bot2/data/*.sqlite3
+telegram-bot2/data/*.sqlite3-shm
+telegram-bot2/data/*.sqlite3-wal
+telegram-bot2/data/*.session
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
