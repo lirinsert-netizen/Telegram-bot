@@ -22,10 +22,7 @@ main.py — Точка входа бота.
   handlers      — group stats UI, approve/deny_group, my_chat_member,
                     главный callback_handler, all_other (ДОЛЖЕН БЫТЬ ПОСЛЕДНИМ)
 
-Режимы запуска (переменная MODE):
-  webhook  — HTTP-сервер принимает апдейты от Telegram (по умолчанию).
-             Требует задать WEBHOOK_URL. Для локальной отладки используйте ngrok.
-  polling  — long polling (fallback, удобен для отладки без публичного URL).
+Режим запуска: long polling (infinity_polling).
 
 Клоны (IS_CLONE=1):
   Клон — отдельный процесс/контейнер с тем же кодом.
@@ -53,7 +50,7 @@ import settings_ui  # noqa: F401
 import antispam     # noqa: F401
 import banned_words  # noqa: F401
 
-from config import bot, IS_CLONE, MODE, get_bot_me
+from config import bot, IS_CLONE, get_bot_me
 
 if not IS_CLONE:
     import clones   # noqa: F401  — команды /clones, /clone_register и т.д.
@@ -63,7 +60,7 @@ import handlers     # noqa: F401  — all_other ДОЛЖЕН БЫТЬ ПОСЛЕ
 
 def _start_clone_disable_watcher(my_bot_id: int) -> None:
     """Фоновый тред клона: каждые 10 с проверяет статус в реестре.
-    Если статус «disabled» — останавливает бота (polling или webhook).
+    Если статус «disabled» — останавливает бота.
     """
     import threading
     import time
@@ -82,11 +79,7 @@ def _start_clone_disable_watcher(my_bot_id: int) -> None:
                         continue
                     if eid == my_bot_id and entry.get("status") == "disabled":
                         logger.info("[CLONE] Статус «disabled» — останавливаю бота.")
-                        if MODE == "webhook":
-                            from webhook import request_shutdown
-                            request_shutdown()
-                        else:
-                            bot.stop_polling()
+                        bot.stop_polling()
                         return
             except Exception as e:
                 logger.warning("[CLONE WATCHER] Ошибка проверки статуса: %s", e)
@@ -96,7 +89,7 @@ def _start_clone_disable_watcher(my_bot_id: int) -> None:
 
 if __name__ == "__main__":
     mode_label = "клон" if IS_CLONE else "основной"
-    logger.info("Запуск бота (%s), режим=%s…", mode_label, MODE)
+    logger.info("Запуск бота (%s), режим=polling…", mode_label)
 
     if IS_CLONE:
         from config import CLONES_FILE
@@ -128,18 +121,6 @@ if __name__ == "__main__":
         # Основной бот: запускаем все зарегистрированные клоны.
         clones.autostart_clones()
 
-    if MODE == "webhook":
-        from webhook import setup_webhook, run_webhook_server, delete_webhook
-        import atexit
-
-        try:
-            setup_webhook()
-        except Exception as _setup_exc:
-            logger.error("[Webhook] Не удалось зарегистрировать webhook: %s", _setup_exc)
-            sys.exit(1)
-        atexit.register(delete_webhook)
-        run_webhook_server()
-    else:
-        logger.info("[Polling] Запуск long polling…")
-        bot.infinity_polling(timeout=60, long_polling_timeout=60)
+    logger.info("[Polling] Запуск long polling…")
+    bot.infinity_polling(timeout=60, long_polling_timeout=60)
 
