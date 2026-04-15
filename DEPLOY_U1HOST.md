@@ -33,6 +33,7 @@ nano /opt/telegram-bot2/.env
 - `API_ID`
 - `API_HASH`
 - `OWNER_USERNAME`
+- `WEBHOOK_URL` — публичный HTTPS-URL бота (например, `https://my-bot.example.com`)
 
 Обычно можно оставить как есть:
 - `DATA_DIR=/opt/telegram-bot2/data`

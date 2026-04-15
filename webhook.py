@@ -147,34 +147,27 @@ def delete_webhook() -> None:
 def run_webhook_server() -> None:
     """Запустить Flask-сервер (блокирующий вызов).
 
-    Проверяет флаг _shutdown_event каждые 0.5 с; как только флаг выставлен —
-    выходит (используется clone-disable watcher).
-    Werkzeug запускается в daemon-треде, чтобы основной поток мог следить
-    за флагом остановки.
+    Использует werkzeug.serving.make_server, чтобы сервер работал
+    в главном потоке (без проблем с регистрацией сигналов).
+    Фоновый тред следит за _shutdown_event и останавливает сервер.
     """
+    from werkzeug.serving import make_server
+
     logger.info(
         "[Webhook] Запуск HTTP-сервера на %s:%s (путь %s)",
         config.HOST, config.PORT, config.WEBHOOK_PATH,
     )
 
-    server_thread = threading.Thread(
-        target=_flask_app.run,
-        kwargs={
-            "host": config.HOST,
-            "port": config.PORT,
-            "debug": False,
-            "use_reloader": False,
-            "threaded": True,
-        },
-        daemon=True,
-        name="webhook-flask",
-    )
-    server_thread.start()
+    srv = make_server(config.HOST, config.PORT, _flask_app, threaded=True)
 
-    # Ждём либо сигнала остановки, либо завершения потока сервера.
-    while not _shutdown_event.is_set():
-        server_thread.join(timeout=0.5)
-        if not server_thread.is_alive():
-            break
+    def _shutdown_watcher() -> None:
+        _shutdown_event.wait()
+        logger.info("[Webhook] Остановка HTTP-сервера…")
+        srv.shutdown()
 
+    threading.Thread(
+        target=_shutdown_watcher, daemon=True, name="webhook-shutdown-watcher"
+    ).start()
+
+    srv.serve_forever()
     logger.info("[Webhook] HTTP-сервер остановлен.")
