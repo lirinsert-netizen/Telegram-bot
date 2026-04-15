@@ -81,28 +81,6 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # Основные функции (модерация, статистика, настройки) работают у всех ботов.
 IS_CLONE: bool = os.getenv("IS_CLONE", "0").strip() in {"1", "true", "yes", "on"}
 
-# ==== WEBHOOK / POLLING MODE ====
-# MODE=webhook (по умолчанию) — принимает апдейты через HTTP webhook.
-# MODE=polling                — legacy long polling (для локальной отладки без ngrok).
-MODE: str = os.getenv("MODE", "webhook").strip().lower()
-
-# Полный публичный HTTPS URL, по которому Telegram будет слать апдейты.
-# Пример: https://my-bot.example.com
-WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "").strip()
-
-# Путь эндпоинта (без домена).
-WEBHOOK_PATH: str = os.getenv("WEBHOOK_PATH", "/telegram/webhook").strip()
-
-# Секретный токен для заголовка X-Telegram-Bot-Api-Secret-Token.
-# Рекомендуется задавать в prod. В dev можно оставить пустым (проверка пропускается).
-WEBHOOK_SECRET_TOKEN: str = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
-
-# Порт HTTP-сервера (используется в webhook-режиме).
-PORT: int = int(os.getenv("PORT", "8000"))
-
-# Адрес, на котором слушает HTTP-сервер.
-HOST: str = os.getenv("HOST", "0.0.0.0").strip()
-
 BOT_THREADS = max(2, int(os.getenv("BOT_THREADS", "16")))
 DB_FLUSH_INTERVAL_SECONDS = max(1, int(os.getenv("DB_FLUSH_INTERVAL_SECONDS", "5")))
 GLOBAL_LAST_SEEN_UPDATE_SECONDS = max(15, int(os.getenv("GLOBAL_LAST_SEEN_UPDATE_SECONDS", "60")))
