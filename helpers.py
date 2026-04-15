@@ -2706,15 +2706,17 @@ _STAT_BG_QUEUE: _stat_queue.Queue = _stat_queue.Queue(maxsize=2000)
 def _stat_bg_worker() -> None:
     while True:
         try:
-            msg = _STAT_BG_QUEUE.get(timeout=5)
+            msg = _STAT_BG_QUEUE.get(block=True, timeout=30)
         except _stat_queue.Empty:
             continue
         try:
+            user = msg.from_user
             update_group_stats(msg)
-            update_user_in_chat(msg.chat, msg.from_user)
-            update_global_user_from_telebot(msg.from_user)
-        except Exception:
-            pass
+            if user:
+                update_user_in_chat(msg.chat, user)
+                update_global_user_from_telebot(user)
+        except Exception as e:
+            print(f"[stat-bg] Ошибка обработки статистики: {e}")
         finally:
             _STAT_BG_QUEUE.task_done()
 
@@ -2737,10 +2739,11 @@ def add_stat_message(message: types.Message):
         # Очередь переполнена под экстремальной нагрузкой — делаем синхронно
         try:
             update_group_stats(message)
-            update_user_in_chat(message.chat, user)
-            update_global_user_from_telebot(user)
-        except Exception:
-            pass
+            if user:
+                update_user_in_chat(message.chat, user)
+                update_global_user_from_telebot(user)
+        except Exception as e:
+            print(f"[stat-bg] Ошибка синхронной статистики: {e}")
 
 def add_stat_command(cmd: str):
     STATS['commands_used'][cmd] = STATS['commands_used'].get(cmd, 0) + 1
