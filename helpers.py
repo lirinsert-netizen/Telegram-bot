@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 import threading
 import asyncio
+import queue as _stat_queue
 
 from config import (
     os, json, re, _re, _html, random, psutil,
@@ -545,8 +546,76 @@ def notify_dev_about_new_group(chat_id: int, chat_title: str, adder_user: types.
             parse_mode='HTML',
             reply_markup=keyboard
         )
+        # Помечаем что уведомление успешно доставлено
+        cid = str(chat_id)
+        if cid in PENDING_GROUPS:
+            PENDING_GROUPS[cid]["notified"] = True
+            save_pending_groups()
     except Exception as e:
         print(f"[ERROR] Не удалось отправить сообщение разработчику: {e}")
+
+
+def resend_pending_group_notifications() -> int:
+    """Переотправляет уведомления об одобрении для групп, где первая попытка провалилась.
+
+    Вызывается когда владелец пишет /start боту — так он гарантированно получает
+    все пропущенные уведомления, даже если при добавлении бота в группу владелец
+    ещё не открывал ЛС с этим ботом.
+
+    Возвращает количество успешно отправленных уведомлений.
+    """
+    owner_id = _resolve_owner_user_id()
+    if not owner_id:
+        return 0
+
+    emoji_new = f'<tg-emoji emoji-id="{EMOJI_NEW_MSG_OWNER_ID}">📨</tg-emoji>'
+    sent = 0
+
+    for cid, info in list(PENDING_GROUPS.items()):
+        if info.get("notified"):
+            continue  # уведомление уже было доставлено
+        try:
+            chat_id = int(cid)
+        except (ValueError, TypeError):
+            continue
+
+        title = info.get("title") or "Без названия"
+        adder_id = info.get("adder_id") or 0
+        adder_username = info.get("adder_username") or ""
+        added_at = info.get("added_at") or 0
+
+        adder_name = f"@{adder_username}" if (adder_username and adder_username != "unknown") else f"ID {adder_id}"
+        time_str = (
+            datetime.fromtimestamp(added_at).strftime('%d.%m.%Y %H:%M:%S')
+            if added_at else "—"
+        )
+
+        text = (
+            f"<b>{emoji_new} Новая группа для одобрения</b>\n\n"
+            f"<b>Группа:</b> {_html.escape(title)}\n"
+            f"<b>ID:</b> <code>{chat_id}</code>\n"
+            f"<b>Добавил:</b> {_html.escape(adder_name)} (ID: {adder_id})\n"
+            f"<b>Время добавления:</b> {time_str}\n\n"
+            f"<i>Выберите действие ниже.</i>"
+        )
+
+        keyboard = types.InlineKeyboardMarkup()
+        btn_approve = types.InlineKeyboardButton("Разрешить", callback_data=f"approve_group:{chat_id}")
+        btn_approve.icon_custom_emoji_id = str(EMOJI_SENT_OK_ID)
+        btn_deny = types.InlineKeyboardButton("Запретить", callback_data=f"deny_group:{chat_id}")
+        btn_deny.icon_custom_emoji_id = str(EMOJI_ROLE_SETTINGS_CANCEL_ID)
+        keyboard.add(btn_approve, btn_deny)
+
+        try:
+            bot.send_message(owner_id, text, parse_mode='HTML', reply_markup=keyboard)
+            info["notified"] = True
+            sent += 1
+        except Exception:
+            break  # не можем достучаться до владельца — прерываем, не спамим
+
+    if sent:
+        save_pending_groups()
+    return sent
 
 # ==== ПАРСИНГ ВРЕМЕНИ ДЛЯ /closechat ==== 
 
@@ -2627,17 +2696,51 @@ def get_operation_queue_stats() -> dict[str, int]:
 
 # ==== СТАТИСТИКА БОТА ====
 
+# ── Фоновый воркер для тяжёлых DB-записей (group_stats, users, global_users) ─
+# Держим одну очередь и один daemon-поток, чтобы не блокировать handler-потоки
+# при каждом входящем сообщении.
+
+_STAT_BG_QUEUE: _stat_queue.Queue = _stat_queue.Queue(maxsize=2000)
+
+
+def _stat_bg_worker() -> None:
+    while True:
+        try:
+            msg = _STAT_BG_QUEUE.get(timeout=5)
+        except _stat_queue.Empty:
+            continue
+        try:
+            update_group_stats(msg)
+            update_user_in_chat(msg.chat, msg.from_user)
+            update_global_user_from_telebot(msg.from_user)
+        except Exception:
+            pass
+        finally:
+            _STAT_BG_QUEUE.task_done()
+
+
+threading.Thread(target=_stat_bg_worker, daemon=True, name="stat-bg").start()
+
 
 def add_stat_message(message: types.Message):
+    user = message.from_user
     STATS['messages'] += 1
-    STATS['users'].add(message.from_user.id)
+    # from_user бывает None для анонимных/сервисных сообщений — не падаем
+    if user:
+        STATS['users'].add(user.id)
     STATS['chats'].add(message.chat.id)
-    _remember_owner_user_id(message.from_user)
-    update_group_stats(message)
-    # обновляем БД пользователей по чатам
-    update_user_in_chat(message.chat, message.from_user)
-    # обновляем глобальную БД пользователей
-    update_global_user_from_telebot(message.from_user)
+    _remember_owner_user_id(user)
+    # Тяжёлые DB-записи откладываем в фоновый поток
+    try:
+        _STAT_BG_QUEUE.put_nowait(message)
+    except _stat_queue.Full:
+        # Очередь переполнена под экстремальной нагрузкой — делаем синхронно
+        try:
+            update_group_stats(message)
+            update_user_in_chat(message.chat, user)
+            update_global_user_from_telebot(user)
+        except Exception:
+            pass
 
 def add_stat_command(cmd: str):
     STATS['commands_used'][cmd] = STATS['commands_used'].get(cmd, 0) + 1

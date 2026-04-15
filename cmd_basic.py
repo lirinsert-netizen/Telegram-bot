@@ -105,7 +105,7 @@ def _invalidate_profile_cache(chat_id: int, user_id: int) -> None:
 _PROFILE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="profile")
 
 
-def _build_start_home_keyboard(show_owner_button: bool = False) -> types.InlineKeyboardMarkup:
+def _build_start_home_keyboard(show_owner_button: bool = False, pending_count: int = 0) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup()
     kb.row(
         types.InlineKeyboardButton("Команды", callback_data="start:commands"),
@@ -113,6 +113,11 @@ def _build_start_home_keyboard(show_owner_button: bool = False) -> types.InlineK
     )
     kb.row(types.InlineKeyboardButton("Связь с разработчиком", callback_data="start:contact"))
     if show_owner_button:
+        if pending_count > 0:
+            btn_pending = types.InlineKeyboardButton(
+                f"⏳ Ожидают одобрения ({pending_count})", callback_data="start:pending"
+            )
+            kb.row(btn_pending)
         btn_new = types.InlineKeyboardButton("Новые сообщения", callback_data="start:newmsgs")
         btn_new.icon_custom_emoji_id = EMOJI_NEW_MSG_OWNER_ID
         kb.row(btn_new)
@@ -641,13 +646,17 @@ def _sendpm_reply_keyboard() -> types.InlineKeyboardMarkup:
 
 def _send_start_menu(chat_id: int, user: telebot.types.User):
     show_owner_button = is_owner(user)
+    pending_count = len(PENDING_GROUPS) if show_owner_button else 0
 
     sent = bot.send_message(
         chat_id,
         _build_start_home_text(user),
         parse_mode='HTML',
         disable_web_page_preview=True,
-        reply_markup=_build_start_home_keyboard(show_owner_button=show_owner_button),
+        reply_markup=_build_start_home_keyboard(
+            show_owner_button=show_owner_button,
+            pending_count=pending_count,
+        ),
     )
 
     START_MENU_STATE[(chat_id, sent.message_id)] = {
@@ -663,6 +672,10 @@ def cmd_start(m: types.Message):
 
     if m.chat.type != 'private':
         return
+
+    # Когда владелец пишет /start — переотправляем пропущенные уведомления о группах
+    if is_owner(m.from_user):
+        resend_pending_group_notifications()
 
     _send_start_menu(m.chat.id, m.from_user)
 

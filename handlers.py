@@ -1757,7 +1757,8 @@ def callback_handler(call: types.CallbackQuery):
 
         if data == 'start:home':
             text = _build_start_home_text(call.from_user)
-            kb = _build_start_home_keyboard(show_owner_button=show_owner_button)
+            pending_count = len(PENDING_GROUPS) if show_owner_button else 0
+            kb = _build_start_home_keyboard(show_owner_button=show_owner_button, pending_count=pending_count)
         elif data == 'start:commands':
             text = _build_start_commands_text(call.from_user)
             kb = _build_start_commands_keyboard()
@@ -1816,6 +1817,39 @@ def callback_handler(call: types.CallbackQuery):
 
         _show_dev_contact_new_messages(call.from_user.id)
         return bot.answer_callback_query(call.id, "Отправляю новые сообщения…", show_alert=False)
+
+    if data == 'start:pending':
+        state = START_MENU_STATE.get((chat_id, msg_id))
+        if not state:
+            return bot.answer_callback_query(call.id, "Меню устарело, открой /start заново.", show_alert=False)
+
+        owner_id_check = int(state.get('user_id') or 0)
+        if call.from_user.id != owner_id_check:
+            return bot.answer_callback_query(call.id, "Это меню не для вас.", show_alert=False)
+
+        if not is_owner(call.from_user):
+            return bot.answer_callback_query(call.id, "Кнопка доступна только разработчику.", show_alert=False)
+
+        count = len(PENDING_GROUPS)
+        if count == 0:
+            # Обновляем клавиатуру — убираем кнопку ожидания
+            show_owner_button = bool(state.get('show_owner_button'))
+            try:
+                bot.edit_message_reply_markup(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    reply_markup=_build_start_home_keyboard(show_owner_button=show_owner_button, pending_count=0),
+                )
+            except Exception:
+                pass
+            return bot.answer_callback_query(call.id, "Нет ожидающих групп.", show_alert=False)
+
+        resend_pending_group_notifications()
+        return bot.answer_callback_query(
+            call.id,
+            f"Отправляю уведомления для {count} групп…",
+            show_alert=False,
+        )
 
     bot.answer_callback_query(call.id)
 
