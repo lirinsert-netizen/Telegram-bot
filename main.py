@@ -35,6 +35,13 @@ main.py — Точка входа бота.
 from __future__ import annotations
 
 import logging
+import sys
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 import config       # noqa: F401
 import persistence  # noqa: F401 — при импорте подключается кеш get_chat(user_id)
@@ -52,13 +59,6 @@ if not IS_CLONE:
     import clones   # noqa: F401  — команды /clones, /clone_register и т.д.
 
 import handlers     # noqa: F401  — all_other ДОЛЖЕН БЫТЬ ПОСЛЕДНИМ
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-logger = logging.getLogger(__name__)
 
 
 def _start_clone_disable_watcher(my_bot_id: int) -> None:
@@ -99,7 +99,6 @@ if __name__ == "__main__":
     logger.info("Запуск бота (%s), режим=%s…", mode_label, MODE)
 
     if IS_CLONE:
-        import sys
         from config import CLONES_FILE
         from persistence import load_json_file
 
@@ -133,7 +132,11 @@ if __name__ == "__main__":
         from webhook import setup_webhook, run_webhook_server, delete_webhook
         import atexit
 
-        setup_webhook()
+        try:
+            setup_webhook()
+        except Exception as _setup_exc:
+            logger.error("[Webhook] Не удалось зарегистрировать webhook: %s", _setup_exc)
+            sys.exit(1)
         atexit.register(delete_webhook)
         run_webhook_server()
     else:
