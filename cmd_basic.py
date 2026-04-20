@@ -2242,7 +2242,7 @@ def _change_rank(
         if actor_rank <= target_rank:
             return "Вы не можете изменить должность этого пользователя (его должность не ниже вашей)."
 
-    if (delta is None) == (set_rank is None):
+    if not ((delta is None) ^ (set_rank is None)):
         return "Внутренняя ошибка изменения должности."
 
     # 5) считаем новый ранг
@@ -2757,9 +2757,11 @@ def cmd_inactive_users(m: types.Message):
             disable_web_page_preview=True,
         )
 
-    def _inactive_sort_key(row: tuple[float, int, str, str]) -> tuple[float, int]:
+    def _inactive_sort_key(row: tuple[float, int, str, str]) -> tuple[int, float, int]:
         # last_seen=0 (нет данных) выводим первыми
-        return (row[0] if row[0] > 0 else -1, row[1])
+        if row[0] <= 0:
+            return (0, 0.0, row[1])
+        return (1, row[0], row[1])
 
     rows.sort(key=_inactive_sort_key)
     shown = rows[:limit]
