@@ -2251,7 +2251,7 @@ def _change_rank(
             new_rank = int(set_rank)
         except Exception:
             return "Указан некорректный ранг."
-        if new_rank < 0 or new_rank > 5:
+        if new_rank < 1 or new_rank > 5:
             return "Ранг должен быть числом от 1 до 5."
         if new_rank == target_rank:
             return "У пользователя уже эта должность."
@@ -2757,7 +2757,11 @@ def cmd_inactive_users(m: types.Message):
             disable_web_page_preview=True,
         )
 
-    rows.sort(key=lambda x: (x[0] if x[0] > 0 else -1, x[1]))
+    def _inactive_sort_key(row: tuple[float, int, str, str]) -> tuple[float, int]:
+        # last_seen=0 (нет данных) выводим первыми
+        return (row[0] if row[0] > 0 else -1, row[1])
+
+    rows.sort(key=_inactive_sort_key)
     shown = rows[:limit]
 
     lines = [
