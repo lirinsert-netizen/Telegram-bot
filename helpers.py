@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 import threading
 import asyncio
+import io
 
 from config import (
     os, json, re, _re, _html, random, psutil,
@@ -397,9 +398,23 @@ def schedulereopenchat(chatid: int, delayseconds: int):
             # Лог открытия (автоматическое)
             try:
                 me = get_bot_me()
+                try:
+                    chat = bot.get_chat(chatid)
+                    chat_title = _html.escape(chat.title or str(chatid))
+                    chat_link = f'<a href="https://t.me/c/{str(chat.id).lstrip("-100")}/0">{chat_title}</a> [<code>{chatid}</code>]'
+                except Exception:
+                    chat_link = f"<code>{chatid}</code>"
+                actor_name = _html.escape(me.first_name or me.username or "Бот")
+                actor_link = f'<a href="tg://user?id={me.id}">{actor_name}</a> [<code>{me.id}</code>]'
                 send_log_event(
                     chatid, "chat_opened",
-                    f"🔓 <b>Чат открыт</b> (автоматически по истечении срока)"
+                    "\n".join([
+                        "🔓 <b>#ОТКРЫТИЕ_ЧАТА</b>",
+                        f"<b>Группа:</b> {chat_link}",
+                        f"<b>Администратор:</b> {actor_link}",
+                        "<b>Источник:</b> автоматически по таймеру",
+                        f"#id{me.id} #id{abs(chatid)}",
+                    ])
                 )
             except Exception:
                 pass
@@ -2416,24 +2431,41 @@ def cmd_dbg_global_users(m: types.Message):
         return  # тихо игнорируем
 
     total = len(GLOBAL_USERS or {})
-    lines = [f"GLOBAL_USERS: всего {total} пользователей."]
+    lines = [f"GLOBAL_USERS: всего {total} пользователей.", ""]
 
     # покажем до 50 строк для примера
-    max_show = 50
+    max_show = 1000
     count = 0
-    for uid, data in (GLOBAL_USERS or {}).items():
-        username = data.get("username") or "-"
-        full_name = data.get("full_name") or (data.get("first_name") or "")
-        lines.append(f"{uid}: @{username} {full_name}")
+    def _uid_sort_key(item):
+        key = item[0]
+        try:
+            return int(key)
+        except Exception:
+            return 0
+
+    for uid, data in sorted((GLOBAL_USERS or {}).items(), key=_uid_sort_key):
+        username = (data.get("username") or "").strip()
+        full_name = (data.get("full_name") or (data.get("first_name") or "")).strip()
+        last_seen = int(float(data.get("last_seen") or 0))
+        uname = f"@{username}" if username else "-"
+        lines.append(f"{uid}\t{uname}\t{full_name}\tlast_seen={last_seen}")
         count += 1
         if count >= max_show:
             break
 
     if total > max_show:
+        lines.append("")
         lines.append(f"... и ещё {total - max_show} записей")
 
-    text = "\n".join(lines)
-    bot.reply_to(m, text[:4000])
+    payload = "\n".join(lines).encode("utf-8")
+    doc = io.BytesIO(payload)
+    doc.name = f"dbg_global_users_{int(time.time())}.txt"
+    bot.send_document(
+        m.chat.id,
+        doc,
+        caption=f"Экспорт GLOBAL_USERS: {total} записей.",
+        reply_to_message_id=m.message_id,
+    )
 
 @bot.message_handler(commands=['migrate_users_to_global'])
 def cmd_migrate_users_to_global(m: types.Message):

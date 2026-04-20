@@ -361,7 +361,7 @@ def _build_start_commands_text(user: telebot.types.User) -> str:
         f"• /taglist, /теглист, теглист ({legend_group_admin} | {legend_group_only})",
         f"• /settag, /removetag, /taglist ({legend_group_admin} | {legend_group_only})",
         f"• Список тегов, Выдать тег, Снять тег ({legend_group_admin} | {legend_group_only})",
-        f"• /staff, /ranks, /myrank, /promote, /demote ({legend_group_admin} | {legend_group_only})",
+        f"• /staff, /ranks, /myrank, /promote, /demote, /inactive ({legend_group_admin} | {legend_group_only})",
         f"• Повысить, Понизить, Админы ({legend_group_admin} | {legend_group_only})",
         f"• Наградить, Снять награду, Снять все награды ({legend_group_admin} | {legend_group_only})",
         f"• +Описание, -Описание ({legend_group_admin} | {legend_group_only})",
@@ -425,7 +425,8 @@ def _build_start_usage_text() -> str:
         "EN: <code>m</code>, <code>h</code>, <code>d</code>, <code>w</code>, <code>mou</code>, <code>y</code></blockquote>\n"
         "5. Команды модерации работают только в группе и требуют прав у вашей должности.\n"
         "6. Приветствия, правила, очистка, лимит предупреждений и права ролей настраиваются через <code>/settings</code>.\n"
-        "7. Если команда не сработала, проверьте права должности и права бота в чате."
+        "7. Повышение можно выдать на конкретный ранг: <code>/promote @username 5</code> или <code>Повысить @username 5</code>.\n"
+        "8. Если команда не сработала, проверьте права должности и права бота в чате."
     )
 
 
@@ -2190,7 +2191,13 @@ def cmd_removetag_text(m: types.Message):
 
 # ==== ДОЛЖНОСТИ: ПОВЫСИТЬ / ПОНИЗИТЬ ====
 
-def _change_rank(chat_id: int, actor: types.User, target_id: int, delta: int) -> str:
+def _change_rank(
+    chat_id: int,
+    actor: types.User,
+    target_id: int,
+    delta: int | None = None,
+    set_rank: int | None = None,
+) -> str:
     """
     Внутренний хелпер: изменить ранг target_id на +1 или -1
     с учётом ограничений.
@@ -2235,18 +2242,30 @@ def _change_rank(chat_id: int, actor: types.User, target_id: int, delta: int) ->
         if actor_rank <= target_rank:
             return "Вы не можете изменить должность этого пользователя (его должность не ниже вашей)."
 
-    # 5) доп. проверки по текущему рангу цели
-    if delta > 0:
-        # повышаем
-        if target_rank >= 5:
-            return "У этого пользователя уже максимальная должность."
-    else:
-        # понижаем
-        if target_rank <= 0:
-            return "У этого пользователя нет должности, которую можно понизить."
+    if (delta is None) == (set_rank is None):
+        return "Внутренняя ошибка изменения должности."
 
-    # 6) считаем новый ранг
-    new_rank = target_rank + delta
+    # 5) считаем новый ранг
+    if set_rank is not None:
+        try:
+            new_rank = int(set_rank)
+        except Exception:
+            return "Указан некорректный ранг."
+        if new_rank < 0 or new_rank > 5:
+            return "Ранг должен быть числом от 1 до 5."
+        if new_rank == target_rank:
+            return "У пользователя уже эта должность."
+    else:
+        if delta > 0:
+            # повышаем
+            if target_rank >= 5:
+                return "У этого пользователя уже максимальная должность."
+        else:
+            # понижаем
+            if target_rank <= 0:
+                return "У этого пользователя нет должности, которую можно понизить."
+
+        new_rank = target_rank + delta
 
     if is_real_owner_chat_actor:
         # настоящий владелец чата: может довести до 5, ниже 0 не опускаем
@@ -2293,6 +2312,35 @@ def _resolve_target_for_rank(m: types.Message) -> int | None:
     return None
 
 
+def _resolve_target_and_promote_rank(m: types.Message) -> tuple[int | None, int | None, bool]:
+    parts = m.text.split(maxsplit=1)
+    raw_after = parts[1] if len(parts) > 1 else ""
+    args = raw_after.split() if raw_after else []
+
+    target_id = _resolve_target_for_rank(m)
+    if not isinstance(target_id, int):
+        return None, None, False
+
+    rank_token: str | None = None
+    if m.reply_to_message:
+        if args:
+            rank_token = args[0]
+    else:
+        if len(args) >= 2:
+            rank_token = args[1]
+
+    if rank_token is None:
+        return target_id, None, False
+
+    if not rank_token.isdigit():
+        return target_id, None, True
+
+    rank_value = int(rank_token)
+    if rank_value < 1 or rank_value > 5:
+        return target_id, None, True
+    return target_id, rank_value, False
+
+
 @bot.message_handler(commands=['promote'])
 def cmd_promote(m: types.Message):
     add_stat_message(m)
@@ -2315,7 +2363,7 @@ def cmd_promote(m: types.Message):
             disable_web_page_preview=True
         )
 
-    target_id = _resolve_target_for_rank(m)
+    target_id, requested_rank, bad_rank = _resolve_target_and_promote_rank(m)
     if not isinstance(target_id, int):
         return bot.reply_to(
             m,
@@ -2323,8 +2371,27 @@ def cmd_promote(m: types.Message):
             parse_mode='HTML',
             disable_web_page_preview=True
         )
+    if bad_rank:
+        return bot.reply_to(
+            m,
+            premium_prefix("Укажи целевой ранг числом от 1 до 5. Пример: /promote @username 5"),
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
 
-    err = _change_rank(m.chat.id, m.from_user, target_id, +1)
+    current_rank = get_user_rank(m.chat.id, target_id)
+    if requested_rank is not None and requested_rank <= current_rank:
+        return bot.reply_to(
+            m,
+            premium_prefix("Для повышения укажи ранг выше текущего."),
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+
+    if requested_rank is None:
+        err = _change_rank(m.chat.id, m.from_user, target_id, delta=+1)
+    else:
+        err = _change_rank(m.chat.id, m.from_user, target_id, set_rank=requested_rank)
     if err:
         return bot.reply_to(
             m,
@@ -2339,13 +2406,16 @@ def cmd_promote(m: types.Message):
     name = link_for_user(m.chat.id, target_id)
     if rank_instr:
         text = (
-            f"{name} [<code>{target_id}</code>] <b>назначен</b> {rank_instr}.\n"
-            f"{rank_html}"
+            "<b>Повышение пользователя</b>\n"
+            f"<b>Пользователь:</b> {name} [<code>{target_id}</code>]\n"
+            f"<b>Новая должность:</b> {rank_html}\n"
+            f"<b>Статус:</b> назначен {rank_instr}."
         )
     else:
         text = (
-            f"{name} [<code>{target_id}</code>] теперь имеет должность:\n"
-            f"{rank_html}"
+            "<b>Повышение пользователя</b>\n"
+            f"<b>Пользователь:</b> {name} [<code>{target_id}</code>]\n"
+            f"<b>Новая должность:</b> {rank_html}"
         )
     bot.reply_to(m, text, parse_mode='HTML', disable_web_page_preview=True)
 
@@ -2526,6 +2596,193 @@ def cmd_staff_text(m: types.Message):
     fake = m
     fake.text = "/staff"
     cmd_staff(fake)
+
+
+INACTIVE_USERS_COOLDOWN_SECONDS = 30 * 60
+INACTIVE_USERS_DEFAULT_WINDOW_SECONDS = 30 * 24 * 60 * 60
+INACTIVE_USERS_DEFAULT_LIMIT = 25
+INACTIVE_USERS_MAX_LIMIT = 100
+
+
+def _parse_inactive_window(value: str) -> int | None:
+    token = (value or "").strip().lower()
+    if not token:
+        return None
+
+    if token.isdigit():
+        days = int(token)
+        if days <= 0:
+            return None
+        return days * 24 * 60 * 60
+
+    match = _re.match(r"^(\d+)\s*(m|h|d|w|mou|y|мин|м|ч|д|н|мес|г)$", token)
+    if not match:
+        return None
+
+    amount = int(match.group(1))
+    unit = match.group(2)
+    if amount <= 0:
+        return None
+
+    multipliers = {
+        "m": 60, "мин": 60, "м": 60,
+        "h": 60 * 60, "ч": 60 * 60,
+        "d": 24 * 60 * 60, "д": 24 * 60 * 60,
+        "w": 7 * 24 * 60 * 60, "н": 7 * 24 * 60 * 60,
+        "mou": 30 * 24 * 60 * 60, "мес": 30 * 24 * 60 * 60,
+        "y": 365 * 24 * 60 * 60, "г": 365 * 24 * 60 * 60,
+    }
+    sec = multipliers.get(unit)
+    if not sec:
+        return None
+    return amount * sec
+
+
+def _format_inactive_age(last_seen: float, now_ts: float) -> str:
+    if last_seen <= 0:
+        return "нет данных"
+
+    ago = int(max(0, now_ts - last_seen))
+    if ago < 60:
+        return "менее минуты назад"
+    if ago < 60 * 60:
+        return f"{ago // 60}м назад"
+    if ago < 24 * 60 * 60:
+        return f"{ago // (60 * 60)}ч назад"
+    if ago < 30 * 24 * 60 * 60:
+        return f"{ago // (24 * 60 * 60)}д назад"
+    if ago < 365 * 24 * 60 * 60:
+        return f"{ago // (30 * 24 * 60 * 60)}мес назад"
+    return f"{ago // (365 * 24 * 60 * 60)}г назад"
+
+
+def _format_inactive_window(seconds: int) -> str:
+    if seconds < 60 * 60:
+        return f"{max(1, seconds // 60)}м"
+    if seconds < 24 * 60 * 60:
+        return f"{seconds // (60 * 60)}ч"
+    if seconds < 30 * 24 * 60 * 60:
+        return f"{seconds // (24 * 60 * 60)}д"
+    if seconds < 365 * 24 * 60 * 60:
+        return f"{seconds // (30 * 24 * 60 * 60)}мес"
+    return f"{seconds // (365 * 24 * 60 * 60)}г"
+
+
+@bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'] and match_command_aliases(m.text, ['inactive', 'inactive_users', 'неактив', 'неактивные']))
+def cmd_inactive_users(m: types.Message):
+    add_stat_message(m)
+    _, cmd, _ = _extract_command_info(m)
+    add_stat_command(cmd or 'inactive')
+
+    if not (_is_special_actor(m.chat.id, m.from_user) or user_is_real_admin(m.chat.id, m.from_user.id)):
+        return bot.reply_to(
+            m,
+            premium_prefix("Команда доступна только администраторам чата."),
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+
+    if not is_owner(m.from_user):
+        wait_seconds = cooldown_hit('chat', int(m.chat.id), 'inactive_users', INACTIVE_USERS_COOLDOWN_SECONDS)
+        if wait_seconds > 0:
+            return reply_cooldown_message(m, wait_seconds, scope='chat', bucket=int(m.chat.id), action='inactive_users')
+
+    parts = (m.text or "").split()
+    args = parts[1:] if len(parts) > 1 else []
+    if len(args) > 2:
+        return bot.reply_to(
+            m,
+            premium_prefix("Использование: /inactive [порог_неактивности] [лимит]. Пример: /inactive 30d 50"),
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+
+    window_seconds = INACTIVE_USERS_DEFAULT_WINDOW_SECONDS
+    limit = INACTIVE_USERS_DEFAULT_LIMIT
+
+    if len(args) >= 1:
+        parsed = _parse_inactive_window(args[0])
+        if parsed is None:
+            return bot.reply_to(
+                m,
+                premium_prefix("Неверный порог неактивности. Примеры: 30, 14d, 12h, 45д, 2н."),
+                parse_mode='HTML',
+                disable_web_page_preview=True,
+            )
+        window_seconds = parsed
+
+    if len(args) >= 2:
+        if not args[1].isdigit():
+            return bot.reply_to(
+                m,
+                premium_prefix("Лимит должен быть числом от 1 до 100."),
+                parse_mode='HTML',
+                disable_web_page_preview=True,
+            )
+        limit = max(1, min(INACTIVE_USERS_MAX_LIMIT, int(args[1])))
+
+    chat_users = USERS.get(str(m.chat.id)) or {}
+    if not chat_users:
+        return bot.reply_to(
+            m,
+            premium_prefix("В этом чате пока нет данных по пользователям."),
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+
+    now_ts = time.time()
+    threshold_ts = now_ts - window_seconds
+    rows: list[tuple[float, int, str, str]] = []
+
+    for uid_s, data in chat_users.items():
+        try:
+            uid = int(uid_s)
+        except Exception:
+            continue
+
+        g = GLOBAL_USERS.get(uid_s) or {}
+        last_seen = float(g.get("last_seen") or 0)
+        if last_seen > threshold_ts:
+            continue
+
+        username = (g.get("username") or data.get("username") or "").strip()
+        full_name = (g.get("full_name") or data.get("full_name") or data.get("first_name") or "").strip()
+        rows.append((last_seen if last_seen > 0 else 0.0, uid, username, full_name))
+
+    if not rows:
+        return bot.reply_to(
+            m,
+            premium_prefix("Неактивных пользователей за выбранный период не найдено."),
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+
+    rows.sort(key=lambda x: (x[0] if x[0] > 0 else -1, x[1]))
+    shown = rows[:limit]
+
+    lines = [
+        "<b>Неактивные пользователи</b>",
+        f"<b>Чат:</b> {_html.escape(m.chat.title or str(m.chat.id))} [<code>{m.chat.id}</code>]",
+        f"<b>Порог неактивности:</b> {_format_inactive_window(window_seconds)}",
+        f"<b>Найдено:</b> <code>{len(rows)}</code> (показано: <code>{len(shown)}</code>)",
+        "",
+    ]
+
+    for idx, (last_seen, uid, username, full_name) in enumerate(shown, 1):
+        display = _html.escape(full_name or f"id{uid}")
+        if username:
+            display = f"@{_html.escape(username)} ({display})"
+        lines.append(
+            f"{idx}. {display} [<code>{uid}</code>] — <i>{_format_inactive_age(last_seen, now_ts)}</i>"
+        )
+
+    return bot.reply_to(
+        m,
+        "\n".join(lines),
+        parse_mode='HTML',
+        disable_web_page_preview=True,
+    )
+
 
 @bot.message_handler(commands=['myrank'])
 def cmd_myrank(m: types.Message):
@@ -2868,27 +3125,26 @@ def _send_chat_close_log(chatid: int, actor_id: int, durationseconds: int | None
         try:
             chat = bot.get_chat(chatid)
             chat_title = _html_mod.escape(chat.title or str(chatid))
+            chat_link = f'<a href="https://t.me/c/{str(chat.id).lstrip("-100")}/0">{chat_title}</a> [<code>{chatid}</code>]'
         except Exception:
-            chat_title = str(chatid)
+            chat_link = f"<code>{chatid}</code>"
         try:
             actor = bot.get_chat(actor_id)
             actor_name = _html_mod.escape(actor.first_name or str(actor_id))
-            actor_link = f'<a href="tg://user?id={actor_id}">{actor_name}</a>'
+            actor_link = f'<a href="tg://user?id={actor_id}">{actor_name}</a> [<code>{actor_id}</code>]'
         except Exception:
             actor_link = f"<code>{actor_id}</code>"
-        dur_text = ""
-        if durationseconds and durationseconds > 0:
-            dur_text = f"\nСрок: {format_closechat_duration_text(durationseconds)}"
         lines = [
-            "🔒 <b>Чат закрыт</b>",
-            f"Чат: <b>{chat_title}</b>",
-            f"Закрыл: {actor_link}",
+            "🔒 <b>#ЗАКРЫТИЕ_ЧАТА</b>",
+            f"<b>Группа:</b> {chat_link}",
+            f"<b>Администратор:</b> {actor_link}",
         ]
-        if dur_text:
-            lines.append(dur_text.strip())
+        if durationseconds and durationseconds > 0:
+            lines.append(f"<b>Срок:</b> {format_closechat_duration_text(durationseconds)}")
         from datetime import datetime as _dt
         import time as _time
-        lines.append(f"Время: {_dt.utcfromtimestamp(_time.time()).strftime('%Y-%m-%d %H:%M')} UTC")
+        lines.append(f"<b>Время:</b> {_dt.utcfromtimestamp(_time.time()).strftime('%Y-%m-%d %H:%M')} UTC")
+        lines.append(f"#id{actor_id} #id{abs(chatid)}")
         send_log_event(chatid, "chat_closed", "\n".join(lines))
     except Exception as e:
         print(f"[LOG CHAT CLOSE] {e}")
@@ -2901,21 +3157,23 @@ def _send_chat_open_log(chatid: int, actor_id: int) -> None:
         try:
             chat = bot.get_chat(chatid)
             chat_title = _html_mod.escape(chat.title or str(chatid))
+            chat_link = f'<a href="https://t.me/c/{str(chat.id).lstrip("-100")}/0">{chat_title}</a> [<code>{chatid}</code>]'
         except Exception:
-            chat_title = str(chatid)
+            chat_link = f"<code>{chatid}</code>"
         try:
             actor = bot.get_chat(actor_id)
             actor_name = _html_mod.escape(actor.first_name or str(actor_id))
-            actor_link = f'<a href="tg://user?id={actor_id}">{actor_name}</a>'
+            actor_link = f'<a href="tg://user?id={actor_id}">{actor_name}</a> [<code>{actor_id}</code>]'
         except Exception:
             actor_link = f"<code>{actor_id}</code>"
         from datetime import datetime as _dt
         import time as _time
         lines = [
-            "🔓 <b>Чат открыт</b>",
-            f"Чат: <b>{chat_title}</b>",
-            f"Открыл: {actor_link}",
-            f"Время: {_dt.utcfromtimestamp(_time.time()).strftime('%Y-%m-%d %H:%M')} UTC",
+            "🔓 <b>#ОТКРЫТИЕ_ЧАТА</b>",
+            f"<b>Группа:</b> {chat_link}",
+            f"<b>Администратор:</b> {actor_link}",
+            f"<b>Время:</b> {_dt.utcfromtimestamp(_time.time()).strftime('%Y-%m-%d %H:%M')} UTC",
+            f"#id{actor_id} #id{abs(chatid)}",
         ]
         send_log_event(chatid, "chat_opened", "\n".join(lines))
     except Exception as e:
@@ -3431,5 +3689,3 @@ def _kick_with_unban(chatid: int, actor: types.User, target_id: int, reason: str
 
 
 __all__ = [name for name in globals() if not name.startswith('__')]
-
-
