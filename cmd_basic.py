@@ -2641,6 +2641,8 @@ def _parse_inactive_window(value: str) -> int | None:
 def _format_inactive_age(last_seen: float, now_ts: float) -> str:
     if last_seen <= 0:
         return "нет данных"
+    if last_seen > now_ts:
+        return "дата активности некорректна"
 
     ago = int(max(0, now_ts - last_seen))
     if ago < 60:
@@ -2757,13 +2759,13 @@ def cmd_inactive_users(m: types.Message):
             disable_web_page_preview=True,
         )
 
-    def _inactive_sort_key(row: tuple[float, int, str, str]) -> tuple[int, float, int]:
+    def _sort_inactive_rows_by_last_seen(row: tuple[float, int, str, str]) -> tuple[int, float, int]:
         # last_seen=0 (нет данных) выводим первыми
         if row[0] <= 0:
             return (0, 0.0, row[1])
         return (1, row[0], row[1])
 
-    rows.sort(key=_inactive_sort_key)
+    rows.sort(key=_sort_inactive_rows_by_last_seen)
     shown = rows[:limit]
 
     lines = [
