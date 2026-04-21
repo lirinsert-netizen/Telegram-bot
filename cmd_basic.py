@@ -3594,6 +3594,8 @@ MUSIC_MAX_DURATION_SECONDS = 30 * 60
 MUSIC_MAX_FILE_SIZE_BYTES = 49 * 1024 * 1024
 MUSIC_SEARCH_COOLDOWN_SECONDS = 30
 MUSIC_DOWNLOAD_COOLDOWN_SECONDS = 15
+MUSIC_BUTTON_TITLE_MAX_LEN = 46
+MUSIC_BUTTON_TRUNCATE_TO = 43
 
 MUSIC_SEARCH_SOURCES: list[tuple[str, int, str, str]] = [
     ("ytsearch", 6, "YouTube", PREMIUM_MUSIC_YOUTUBE_EMOJI_ID),
@@ -3698,7 +3700,7 @@ def _music_build_results_keyboard(token: str, results: list[dict[str, Any]]) -> 
     for idx, item in enumerate(results):
         dur = _music_format_duration(_music_parse_duration(item.get("duration")))
         title = str(item.get("title") or "").strip()
-        short_title = title if len(title) <= 46 else (title[:43] + "…")
+        short_title = title if len(title) <= MUSIC_BUTTON_TITLE_MAX_LEN else (title[:MUSIC_BUTTON_TRUNCATE_TO] + "…")
         label = f"{short_title} ({dur})"
         btn = types.InlineKeyboardButton(label, callback_data=f"music:pick:{token}:{idx}")
         btn.icon_custom_emoji_id = str(item.get("source_emoji_id") or PREMIUM_MUSIC_SEARCH_EMOJI_ID)
@@ -3929,7 +3931,6 @@ def cb_music_actions(c: types.CallbackQuery):
     item = results[index]
     title = str(item.get("title") or "Без названия")
     url = str(item.get("url") or "").strip()
-    source = str(item.get("source") or "Источник")
     source_emoji_id = str(item.get("source_emoji_id") or PREMIUM_MUSIC_SEARCH_EMOJI_ID)
     if not url.startswith("http"):
         return bot.answer_callback_query(c.id, text="Некорректная ссылка результата.", show_alert=True)
