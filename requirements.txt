@@ -6,3 +6,4 @@ requests
 python-dotenv
 Pillow
 ujson
+yt-dlp==2026.3.17
