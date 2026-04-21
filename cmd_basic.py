@@ -35,6 +35,7 @@ from config import (
     EMOJI_ROLE_OWNER_ID, EMOJI_ROLE_CHIEF_ADMIN_ID, EMOJI_ROLE_ADMIN_ID,
     EMOJI_ROLE_MOD_ID, EMOJI_ROLE_TRAINEE_ID,
     EMOJI_USER_ROLE_TEXT_ID, EMOJI_ROLE_ACTION_ID,
+    EMOJI_ROLE_SETTINGS_CANCEL_ID,
     EMOJI_SCOPE_GROUP_ID, EMOJI_SCOPE_PM_ID, EMOJI_SCOPE_ALL_ID,
     EMOJI_LIST_ID, EMOJI_ADMIN_RIGHTS_ID, EMOJI_BTN_UNADMIN_ID, EMOJI_BTN_KICK_ID,
     EMOJI_PUNISHMENT_ID,
@@ -3618,10 +3619,17 @@ def cb_openchat_button(c: types.CallbackQuery):
 
 TIKTOK_REQUEST_TTL_SECONDS = 15 * 60
 TIKTOK_MAX_FILE_SIZE_BYTES = 49 * 1024 * 1024
+TIKTOK_AUDIO_METADATA_MAX_LEN = 128
+TIKTOK_URL_TRAILING_CHARS = "]})>,.!?:;\"'"
+TIKTOK_DEFAULT_AUDIO_TITLE = "TikTok audio"
+TIKTOK_DEFAULT_AUDIO_PERFORMER = "TikTok"
+DOWNLOAD_TOGGLE_NO_PERM_TEXT = (
+    "Недостаточно прав. Нужны права «Управление настройками группы», либо статус владельца чата, владельца бота или dev."
+)
 
-TIKTOK_REQUESTS_CACHE: dict[str, dict[str, Any]] = {}
-TIKTOK_REQUESTS_CACHE_LOCK = threading.Lock()
-_URL_RE = _re.compile(r"https?://[^\s<>()]+", _re.IGNORECASE)
+_TIKTOK_REQUESTS_CACHE: dict[str, dict[str, Any]] = {}
+_TIKTOK_REQUESTS_CACHE_LOCK = threading.Lock()
+_URL_PATTERN = _re.compile(r"https?://[^\s<>()]+", _re.IGNORECASE)
 
 
 def _is_tiktok_url(url: str) -> bool:
@@ -3630,8 +3638,13 @@ def _is_tiktok_url(url: str) -> bool:
     lowered = url.strip().lower()
     if not lowered.startswith(("http://", "https://")):
         return False
-    host = lowered.split("://", 1)[1].split("/", 1)[0].split("?", 1)[0]
+    parts = lowered.split("://", 1)
+    if len(parts) < 2 or not parts[1]:
+        return False
+    host = parts[1].split("/", 1)[0].split("?", 1)[0]
     host = host.split(":", 1)[0].lstrip().strip(".")
+    if not host:
+        return False
     if host.startswith("www."):
         host = host[4:]
     return host == "tiktok.com" or host.endswith(".tiktok.com")
@@ -3640,7 +3653,7 @@ def _is_tiktok_url(url: str) -> bool:
 def _extract_single_tiktok_url(text: str) -> str | None:
     if not text:
         return None
-    urls = [u.rstrip(").,!?:;]}>\"'") for u in _URL_RE.findall(text)]
+    urls = [u.rstrip(TIKTOK_URL_TRAILING_CHARS) for u in _URL_PATTERN.findall(text)]
     if len(urls) != 1:
         return None
     url = urls[0]
@@ -3651,21 +3664,21 @@ def _extract_single_tiktok_url(text: str) -> str | None:
 
 def _tiktok_cleanup_cache() -> None:
     now_ts = int(time.time())
-    with TIKTOK_REQUESTS_CACHE_LOCK:
+    with _TIKTOK_REQUESTS_CACHE_LOCK:
         stale_tokens = [
             token
-            for token, payload in TIKTOK_REQUESTS_CACHE.items()
+            for token, payload in _TIKTOK_REQUESTS_CACHE.items()
             if int(payload.get("expires_at", 0) or 0) <= now_ts
         ]
         for token in stale_tokens:
-            TIKTOK_REQUESTS_CACHE.pop(token, None)
+            _TIKTOK_REQUESTS_CACHE.pop(token, None)
 
 
 def _tiktok_store_request(chat_id: int, user: types.User, url: str, source_message_id: int | None) -> str:
     token = secrets.token_hex(8)
     _tiktok_cleanup_cache()
-    with TIKTOK_REQUESTS_CACHE_LOCK:
-        TIKTOK_REQUESTS_CACHE[token] = {
+    with _TIKTOK_REQUESTS_CACHE_LOCK:
+        _TIKTOK_REQUESTS_CACHE[token] = {
             "chat_id": int(chat_id),
             "user_id": int(user.id),
             "user_name": (user.full_name or user.first_name or user.username or "Пользователь"),
@@ -3679,26 +3692,26 @@ def _tiktok_store_request(chat_id: int, user: types.User, url: str, source_messa
 
 def _tiktok_get_request(token: str) -> dict[str, Any] | None:
     _tiktok_cleanup_cache()
-    with TIKTOK_REQUESTS_CACHE_LOCK:
-        payload = TIKTOK_REQUESTS_CACHE.get(token)
+    with _TIKTOK_REQUESTS_CACHE_LOCK:
+        payload = _TIKTOK_REQUESTS_CACHE.get(token)
         if not payload:
             return None
         if int(payload.get("expires_at", 0) or 0) <= int(time.time()):
-            TIKTOK_REQUESTS_CACHE.pop(token, None)
+            _TIKTOK_REQUESTS_CACHE.pop(token, None)
             return None
         return payload
 
 
 def _tiktok_take_request(token: str) -> dict[str, Any] | None:
     _tiktok_cleanup_cache()
-    with TIKTOK_REQUESTS_CACHE_LOCK:
-        payload = TIKTOK_REQUESTS_CACHE.get(token)
+    with _TIKTOK_REQUESTS_CACHE_LOCK:
+        payload = _TIKTOK_REQUESTS_CACHE.get(token)
         if not payload:
             return None
         if int(payload.get("expires_at", 0) or 0) <= int(time.time()):
-            TIKTOK_REQUESTS_CACHE.pop(token, None)
+            _TIKTOK_REQUESTS_CACHE.pop(token, None)
             return None
-        return TIKTOK_REQUESTS_CACHE.pop(token, None)
+        return _TIKTOK_REQUESTS_CACHE.pop(token, None)
 
 
 def _is_music_enabled(chat_id: int) -> bool:
@@ -3764,7 +3777,7 @@ def _tiktok_download_file(url: str, mode: str) -> tuple[str, dict[str, Any], str
         ffmpeg_path = shutil.which("ffmpeg")
         if not ffmpeg_path:
             shutil.rmtree(temp_dir, ignore_errors=True)
-            raise RuntimeError("На сервере не найден ffmpeg для подготовки звука.")
+            raise RuntimeError("На сервере не найден ffmpeg для подготовки звука. Обратитесь к администратору бота.")
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": os.path.join(temp_dir, "%(title)s [%(id)s].%(ext)s"),
@@ -3816,7 +3829,7 @@ def _tiktok_download_file(url: str, mode: str) -> tuple[str, dict[str, Any], str
                     file_path = candidate
                     break
         if not file_path:
-            raise RuntimeError("Не удалось подготовить файл для отправки.")
+            raise RuntimeError(f"Не удалось подготовить {'аудио' if mode == 'audio' else 'видео'} для отправки.")
         return file_path, (info or {}), temp_dir
 
 
@@ -3859,7 +3872,10 @@ def _run_tiktok_download_job(
 
         file_size = os.path.getsize(file_path)
         if file_size > TIKTOK_MAX_FILE_SIZE_BYTES:
-            raise RuntimeError("Файл слишком большой для отправки ботом.")
+            raise RuntimeError(
+                f"Файл слишком большой для отправки ботом (размер: {format_bytes_mb(file_size)}, "
+                f"максимум: {format_bytes_mb(TIKTOK_MAX_FILE_SIZE_BYTES)})."
+            )
 
         user_link = _tiktok_user_link_html(user_name, user_username)
         if mode == "video":
@@ -3888,8 +3904,8 @@ def _run_tiktok_download_job(
                 f'<tg-emoji emoji-id="{PREMIUM_TIKTOK_PROMPT_EMOJI_ID}">📥</tg-emoji> '
                 f'{user_link}, ваш звук.'
             )
-            title = (info.get("track") or info.get("title") or "TikTok audio").strip()
-            performer = (info.get("artist") or info.get("uploader") or "TikTok").strip()
+            title = str(info.get("track") or info.get("title") or TIKTOK_DEFAULT_AUDIO_TITLE).strip()
+            performer = str(info.get("artist") or info.get("uploader") or TIKTOK_DEFAULT_AUDIO_PERFORMER).strip()
             duration = _music_parse_duration(info.get("duration"))
 
             def _send_audio(reply_to_id: int | None):
@@ -3902,19 +3918,30 @@ def _run_tiktok_download_job(
                         audio_file,
                         caption=caption,
                         parse_mode='HTML',
-                        title=title[:128] if title else None,
-                        performer=performer[:128] if performer else None,
+                        title=title[:TIKTOK_AUDIO_METADATA_MAX_LEN] if title else None,
+                        performer=performer[:TIKTOK_AUDIO_METADATA_MAX_LEN] if performer else None,
                         duration=duration,
                         **kwargs,
                     )
 
             _send_with_optional_reply(_send_audio, source_message_id)
-    except Exception as e:
+    except RuntimeError as e:
         err_text = str(e) or "Не удалось выгрузить файл из TikTok."
         try:
             bot.send_message(
                 chat_id,
                 premium_prefix(_html.escape(err_text)),
+                parse_mode='HTML',
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning("[tiktok] download failed: %s", e)
+        try:
+            bot.send_message(
+                chat_id,
+                premium_prefix("Не удалось выгрузить файл из TikTok. Попробуйте другую ссылку."),
                 parse_mode='HTML',
                 disable_web_page_preview=True,
             )
@@ -3981,8 +4008,11 @@ def cb_tiktok_actions(c: types.CallbackQuery):
     if int(payload.get("user_id") or 0) != int(c.from_user.id):
         return bot.answer_callback_query(c.id, text="Кнопки доступны только автору ссылки.", show_alert=True)
 
+    if not c.message or not c.message.chat:
+        return bot.answer_callback_query(c.id)
+
     chat_id = int(payload.get("chat_id") or 0)
-    if chat_id and c.message and c.message.chat and c.message.chat.type in ("group", "supergroup"):
+    if chat_id and c.message.chat.type in ("group", "supergroup"):
         if not _is_tiktok_enabled(chat_id):
             return bot.answer_callback_query(c.id, text="Выгрузка TikTok отключена в этой группе.", show_alert=True)
 
@@ -3996,6 +4026,13 @@ def cb_tiktok_actions(c: types.CallbackQuery):
 
     if action not in {"video", "audio"}:
         return bot.answer_callback_query(c.id)
+
+    if action == "audio" and not shutil.which("ffmpeg"):
+        return bot.answer_callback_query(
+            c.id,
+            text="На сервере не найден ffmpeg для подготовки звука.",
+            show_alert=True,
+        )
 
     payload = _tiktok_take_request(token)
     if not payload:
@@ -4022,7 +4059,7 @@ def cb_tiktok_actions(c: types.CallbackQuery):
             str(payload.get("user_username") or ""),
         ),
         daemon=True,
-        name="tiktok-download",
+        name=f"tiktok-download-{token[:6]}",
     ).start()
 
 
@@ -4042,9 +4079,7 @@ def cmd_music_off(m: types.Message):
     if not _can_manage_download_toggles(m.chat.id, m.from_user):
         return bot.reply_to(
             m,
-            premium_prefix(
-                "Недостаточно прав. Нужны права «Управление настройками группы», либо статус владельца чата, владельца бота или dev."
-            ),
+            premium_prefix(DOWNLOAD_TOGGLE_NO_PERM_TEXT),
             parse_mode='HTML',
             disable_web_page_preview=True,
         )
@@ -4084,9 +4119,7 @@ def cmd_tiktok_off(m: types.Message):
     if not _can_manage_download_toggles(m.chat.id, m.from_user):
         return bot.reply_to(
             m,
-            premium_prefix(
-                "Недостаточно прав. Нужны права «Управление настройками группы», либо статус владельца чата, владельца бота или dev."
-            ),
+            premium_prefix(DOWNLOAD_TOGGLE_NO_PERM_TEXT),
             parse_mode='HTML',
             disable_web_page_preview=True,
         )
