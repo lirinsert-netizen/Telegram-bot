@@ -2409,23 +2409,16 @@ def cmd_promote(m: types.Message):
         )
 
     new_rank = get_user_rank(m.chat.id, target_id)
-    rank_html = get_rank_label_html(new_rank) or "без должности"
     rank_instr = get_rank_label_instrumental(new_rank)
+    rank_plain = get_rank_label_plain(new_rank)
     name = link_for_user(m.chat.id, target_id)
     if rank_instr:
-        text = (
-            "<b>Повышение пользователя</b>\n"
-            f"<b>Пользователь:</b> {name} [<code>{target_id}</code>]\n"
-            f"<b>Новая должность:</b> {rank_html}\n"
-            f"<b>Статус:</b> назначен {rank_instr}."
-        )
+        text = f"Пользователь {name} [<code>{target_id}</code>] назначен {rank_instr}."
     else:
-        text = (
-            "<b>Повышение пользователя</b>\n"
-            f"<b>Пользователь:</b> {name} [<code>{target_id}</code>]\n"
-            f"<b>Новая должность:</b> {rank_html}"
-        )
+        role_text = _html.escape((rank_plain or "должностью").lower())
+        text = f"Пользователь {name} [<code>{target_id}</code>] назначен {role_text}."
     bot.reply_to(m, text, parse_mode='HTML', disable_web_page_preview=True)
+    _send_role_change_log(m.chat.id, m.from_user.id, target_id, action="promote", new_rank=new_rank)
 
 
 @bot.message_handler(commands=['demote'])
@@ -2476,20 +2469,16 @@ def cmd_demote(m: types.Message):
             f"{name} [<code>{target_id}</code>] больше не имеет никакой должности."
         )
     else:
-        rank_html = get_rank_label_html(new_rank) or "без должности"
         rank_instr = get_rank_label_instrumental(new_rank)
+        rank_plain = get_rank_label_plain(new_rank)
         if rank_instr:
-            text = (
-                f"{name} [<code>{target_id}</code>] <b>назначен</b> {rank_instr}.\n"
-                f"{rank_html}"
-            )
+            text = f"Пользователь {name} [<code>{target_id}</code>] назначен {rank_instr}."
         else:
-            text = (
-                f"{name} [<code>{target_id}</code>] теперь имеет должность:\n"
-                f"{rank_html}"
-            )
+            role_text = _html.escape((rank_plain or "должностью").lower())
+            text = f"Пользователь {name} [<code>{target_id}</code>] назначен {role_text}."
 
     bot.reply_to(m, text, parse_mode='HTML', disable_web_page_preview=True)
+    _send_role_change_log(m.chat.id, m.from_user.id, target_id, action="demote", new_rank=new_rank)
 
 
 @bot.message_handler(func=lambda m: text_starts_with_ci(m.text, "повысить"))
@@ -3134,6 +3123,50 @@ def user_is_real_admin(chatid: int, userid: int) -> bool:
         return False
 
 
+def _send_role_change_log(chatid: int, actor_id: int, target_id: int, action: str, new_rank: int) -> None:
+    """Отправить лог повышения/понижения пользователя."""
+    try:
+        try:
+            chat = bot.get_chat(chatid)
+            chat_title = _html.escape(chat.title or str(chatid))
+            chat_link = f'<a href="https://t.me/c/{str(chat.id).lstrip("-100")}/0">{chat_title}</a> [<code>{chatid}</code>]'
+        except Exception:
+            chat_link = f"<code>{chatid}</code>"
+
+        try:
+            actor = bot.get_chat(actor_id)
+            actor_name = _html.escape(actor.first_name or str(actor_id))
+            actor_link = f'<a href="tg://user?id={actor_id}">{actor_name}</a> [<code>{actor_id}</code>]'
+        except Exception:
+            actor_link = f"<code>{actor_id}</code>"
+
+        try:
+            target = bot.get_chat(target_id)
+            target_name = _html.escape(target.first_name or str(target_id))
+            target_link = f'<a href="tg://user?id={target_id}">{target_name}</a> [<code>{target_id}</code>]'
+        except Exception:
+            target_link = f"<code>{target_id}</code>"
+
+        label = "#ПОВЫШЕНИЕ" if action == "promote" else "#ПОНИЖЕНИЕ"
+        rank_instr = get_rank_label_instrumental(new_rank)
+        if rank_instr:
+            role_line = f"<b>Новая должность:</b> {rank_instr}"
+        else:
+            role_line = "<b>Новая должность:</b> Без должности"
+
+        lines = [
+            f"<b>{label}</b>",
+            f"<b>Группа:</b> {chat_link}",
+            f"<b>Пользователь:</b> {target_link}",
+            f"<b>Администратор:</b> {actor_link}",
+            role_line,
+            f"#id{target_id} #id{abs(chatid)}",
+        ]
+        send_log_event(chatid, "role_change", "\n".join(lines))
+    except Exception as e:
+        print(f"[LOG ROLE CHANGE] {e}")
+
+
 def _send_chat_close_log(chatid: int, actor_id: int, durationseconds: int | None = None) -> None:
     """Отправить лог закрытия чата в лог-канал (если настроен)."""
     try:
@@ -3150,16 +3183,17 @@ def _send_chat_close_log(chatid: int, actor_id: int, durationseconds: int | None
             actor_link = f'<a href="tg://user?id={actor_id}">{actor_name}</a> [<code>{actor_id}</code>]'
         except Exception:
             actor_link = f"<code>{actor_id}</code>"
+        from moderation import _fmt_time
         lines = [
-            "🔒 <b>#ЗАКРЫТИЕ_ЧАТА</b>",
+            "<b>#ЗАКРЫТИЕ_ЧАТА</b>",
             f"<b>Группа:</b> {chat_link}",
             f"<b>Администратор:</b> {actor_link}",
         ]
         if durationseconds and durationseconds > 0:
-            lines.append(f"<b>Срок:</b> {format_closechat_duration_text(durationseconds)}")
-        from datetime import datetime as _dt
-        import time as _time
-        lines.append(f"<b>Время:</b> {_dt.utcfromtimestamp(_time.time()).strftime('%Y-%m-%d %H:%M')} UTC")
+            until_ts = int(time.time()) + int(durationseconds)
+            lines.append(f"<b>До:</b> {_fmt_time(until_ts)}")
+        else:
+            lines.append("<b>До:</b> Навсегда")
         lines.append(f"#id{actor_id} #id{abs(chatid)}")
         send_log_event(chatid, "chat_closed", "\n".join(lines))
     except Exception as e:
@@ -3182,13 +3216,10 @@ def _send_chat_open_log(chatid: int, actor_id: int) -> None:
             actor_link = f'<a href="tg://user?id={actor_id}">{actor_name}</a> [<code>{actor_id}</code>]'
         except Exception:
             actor_link = f"<code>{actor_id}</code>"
-        from datetime import datetime as _dt
-        import time as _time
         lines = [
-            "🔓 <b>#ОТКРЫТИЕ_ЧАТА</b>",
+            "<b>#ОТКРЫТИЕ_ЧАТА</b>",
             f"<b>Группа:</b> {chat_link}",
             f"<b>Администратор:</b> {actor_link}",
-            f"<b>Время:</b> {_dt.utcfromtimestamp(_time.time()).strftime('%Y-%m-%d %H:%M')} UTC",
             f"#id{actor_id} #id{abs(chatid)}",
         ]
         send_log_event(chatid, "chat_opened", "\n".join(lines))

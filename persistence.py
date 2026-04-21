@@ -937,7 +937,7 @@ LOG_CHANNEL_ALL_EVENTS: frozenset[str] = frozenset([
     "join", "leave",
     "antiflood", "antispam", "antiraid",
     "settings",
-    "verify", "role",
+    "verify", "role", "role_change",
     "manual_punish",
 ])
 

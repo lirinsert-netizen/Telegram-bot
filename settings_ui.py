@@ -2553,6 +2553,7 @@ LOG_CHANNEL_EVENT_LABELS: dict[str, str] = {
     "leave":        "Выход участника",
     "verify":       "Верификация",
     "role":         "Должности",
+    "role_change":  "Повышение/понижение",
     "manual_punish": "Ручные наказания",
 }
 
@@ -2563,7 +2564,7 @@ LOG_CHANNEL_EVENT_GROUPS: list[tuple[str, list[str]]] = [
     ("Автоматические наказания", ["antiflood", "antispam", "antiraid"]),
     ("Управление группой",      ["settings", "chat_closed", "chat_opened"]),
     ("Участники",               ["join", "leave"]),
-    ("Прочее",                  ["verify", "role", "manual_punish"]),
+    ("Прочее",                  ["verify", "role", "role_change", "manual_punish"]),
 ]
 
 
@@ -5583,6 +5584,32 @@ def _is_rules_trigger(text: Optional[str]) -> bool:
     return tl in _RULES_ALIASES
 
 
+def _channel_post_has_command_name(chat_id: int, m: types.Message) -> bool:
+    """Проверка: автопост канала начинается с имени встроенной/пользовательской команды."""
+    raw = (getattr(m, "text", None) or getattr(m, "caption", None) or "").strip()
+    if not raw:
+        return False
+
+    first = raw.split(maxsplit=1)[0].strip().lower()
+    if not first:
+        return False
+
+    cmd_token = first.strip("`'\"«»()[]{}<>.,;:!?")
+    for prefix in tuple(COMMAND_PREFIXES) + (".", "!"):
+        if cmd_token.startswith(prefix):
+            cmd_token = cmd_token[len(prefix):]
+            break
+    cmd_token = cmd_token.split("@", 1)[0].strip("`'\"«»()[]{}<>.,;:!?")
+    if not cmd_token:
+        return False
+
+    if cmd_token in _RESERVED_CMD_NAMES:
+        return True
+
+    cmds = _get_commands_dict(chat_id)
+    return cmd_token in cmds
+
+
 def _send_section_payload(chat_id: int, sec: str, viewer_user, chat_title: str, viewer_uid_for_buttons: int, reply_to_message_id: Optional[int] = None) -> bool:
     """
     Унифицированная отправка секции:
@@ -6598,6 +6625,10 @@ def on_channel_post_in_group(m: types.Message):
     if not bool(sc.get("enabled")):
         return ContinueHandling()
 
+    # Если пост похож на команду (встроенную или пользовательскую), не оставляем первый комментарий.
+    if _channel_post_has_command_name(chat_id, m):
+        return ContinueHandling()
+
     # Дедупликация: не комментировать одно и то же сообщение дважды
     key = (chat_id, msg_id)
     with _FIRST_COMMENT_LOCK:
@@ -7442,6 +7473,3 @@ def _antiraid_runtime_check(chat_id: int, user: types.User) -> None:
 
 
 __all__ = [name for name in globals() if not name.startswith('__')]
-
-
-
