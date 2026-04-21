@@ -409,7 +409,7 @@ def schedulereopenchat(chatid: int, delayseconds: int):
                 send_log_event(
                     chatid, "chat_opened",
                     "\n".join([
-                        "🔓 <b>#ОТКРЫТИЕ_ЧАТА</b>",
+                        "<b>#ОТКРЫТИЕ_ЧАТА</b>",
                         f"<b>Группа:</b> {chat_link}",
                         f"<b>Администратор:</b> {actor_link}",
                         "<b>Источник:</b> автоматически по таймеру",
