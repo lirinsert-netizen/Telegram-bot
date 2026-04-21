@@ -50,6 +50,8 @@ from config import (
     AWARD_EMOJI_IDS,
     EMOJI_WELCOME_TEXT_ID, EMOJI_WELCOME_MEDIA_ID, EMOJI_WELCOME_BUTTONS_ID,
     EMOJI_LEFT_ID,
+    PREMIUM_MUSIC_SEARCH_EMOJI_ID, PREMIUM_MUSIC_WAIT_EMOJI_ID,
+    PREMIUM_MUSIC_YOUTUBE_EMOJI_ID, PREMIUM_MUSIC_SOUNDCLOUD_EMOJI_ID,
     get_user_id_by_username_mtproto,
     get_bot_me,
 )
@@ -3590,12 +3592,12 @@ MUSIC_QUERY_MAX_LEN = 120
 MUSIC_RESULT_TTL_SECONDS = 15 * 60
 MUSIC_MAX_DURATION_SECONDS = 30 * 60
 MUSIC_MAX_FILE_SIZE_BYTES = 49 * 1024 * 1024
-MUSIC_SEARCH_COOLDOWN_SECONDS = 8
+MUSIC_SEARCH_COOLDOWN_SECONDS = 30
 MUSIC_DOWNLOAD_COOLDOWN_SECONDS = 15
 
-MUSIC_SEARCH_SOURCES: list[tuple[str, int, str]] = [
-    ("ytsearch", 6, "YouTube"),
-    ("scsearch", 4, "SoundCloud"),
+MUSIC_SEARCH_SOURCES: list[tuple[str, int, str, str]] = [
+    ("ytsearch", 6, "YouTube", PREMIUM_MUSIC_YOUTUBE_EMOJI_ID),
+    ("scsearch", 4, "SoundCloud", PREMIUM_MUSIC_SOUNDCLOUD_EMOJI_ID),
 ]
 
 MUSIC_RESULTS_CACHE: dict[str, dict[str, Any]] = {}
@@ -3652,7 +3654,7 @@ def _music_collect_results(query: str) -> list[dict[str, Any]]:
     seen_urls: set[str] = set()
     results: list[dict[str, Any]] = []
 
-    for provider, count, source_title in MUSIC_SEARCH_SOURCES:
+    for provider, count, source_title, source_emoji_id in MUSIC_SEARCH_SOURCES:
         if len(results) >= MUSIC_SEARCH_LIMIT:
             break
         try:
@@ -3682,6 +3684,7 @@ def _music_collect_results(query: str) -> list[dict[str, Any]]:
                     "duration": _music_parse_duration(item.get("duration")),
                     "uploader": (item.get("uploader") or item.get("channel") or "").strip(),
                     "source": source_title,
+                    "source_emoji_id": source_emoji_id,
                 }
             )
             if len(results) >= MUSIC_SEARCH_LIMIT:
@@ -3693,12 +3696,13 @@ def _music_collect_results(query: str) -> list[dict[str, Any]]:
 def _music_build_results_keyboard(token: str, results: list[dict[str, Any]]) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup()
     for idx, item in enumerate(results):
-        src = _html.escape(str(item.get("source") or "Источник"))
         dur = _music_format_duration(_music_parse_duration(item.get("duration")))
         title = str(item.get("title") or "").strip()
-        short_title = title if len(title) <= 40 else (title[:37] + "…")
-        label = f"{idx + 1}. [{src}] {short_title} ({dur})"
-        kb.row(types.InlineKeyboardButton(label, callback_data=f"music:pick:{token}:{idx}"))
+        short_title = title if len(title) <= 46 else (title[:43] + "…")
+        label = f"{short_title} ({dur})"
+        btn = types.InlineKeyboardButton(label, callback_data=f"music:pick:{token}:{idx}")
+        btn.icon_custom_emoji_id = str(item.get("source_emoji_id") or PREMIUM_MUSIC_SEARCH_EMOJI_ID)
+        kb.row(btn)
     kb.row(types.InlineKeyboardButton("Закрыть", callback_data=f"music:cancel:{token}"))
     return kb
 
@@ -3819,7 +3823,8 @@ def cmd_music_search(m: types.Message):
 
     status_msg = bot.reply_to(
         m,
-        "🔎 Ищу музыку по вашему запросу…",
+        f'<tg-emoji emoji-id="{PREMIUM_MUSIC_WAIT_EMOJI_ID}">⏳</tg-emoji> Ищу музыку по вашему запросу…',
+        parse_mode='HTML',
         disable_web_page_preview=True,
     )
     try:
@@ -3849,8 +3854,8 @@ def cmd_music_search(m: types.Message):
     token = _music_store_results(m.chat.id, m.from_user.id, query, results)
     kb = _music_build_results_keyboard(token, results)
     text = (
-        f"🎵 <b>Результаты поиска</b> по запросу: <code>{_html.escape(query)}</code>\n"
-        "Выберите трек кнопкой ниже — бот подготовит и отправит MP3."
+        f'<tg-emoji emoji-id="{PREMIUM_MUSIC_SEARCH_EMOJI_ID}">🎵</tg-emoji> '
+        f"<b>Результаты поиска по запросу:</b> <code>{_html.escape(query)}</code>"
     )
     try:
         bot.edit_message_text(
@@ -3887,7 +3892,10 @@ def cb_music_actions(c: types.CallbackQuery):
     if not payload:
         return bot.answer_callback_query(c.id, text="Список устарел. Выполните поиск заново.", show_alert=True)
 
-    if int(payload.get("user_id") or 0) != int(c.from_user.id):
+    is_group_chat = bool(
+        getattr(c.message.chat, "type", "") in {"group", "supergroup"}
+    ) if c.message and c.message.chat else False
+    if is_group_chat and int(payload.get("user_id") or 0) != int(c.from_user.id):
         return bot.answer_callback_query(c.id, text="Только автор запроса может выбрать трек.", show_alert=True)
 
     if action == "cancel":
@@ -3922,22 +3930,28 @@ def cb_music_actions(c: types.CallbackQuery):
     title = str(item.get("title") or "Без названия")
     url = str(item.get("url") or "").strip()
     source = str(item.get("source") or "Источник")
+    source_emoji_id = str(item.get("source_emoji_id") or PREMIUM_MUSIC_SEARCH_EMOJI_ID)
     if not url.startswith("http"):
         return bot.answer_callback_query(c.id, text="Некорректная ссылка результата.", show_alert=True)
+
+    try:
+        bot.delete_message(c.message.chat.id, c.message.message_id)
+    except Exception:
+        pass
 
     try:
         bot.answer_callback_query(c.id, text="Подготавливаю MP3…", show_alert=False)
     except Exception:
         pass
 
+    status_msg = None
     try:
-        bot.edit_message_text(
+        status_msg = bot.send_message(
+            c.message.chat.id,
             (
-                "⏬ Подготавливаю MP3, подождите…\n"
+                f'<tg-emoji emoji-id="{PREMIUM_MUSIC_WAIT_EMOJI_ID}">⏳</tg-emoji> Подготавливаю MP3, подождите…\n'
                 f"<b>Трек:</b> {_html.escape(title)}"
             ),
-            chat_id=c.message.chat.id,
-            message_id=c.message.message_id,
             parse_mode='HTML',
             disable_web_page_preview=True,
         )
@@ -3967,14 +3981,24 @@ def cb_music_actions(c: types.CallbackQuery):
                 title=send_title[:128] if send_title else None,
                 performer=performer[:128] if performer else None,
                 duration=duration,
-                caption=f"Источник: {source}",
+                caption=(
+                    f'<b><tg-emoji emoji-id="{source_emoji_id}">🎵</tg-emoji> '
+                    f'{_html.escape(send_title or title)}</b>'
+                ),
+                parse_mode='HTML',
             )
 
         try:
-            bot.delete_message(c.message.chat.id, c.message.message_id)
+            if status_msg:
+                bot.delete_message(c.message.chat.id, status_msg.message_id)
         except Exception:
             pass
     except Exception as e:
+        try:
+            if status_msg:
+                bot.delete_message(c.message.chat.id, status_msg.message_id)
+        except Exception:
+            pass
         err_text = str(e) or "Не удалось выгрузить MP3."
         bot.send_message(
             c.message.chat.id,
