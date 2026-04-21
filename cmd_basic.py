@@ -13,6 +13,8 @@ import threading
 import asyncio
 import tempfile
 import shutil
+import logging
+import secrets
 from concurrent.futures import ThreadPoolExecutor
 import yt_dlp
 
@@ -83,6 +85,7 @@ from persistence import (
 from helpers import *  # все helper-функции и константы
 
 # ==== БАЗОВЫЕ КОМАНДЫ ====
+logger = logging.getLogger(__name__)
 
 START_MENU_STATE: dict[tuple[int, int], dict] = {}
 
@@ -3587,7 +3590,6 @@ MUSIC_QUERY_MAX_LEN = 120
 MUSIC_RESULT_TTL_SECONDS = 15 * 60
 MUSIC_MAX_DURATION_SECONDS = 30 * 60
 MUSIC_MAX_FILE_SIZE_BYTES = 49 * 1024 * 1024
-MUSIC_FILE_TITLE_MAX_LEN = 120
 MUSIC_SEARCH_COOLDOWN_SECONDS = 8
 MUSIC_DOWNLOAD_COOLDOWN_SECONDS = 15
 
@@ -3613,7 +3615,7 @@ def _music_cleanup_cache() -> None:
 
 
 def _music_new_token() -> str:
-    return f"{int(time.time() * 1000):x}{random.randint(0, 0xFFFF):04x}"[-12:]
+    return secrets.token_hex(6)
 
 
 def _music_parse_duration(value: Any) -> int | None:
@@ -3656,7 +3658,8 @@ def _music_collect_results(query: str) -> list[dict[str, Any]]:
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 data = ydl.extract_info(f"{provider}{count}:{query}", download=False)
-        except Exception:
+        except Exception as e:
+            logger.warning("[music] search source failed (%s): %s", provider, e)
             continue
 
         entries = (data or {}).get("entries") or []
@@ -3734,7 +3737,8 @@ def _music_download_mp3(url: str) -> tuple[str, dict[str, Any], str]:
     temp_dir = tempfile.mkdtemp(prefix="tgmusic_")
     ydl_opts = {
         "format": "bestaudio/best",
-        "outtmpl": os.path.join(temp_dir, f"%(title).{MUSIC_FILE_TITLE_MAX_LEN}s [%(id)s].%(ext)s"),
+        "outtmpl": os.path.join(temp_dir, "%(title)s [%(id)s].%(ext)s"),
+        "restrictfilenames": True,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
@@ -3820,7 +3824,8 @@ def cmd_music_search(m: types.Message):
     )
     try:
         results = _music_collect_results(query)
-    except Exception:
+    except Exception as e:
+        logger.warning("[music] search failed for query=%r: %s", query, e)
         results = []
 
     if not results:
