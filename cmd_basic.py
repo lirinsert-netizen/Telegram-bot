@@ -11,7 +11,10 @@ from __future__ import annotations
 import time
 import threading
 import asyncio
+import tempfile
+import shutil
 from concurrent.futures import ThreadPoolExecutor
+import yt_dlp
 
 from config import (
     os, json, re, _re, _html, random, psutil,
@@ -3575,6 +3578,407 @@ def cb_openchat_button(c: types.CallbackQuery):
         pass
 
     bot.answer_callback_query(c.id, text="Чат открыт.", show_alert=False)
+
+
+# ==== МУЗЫКА: ПОИСК + ВЫГРУЗКА MP3 ====
+
+MUSIC_SEARCH_LIMIT = 10
+MUSIC_QUERY_MAX_LEN = 120
+MUSIC_RESULT_TTL_SECONDS = 15 * 60
+MUSIC_MAX_DURATION_SECONDS = 30 * 60
+MUSIC_MAX_FILE_SIZE_BYTES = 49 * 1024 * 1024
+MUSIC_SEARCH_COOLDOWN_SECONDS = 8
+MUSIC_DOWNLOAD_COOLDOWN_SECONDS = 15
+
+_MUSIC_SEARCH_SOURCES: list[tuple[str, int, str]] = [
+    ("ytsearch", 6, "YouTube"),
+    ("scsearch", 4, "SoundCloud"),
+]
+
+_MUSIC_RESULTS_CACHE: dict[str, dict[str, Any]] = {}
+_MUSIC_RESULTS_CACHE_LOCK = threading.Lock()
+
+
+def _music_cleanup_cache() -> None:
+    now_ts = int(time.time())
+    with _MUSIC_RESULTS_CACHE_LOCK:
+        stale_tokens = [
+            token
+            for token, payload in _MUSIC_RESULTS_CACHE.items()
+            if int(payload.get("expires_at", 0) or 0) <= now_ts
+        ]
+        for token in stale_tokens:
+            _MUSIC_RESULTS_CACHE.pop(token, None)
+
+
+def _music_new_token() -> str:
+    return f"{int(time.time() * 1000):x}{random.randint(0, 0xFFFF):04x}"[-12:]
+
+
+def _music_parse_duration(value: Any) -> int | None:
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    return seconds
+
+
+def _music_format_duration(seconds: int | None) -> str:
+    if not seconds:
+        return "?"
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def _music_collect_results(query: str) -> list[dict[str, Any]]:
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "cachedir": False,
+        "socket_timeout": 15,
+        "extract_flat": True,
+    }
+    seen_urls: set[str] = set()
+    results: list[dict[str, Any]] = []
+
+    for provider, count, source_title in _MUSIC_SEARCH_SOURCES:
+        if len(results) >= MUSIC_SEARCH_LIMIT:
+            break
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                data = ydl.extract_info(f"{provider}{count}:{query}", download=False)
+        except Exception:
+            continue
+
+        entries = (data or {}).get("entries") or []
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            title = (item.get("title") or "").strip()
+            url = (item.get("webpage_url") or item.get("url") or "").strip()
+            if not title or not url:
+                continue
+            if not url.startswith("http"):
+                continue
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            results.append(
+                {
+                    "title": title,
+                    "url": url,
+                    "duration": _music_parse_duration(item.get("duration")),
+                    "uploader": (item.get("uploader") or item.get("channel") or "").strip(),
+                    "source": source_title,
+                }
+            )
+            if len(results) >= MUSIC_SEARCH_LIMIT:
+                break
+
+    return results
+
+
+def _music_build_results_keyboard(token: str, results: list[dict[str, Any]]) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup()
+    for idx, item in enumerate(results):
+        src = _html.escape(str(item.get("source") or "Источник"))
+        dur = _music_format_duration(_music_parse_duration(item.get("duration")))
+        title = str(item.get("title") or "").strip()
+        short_title = title if len(title) <= 40 else (title[:37] + "…")
+        label = f"{idx + 1}. [{src}] {short_title} ({dur})"
+        kb.row(types.InlineKeyboardButton(label, callback_data=f"music:pick:{token}:{idx}"))
+    kb.row(types.InlineKeyboardButton("Закрыть", callback_data=f"music:cancel:{token}"))
+    return kb
+
+
+def _music_store_results(chat_id: int, user_id: int, query: str, results: list[dict[str, Any]]) -> str:
+    _music_cleanup_cache()
+    token = _music_new_token()
+    with _MUSIC_RESULTS_CACHE_LOCK:
+        _MUSIC_RESULTS_CACHE[token] = {
+            "chat_id": int(chat_id),
+            "user_id": int(user_id),
+            "query": query,
+            "results": results,
+            "expires_at": int(time.time()) + MUSIC_RESULT_TTL_SECONDS,
+        }
+    return token
+
+
+def _music_get_results(token: str) -> dict[str, Any] | None:
+    _music_cleanup_cache()
+    with _MUSIC_RESULTS_CACHE_LOCK:
+        payload = _MUSIC_RESULTS_CACHE.get(token)
+        if not payload:
+            return None
+        if int(payload.get("expires_at", 0) or 0) <= int(time.time()):
+            _MUSIC_RESULTS_CACHE.pop(token, None)
+            return None
+        return payload
+
+
+def _music_download_mp3(url: str) -> tuple[str, dict[str, Any], str]:
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        raise RuntimeError("На сервере не найден ffmpeg, конвертация в MP3 недоступна.")
+
+    temp_dir = tempfile.mkdtemp(prefix="tgmusic_", dir="/tmp")
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(temp_dir, "%(title).120s [%(id)s].%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "cachedir": False,
+        "socket_timeout": 20,
+        "prefer_ffmpeg": True,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }],
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        mp3_path = None
+        requested = (info or {}).get("requested_downloads") or []
+        for entry in requested:
+            if not isinstance(entry, dict):
+                continue
+            candidate = (entry.get("filepath") or "").strip()
+            if candidate and candidate.lower().endswith(".mp3") and os.path.exists(candidate):
+                mp3_path = candidate
+                break
+        if not mp3_path:
+            for file_name in os.listdir(temp_dir):
+                if file_name.lower().endswith(".mp3"):
+                    candidate = os.path.join(temp_dir, file_name)
+                    if os.path.isfile(candidate):
+                        mp3_path = candidate
+                        break
+        if not mp3_path:
+            raise RuntimeError("Не удалось подготовить MP3 файл.")
+        return mp3_path, (info or {}), temp_dir
+
+
+def _music_extract_query(m: types.Message) -> tuple[str | None, str]:
+    _, cmd, rest = _extract_command_info(m)
+    return cmd, (rest or "").strip()
+
+
+@bot.message_handler(func=lambda m: match_command_aliases(m.text, ['music', 'музыка']))
+def cmd_music_search(m: types.Message):
+    add_stat_message(m)
+    cmd, query = _music_extract_query(m)
+    add_stat_command(cmd or 'music')
+
+    if not query:
+        return bot.reply_to(
+            m,
+            premium_prefix("Укажи название трека. Пример: <code>/music Linkin Park Numb</code>"),
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+
+    query = " ".join(query.split())
+    if len(query) < 2:
+        return bot.reply_to(
+            m,
+            premium_prefix("Слишком короткий запрос. Укажи хотя бы 2 символа."),
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+    if len(query) > MUSIC_QUERY_MAX_LEN:
+        return bot.reply_to(
+            m,
+            premium_prefix(f"Слишком длинный запрос. Максимум {MUSIC_QUERY_MAX_LEN} символов."),
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+
+    if not is_owner(m.from_user):
+        wait_seconds = cooldown_hit('user', int(m.from_user.id), 'music_search', MUSIC_SEARCH_COOLDOWN_SECONDS)
+        if wait_seconds > 0:
+            return reply_cooldown_message(
+                m, wait_seconds, scope='user', bucket=int(m.from_user.id), action='music_search'
+            )
+
+    status_msg = bot.reply_to(
+        m,
+        "🔎 Ищу музыку по вашему запросу…",
+        disable_web_page_preview=True,
+    )
+    try:
+        results = _music_collect_results(query)
+    except Exception:
+        results = []
+
+    if not results:
+        try:
+            bot.edit_message_text(
+                premium_prefix("Ничего не найдено. Попробуйте другой запрос."),
+                chat_id=status_msg.chat.id,
+                message_id=status_msg.message_id,
+                parse_mode='HTML',
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            bot.reply_to(
+                m,
+                premium_prefix("Ничего не найдено. Попробуйте другой запрос."),
+                parse_mode='HTML',
+                disable_web_page_preview=True,
+            )
+        return
+
+    token = _music_store_results(m.chat.id, m.from_user.id, query, results)
+    kb = _music_build_results_keyboard(token, results)
+    text = (
+        f"🎵 <b>Результаты поиска</b> по запросу: <code>{_html.escape(query)}</code>\n"
+        "Выберите трек кнопкой ниже — бот подготовит и отправит MP3."
+    )
+    try:
+        bot.edit_message_text(
+            text,
+            chat_id=status_msg.chat.id,
+            message_id=status_msg.message_id,
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+            reply_markup=kb,
+        )
+    except Exception:
+        bot.send_message(
+            m.chat.id,
+            text,
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+            reply_markup=kb,
+        )
+
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("music:"))
+def cb_music_actions(c: types.CallbackQuery):
+    if _is_duplicate_callback_query(c):
+        return
+
+    data = (c.data or "")
+    parts = data.split(":")
+    if len(parts) < 3:
+        return bot.answer_callback_query(c.id)
+
+    action = parts[1]
+    token = parts[2]
+    payload = _music_get_results(token)
+    if not payload:
+        return bot.answer_callback_query(c.id, text="Список устарел. Выполните поиск заново.", show_alert=True)
+
+    if int(payload.get("user_id") or 0) != int(c.from_user.id):
+        return bot.answer_callback_query(c.id, text="Только автор запроса может выбрать трек.", show_alert=True)
+
+    if action == "cancel":
+        try:
+            bot.delete_message(c.message.chat.id, c.message.message_id)
+        except Exception:
+            pass
+        return bot.answer_callback_query(c.id)
+
+    if action != "pick" or len(parts) < 4:
+        return bot.answer_callback_query(c.id)
+
+    try:
+        index = int(parts[3])
+    except (TypeError, ValueError):
+        return bot.answer_callback_query(c.id)
+
+    results = payload.get("results") or []
+    if index < 0 or index >= len(results):
+        return bot.answer_callback_query(c.id, text="Элемент не найден.", show_alert=True)
+
+    if not is_owner(c.from_user):
+        wait_seconds = cooldown_hit('user', int(c.from_user.id), 'music_download', MUSIC_DOWNLOAD_COOLDOWN_SECONDS)
+        if wait_seconds > 0:
+            return bot.answer_callback_query(
+                c.id,
+                text=f"Подожди {wait_seconds} сек. и попробуй снова.",
+                show_alert=True,
+            )
+
+    item = results[index]
+    title = str(item.get("title") or "Без названия")
+    url = str(item.get("url") or "").strip()
+    source = str(item.get("source") or "Источник")
+    if not url.startswith("http"):
+        return bot.answer_callback_query(c.id, text="Некорректная ссылка результата.", show_alert=True)
+
+    try:
+        bot.answer_callback_query(c.id, text="Подготавливаю MP3…", show_alert=False)
+    except Exception:
+        pass
+
+    try:
+        bot.edit_message_text(
+            (
+                "⏬ Подготавливаю MP3, подождите…\n"
+                f"<b>Трек:</b> {_html.escape(title)}"
+            ),
+            chat_id=c.message.chat.id,
+            message_id=c.message.message_id,
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        pass
+
+    temp_dir = None
+    try:
+        bot.send_chat_action(c.message.chat.id, "upload_audio")
+        mp3_path, info, temp_dir = _music_download_mp3(url)
+
+        duration = _music_parse_duration(info.get("duration"))
+        if duration and duration > MUSIC_MAX_DURATION_SECONDS:
+            raise RuntimeError("Трек слишком длинный. Максимум 30 минут.")
+
+        file_size = os.path.getsize(mp3_path)
+        if file_size > MUSIC_MAX_FILE_SIZE_BYTES:
+            raise RuntimeError("Файл слишком большой для отправки ботом.")
+
+        performer = (info.get("artist") or info.get("uploader") or item.get("uploader") or "").strip()
+        send_title = (info.get("track") or info.get("title") or title or "").strip()
+
+        with open(mp3_path, "rb") as audio_file:
+            bot.send_audio(
+                c.message.chat.id,
+                audio_file,
+                title=send_title[:128] if send_title else None,
+                performer=performer[:128] if performer else None,
+                duration=duration,
+                caption=f"Источник: {source}",
+            )
+
+        try:
+            bot.delete_message(c.message.chat.id, c.message.message_id)
+        except Exception:
+            pass
+    except Exception as e:
+        err_text = str(e) or "Не удалось выгрузить MP3."
+        bot.send_message(
+            c.message.chat.id,
+            premium_prefix(_html.escape(err_text)),
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 # ==== ПРОВЕРКА, МОЖНО ЛИ ИСКЛЮЧИТЬ ЦЕЛЬ ====
