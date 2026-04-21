@@ -3587,6 +3587,7 @@ MUSIC_QUERY_MAX_LEN = 120
 MUSIC_RESULT_TTL_SECONDS = 15 * 60
 MUSIC_MAX_DURATION_SECONDS = 30 * 60
 MUSIC_MAX_FILE_SIZE_BYTES = 49 * 1024 * 1024
+MUSIC_FILE_TITLE_MAX_LEN = 120
 MUSIC_SEARCH_COOLDOWN_SECONDS = 8
 MUSIC_DOWNLOAD_COOLDOWN_SECONDS = 15
 
@@ -3730,10 +3731,10 @@ def _music_download_mp3(url: str) -> tuple[str, dict[str, Any], str]:
     if not ffmpeg_path:
         raise RuntimeError("На сервере не найден ffmpeg, конвертация в MP3 недоступна.")
 
-    temp_dir = tempfile.mkdtemp(prefix="tgmusic_", dir="/tmp")
+    temp_dir = tempfile.mkdtemp(prefix="tgmusic_")
     ydl_opts = {
         "format": "bestaudio/best",
-        "outtmpl": os.path.join(temp_dir, "%(title).120s [%(id)s].%(ext)s"),
+        "outtmpl": os.path.join(temp_dir, f"%(title).{MUSIC_FILE_TITLE_MAX_LEN}s [%(id)s].%(ext)s"),
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
