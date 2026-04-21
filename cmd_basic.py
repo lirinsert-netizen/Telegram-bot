@@ -3593,25 +3593,25 @@ MUSIC_MAX_FILE_SIZE_BYTES = 49 * 1024 * 1024
 MUSIC_SEARCH_COOLDOWN_SECONDS = 8
 MUSIC_DOWNLOAD_COOLDOWN_SECONDS = 15
 
-_MUSIC_SEARCH_SOURCES: list[tuple[str, int, str]] = [
+MUSIC_SEARCH_SOURCES: list[tuple[str, int, str]] = [
     ("ytsearch", 6, "YouTube"),
     ("scsearch", 4, "SoundCloud"),
 ]
 
-_MUSIC_RESULTS_CACHE: dict[str, dict[str, Any]] = {}
-_MUSIC_RESULTS_CACHE_LOCK = threading.Lock()
+MUSIC_RESULTS_CACHE: dict[str, dict[str, Any]] = {}
+MUSIC_RESULTS_CACHE_LOCK = threading.Lock()
 
 
 def _music_cleanup_cache() -> None:
     now_ts = int(time.time())
-    with _MUSIC_RESULTS_CACHE_LOCK:
+    with MUSIC_RESULTS_CACHE_LOCK:
         stale_tokens = [
             token
-            for token, payload in _MUSIC_RESULTS_CACHE.items()
+            for token, payload in MUSIC_RESULTS_CACHE.items()
             if int(payload.get("expires_at", 0) or 0) <= now_ts
         ]
         for token in stale_tokens:
-            _MUSIC_RESULTS_CACHE.pop(token, None)
+            MUSIC_RESULTS_CACHE.pop(token, None)
 
 
 def _music_new_token() -> str:
@@ -3652,7 +3652,7 @@ def _music_collect_results(query: str) -> list[dict[str, Any]]:
     seen_urls: set[str] = set()
     results: list[dict[str, Any]] = []
 
-    for provider, count, source_title in _MUSIC_SEARCH_SOURCES:
+    for provider, count, source_title in MUSIC_SEARCH_SOURCES:
         if len(results) >= MUSIC_SEARCH_LIMIT:
             break
         try:
@@ -3706,8 +3706,8 @@ def _music_build_results_keyboard(token: str, results: list[dict[str, Any]]) -> 
 def _music_store_results(chat_id: int, user_id: int, query: str, results: list[dict[str, Any]]) -> str:
     _music_cleanup_cache()
     token = _music_new_token()
-    with _MUSIC_RESULTS_CACHE_LOCK:
-        _MUSIC_RESULTS_CACHE[token] = {
+    with MUSIC_RESULTS_CACHE_LOCK:
+        MUSIC_RESULTS_CACHE[token] = {
             "chat_id": int(chat_id),
             "user_id": int(user_id),
             "query": query,
@@ -3719,12 +3719,12 @@ def _music_store_results(chat_id: int, user_id: int, query: str, results: list[d
 
 def _music_get_results(token: str) -> dict[str, Any] | None:
     _music_cleanup_cache()
-    with _MUSIC_RESULTS_CACHE_LOCK:
-        payload = _MUSIC_RESULTS_CACHE.get(token)
+    with MUSIC_RESULTS_CACHE_LOCK:
+        payload = MUSIC_RESULTS_CACHE.get(token)
         if not payload:
             return None
         if int(payload.get("expires_at", 0) or 0) <= int(time.time()):
-            _MUSIC_RESULTS_CACHE.pop(token, None)
+            MUSIC_RESULTS_CACHE.pop(token, None)
             return None
         return payload
 
@@ -3732,7 +3732,7 @@ def _music_get_results(token: str) -> dict[str, Any] | None:
 def _music_download_mp3(url: str) -> tuple[str, dict[str, Any], str]:
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
-        raise RuntimeError("На сервере не найден ffmpeg, конвертация в MP3 недоступна.")
+        raise RuntimeError("На сервере не найден ffmpeg. Установите ffmpeg для конвертации в MP3.")
 
     temp_dir = tempfile.mkdtemp(prefix="tgmusic_")
     ydl_opts = {
@@ -3951,7 +3951,7 @@ def cb_music_actions(c: types.CallbackQuery):
 
         duration = _music_parse_duration(info.get("duration"))
         if duration and duration > MUSIC_MAX_DURATION_SECONDS:
-            raise RuntimeError("Трек слишком длинный. Максимум 30 минут.")
+            raise RuntimeError(f"Трек слишком длинный. Максимум {MUSIC_MAX_DURATION_SECONDS // 60} минут.")
 
         file_size = os.path.getsize(mp3_path)
         if file_size > MUSIC_MAX_FILE_SIZE_BYTES:
