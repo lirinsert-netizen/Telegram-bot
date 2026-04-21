@@ -4143,6 +4143,86 @@ def cmd_tiktok_off(m: types.Message):
     )
 
 
+@bot.message_handler(func=lambda m: match_command_aliases(m.text, ['musicon']))
+def cmd_music_on(m: types.Message):
+    add_stat_message(m)
+    add_stat_command("musicon")
+
+    if m.chat.type not in ("group", "supergroup"):
+        return bot.reply_to(
+            m,
+            premium_prefix("Эта команда доступна только в группах."),
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+
+    if not _can_manage_download_toggles(m.chat.id, m.from_user):
+        return bot.reply_to(
+            m,
+            premium_prefix(DOWNLOAD_TOGGLE_NO_PERM_TEXT),
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+
+    st = get_group_settings(m.chat.id)
+    if st.get("music_enabled") is not False:
+        return bot.reply_to(
+            m,
+            premium_prefix("Выгрузка музыки уже включена в этой группе."),
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+
+    st["music_enabled"] = True
+    save_group_settings()
+    bot.reply_to(
+        m,
+        premium_prefix("Выгрузка музыки включена в этой группе."),
+        parse_mode='HTML',
+        disable_web_page_preview=True,
+    )
+
+
+@bot.message_handler(func=lambda m: match_command_aliases(m.text, ['tiktokon']))
+def cmd_tiktok_on(m: types.Message):
+    add_stat_message(m)
+    add_stat_command("tiktokon")
+
+    if m.chat.type not in ("group", "supergroup"):
+        return bot.reply_to(
+            m,
+            premium_prefix("Эта команда доступна только в группах."),
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+
+    if not _can_manage_download_toggles(m.chat.id, m.from_user):
+        return bot.reply_to(
+            m,
+            premium_prefix(DOWNLOAD_TOGGLE_NO_PERM_TEXT),
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+
+    st = get_group_settings(m.chat.id)
+    if st.get("tiktok_enabled") is not False:
+        return bot.reply_to(
+            m,
+            premium_prefix("Выгрузка TikTok уже включена в этой группе."),
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+
+    st["tiktok_enabled"] = True
+    save_group_settings()
+    bot.reply_to(
+        m,
+        premium_prefix("Выгрузка TikTok включена в этой группе."),
+        parse_mode='HTML',
+        disable_web_page_preview=True,
+    )
+
+
 # ==== МУЗЫКА: ПОИСК + ВЫГРУЗКА MP3 ====
 
 MUSIC_SEARCH_LIMIT = 10
