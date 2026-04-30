@@ -206,7 +206,7 @@ class TestParsePunishDurationEnglish:
 
 
 class TestParsePunishDurationRussian:
-    def test_navсегда_keyword(self):
+    def test_navsegda_keyword(self):
         assert mod._parse_punish_duration("навсегда", True) == 0
 
     def test_minutes_short(self):

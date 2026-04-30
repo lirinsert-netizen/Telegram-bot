@@ -132,7 +132,8 @@ class TestTgUsernameRegex:
         assert antispam._TG_USERNAME_RE.search("@abcd") is not None
 
     def test_too_short_not_matched(self):
-        # @abc → only 3 chars after @, need 3+ after first letter = 4 total chars
+        # Regex: @[a-zA-Z][a-zA-Z0-9_]{3,} — the letter after '@' plus 3+ more chars are required.
+        # '@abc' has only 1 + 2 = 3 chars, so it does NOT satisfy {3,} (needs 3 after the first letter).
         assert antispam._TG_USERNAME_RE.search("@abc") is None
 
     def test_starts_with_digit_not_matched(self):
