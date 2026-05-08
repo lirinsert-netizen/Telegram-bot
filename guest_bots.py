@@ -585,7 +585,7 @@ def on_guest_pending_input(m: types.Message):
         )
         if not created:
             err_text = _html.escape(str(err or "Ошибка"))
-            bot.reply_to(m, f"{_premium_emoji(PREMIUM_PREFIX_EMOJI_ID)} {err_text}", parse_mode="HTML")
+            bot.reply_to(m, f"{_premium_emoji(PREMIUM_PREFIX_EMOJI_ID)} <code>{err_text}</code>", parse_mode="HTML")
             return
 
         _PENDING_TOKEN_USERS.discard(uid)
