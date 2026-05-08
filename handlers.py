@@ -24,6 +24,7 @@ from config import (
     ApiTelegramException, InlineKeyboardMarkup, InlineKeyboardButton,
     bot, bot_raw, tg_client,
     TOKEN, OWNER_USERNAME, DATA_DIR, API_BASE_URL,
+    IS_GUEST_BOT,
     COMMAND_PREFIXES, MAX_MSG_LEN,
     PREMIUM_STATS_EMOJI_ID, PREMIUM_USER_EMOJI_ID,
     PREMIUM_PREFIX_EMOJI_ID, EMOJI_RATE_LIMIT_ID,
@@ -1973,26 +1974,29 @@ def handle_my_chat_member(update: types.ChatMemberUpdated):
         if old_status in ("member", "administrator"):
             return
 
-        # Бот добавлен в группу — проверяем, нет ли уже другого бота
-        try:
-            me = get_bot_me()
-            my_id = me.id
-            my_username = me.username or ""
-        except Exception:
-            my_id = 0
-            my_username = ""
-
-        ok = assign_bot_to_chat(chat_id, my_id, my_username)
-        if not ok:
-            # Группа уже занята другим клоном — покидаем
+        # Для guest-бота не блокируем группу assignment'ом:
+        # он должен работать рядом с основным ботом по mention-триггеру.
+        if not IS_GUEST_BOT:
+            # Бот добавлен в группу — проверяем, нет ли уже другого бота
             try:
-                bot.leave_chat(chat_id)
-                print(
-                    f"[CLONE] Покинул группу {chat_id}: уже обслуживается другим ботом."
-                )
-            except Exception as e:
-                print(f"[CLONE] Не удалось покинуть группу {chat_id}: {e}")
-            return
+                me = get_bot_me()
+                my_id = me.id
+                my_username = me.username or ""
+            except Exception:
+                my_id = 0
+                my_username = ""
+
+            ok = assign_bot_to_chat(chat_id, my_id, my_username)
+            if not ok:
+                # Группа уже занята другим клоном — покидаем
+                try:
+                    bot.leave_chat(chat_id)
+                    print(
+                        f"[CLONE] Покинул группу {chat_id}: уже обслуживается другим ботом."
+                    )
+                except Exception as e:
+                    print(f"[CLONE] Не удалось покинуть группу {chat_id}: {e}")
+                return
 
         # Группа добавлена или уже наша — обычная логика одобрения
         adder = update.from_user
@@ -2002,7 +2006,8 @@ def handle_my_chat_member(update: types.ChatMemberUpdated):
 
     elif new_status == "left":
         # Бот удалён из группы — освобождаем привязку
-        unassign_bot_from_chat(chat_id)
+        if not IS_GUEST_BOT:
+            unassign_bot_from_chat(chat_id)
         deny_pending_group(chat_id)
         print(f"[INFO] Бот удалён из группы {chat_id}")
 
