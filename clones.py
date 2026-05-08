@@ -6,7 +6,7 @@ clones.py — Управление клонами бота (только осн�
   /clone_register TOKEN           — зарегистрировать клон по токену из BotFather и запустить
   /clone_unlink <username|bot_id> — удалить клон из реестра
   /newbot <display_name> <username> — создать нового бота через BotFather и запустить как клон
-  /newguest <display_name> <username> — создать гостевого бота и запустить в guest-режиме
+  /newguest [TOKEN]               — зарегистрировать гостевого бота по токену и включить guest-режим
 
 Архитектура клонов:
   Клон — это тот же бот с тем же кодом, запущенный как дочерний процесс.
@@ -44,6 +44,7 @@ from persistence import (
     CLONES,
     save_clones,
 )
+from helpers import should_ignore_text_triggers
 
 # ──────────────────────────── subprocess management ───────────────────────────
 
@@ -56,11 +57,46 @@ _CLONE_PROC_LOCK = _threading.Lock()
 
 # Regex to extract a Telegram bot token from BotFather's reply.
 _TOKEN_RE = _re.compile(r'\b(\d{8,10}:[A-Za-z0-9_-]{35,})\b')
+_GUEST_REG_CANCEL_WORDS = {"отмена", "cancel", "/cancel"}
+_PENDING_GUEST_REGISTRATION: set[int] = set()
 
 
 def _normalize_role(value: object) -> str:
     role = str(value).strip().lower()
     return "guest" if role == "guest" else "clone"
+
+
+def _set_pending_guest_registration(user_id: int) -> None:
+    _PENDING_GUEST_REGISTRATION.add(int(user_id))
+
+
+def _clear_pending_guest_registration(user_id: int) -> None:
+    _PENDING_GUEST_REGISTRATION.discard(int(user_id))
+
+
+def start_guest_registration_prompt(chat_id: int, user: types.User | None) -> bool:
+    if not _is_owner(user):
+        return False
+
+    _set_pending_guest_registration(user.id)
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("Открыть BotFather", url="https://t.me/BotFather"))
+    bot.send_message(
+        chat_id,
+        "<b>Подключение гостевого бота</b>\n\n"
+        "Создай нового бота в @BotFather или возьми уже готовый токен, "
+        "затем просто отправь сюда токен следующим сообщением.\n"
+        "Пример токена: <code>123456789:ABCdefGHIjklMNOpqrsTUVwxyz123456789</code>\n\n"
+        "Также можно сразу использовать: <code>/newguest TOKEN</code>\n\n"
+        "<i>После регистрации бот запустится в guest-режиме. "
+        "Пользовательские команды будут работать в формате "
+        "<code>@username_бота имя_команды</code>.</i>\n\n"
+        "Для отмены отправь <code>/cancel</code> или слово <code>отмена</code>.",
+        parse_mode="HTML",
+        reply_markup=kb,
+        disable_web_page_preview=True,
+    )
+    return True
 
 
 def _launch_clone_process(entry: dict) -> "_subprocess.Popen | None":
@@ -255,6 +291,82 @@ def _format_clones_text(entries: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _register_bot_token(m: types.Message, token: str, role: str = "clone") -> bool:
+    role = _normalize_role(role)
+    is_guest = role == "guest"
+    role_title = "Гостевой бот" if is_guest else "Клон"
+    role_title_lower = "гостевой бот" if is_guest else "клон"
+
+    try:
+        test_bot = _tb.TeleBot(token)
+        me = test_bot.get_me()
+        bot_id = me.id
+        bot_username = me.username or ""
+        bot_name = me.first_name or bot_username
+    except Exception as e:
+        bot.reply_to(
+            m,
+            f"❌ Не удалось получить информацию о боте по токену:\n<code>{_html.escape(str(e))}</code>",
+            parse_mode="HTML",
+        )
+        return False
+
+    existing = _find_clone(str(bot_id)) or (bot_username and _find_clone(bot_username))
+    if existing:
+        bot.reply_to(
+            m,
+            f"{role_title} <b>@{_html.escape(bot_username)}</b> уже зарегистрирован.",
+            parse_mode="HTML",
+        )
+        return False
+
+    entry: dict = {
+        "bot_id": bot_id,
+        "username": bot_username,
+        "name": bot_name,
+        "token": token,
+        "role": role,
+        "status": "running",
+        "created_at": int(time.time()),
+    }
+    CLONES["clones"].append(entry)
+    save_clones()
+
+    proc = _launch_clone_process(entry)
+    if proc:
+        save_clones()
+        note = ""
+        if is_guest:
+            note = (
+                "\n\n<i>Гостевой режим активирован.</i>\n"
+                f"<code>@{_html.escape(bot_username)} имя_команды</code>"
+            )
+        bot.reply_to(
+            m,
+            f"✅ {role_title} <b>@{_html.escape(bot_username)}</b> (ID: <code>{bot_id}</code>) "
+            f"зарегистрирован и запущен!\n"
+            f"PID: <code>{proc.pid}</code>{note}",
+            parse_mode="HTML",
+        )
+        return True
+
+    env_lines = [
+        f"<code>BOT_TOKEN={_html.escape(token)}</code>",
+        "<code>IS_CLONE=1</code>",
+        f"<code>IS_GUEST_BOT={'1' if is_guest else '0'}</code>",
+        "<code>DATA_DIR=&lt;shared_data_dir&gt;</code>",
+    ]
+    bot.reply_to(
+        m,
+        f"✅ {role_title} <b>@{_html.escape(bot_username)}</b> (ID: <code>{bot_id}</code>) зарегистрирован.\n\n"
+        f"⚠️ Автозапуск не удался. Для запуска задеплой {role_title_lower} со следующими переменными окружения:\n"
+        f"{chr(10).join(env_lines)}\n\n"
+        f"<i>Все клоны и основной бот должны использовать один и тот же DATA_DIR.</i>",
+        parse_mode="HTML",
+    )
+    return True
+
+
 # ─────────────────────────── команды ─────────────────────────────────────────
 
 @bot.message_handler(commands=["clones"])
@@ -303,66 +415,7 @@ def cmd_clone_register(m: types.Message):
         )
         return
 
-    token = parts[1].strip()
-
-    # Проверяем токен через Telegram API
-    try:
-        test_bot = _tb.TeleBot(token)
-        me = test_bot.get_me()
-        bot_id = me.id
-        bot_username = me.username or ""
-        bot_name = me.first_name or bot_username
-    except Exception as e:
-        bot.reply_to(
-            m,
-            f"❌ Не удалось получить информацию о боте по токену:\n<code>{_html.escape(str(e))}</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    # Проверяем — не зарегистрирован ли уже этот бот
-    existing = _find_clone(str(bot_id)) or (bot_username and _find_clone(bot_username))
-    if existing:
-        bot.reply_to(
-            m,
-            f"Клон <b>@{_html.escape(bot_username)}</b> уже зарегистрирован.",
-            parse_mode="HTML",
-        )
-        return
-
-    entry: dict = {
-        "bot_id": bot_id,
-        "username": bot_username,
-        "name": bot_name,
-        "token": token,
-        "role": "clone",
-        "status": "running",
-        "created_at": int(time.time()),
-    }
-    CLONES["clones"].append(entry)
-    save_clones()
-
-    proc = _launch_clone_process(entry)
-    if proc:
-        save_clones()
-        bot.reply_to(
-            m,
-            f"✅ Клон <b>@{_html.escape(bot_username)}</b> (ID: <code>{bot_id}</code>) "
-            f"зарегистрирован и запущен!\n"
-            f"PID: <code>{proc.pid}</code>",
-            parse_mode="HTML",
-        )
-    else:
-        bot.reply_to(
-            m,
-            f"✅ Клон <b>@{_html.escape(bot_username)}</b> (ID: <code>{bot_id}</code>) зарегистрирован.\n\n"
-            f"⚠️ Автозапуск не удался. Для запуска задеплой бота со следующими переменными окружения:\n"
-            f"<code>BOT_TOKEN={_html.escape(token)}</code>\n"
-            f"<code>IS_CLONE=1</code>\n"
-            f"<code>DATA_DIR=&lt;shared_data_dir&gt;</code>\n\n"
-            f"<i>Все клоны и основной бот должны использовать один и тот же DATA_DIR.</i>",
-            parse_mode="HTML",
-        )
+    _register_bot_token(m, parts[1].strip(), role="clone")
 
 
 @bot.message_handler(commands=["clone_unlink"])
@@ -498,31 +551,55 @@ def cmd_newbot(m: types.Message):
 @bot.message_handler(commands=["newguest"])
 def cmd_newguest(m: types.Message):
     """
-    /newguest <display_name> <username>
-    Создаёт нового гостевого бота через BotFather (Telethon MTProto), затем
-    регистрирует и запускает его как гостя.
+    /newguest [TOKEN]
+    Регистрирует готового гостевого бота по токену и запускает его как гостя.
     """
     if should_ignore_text_triggers(m):
         return
     if m.chat.type != "private" or not _is_owner(m.from_user):
         return
 
-    parts = m.text.split()
-    if len(parts) < 3:
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        start_guest_registration_prompt(m.chat.id, m.from_user)
+        return
+
+    if _register_bot_token(m, parts[1].strip(), role="guest"):
+        _clear_pending_guest_registration(m.from_user.id)
+
+
+def _is_waiting_for_guest_token(m: types.Message) -> bool:
+    if should_ignore_text_triggers(m):
+        return False
+    if m.chat.type != "private" or not _is_owner(m.from_user) or not m.text:
+        return False
+    if int(m.from_user.id) not in _PENDING_GUEST_REGISTRATION:
+        return False
+
+    command = m.text.strip().split(maxsplit=1)[0].lower()
+    return command in _GUEST_REG_CANCEL_WORDS or not command.startswith("/")
+
+
+@bot.message_handler(func=_is_waiting_for_guest_token)
+def on_guest_token_message(m: types.Message):
+    text = m.text.strip()
+    lower_text = text.lower()
+    if lower_text in _GUEST_REG_CANCEL_WORDS:
+        _clear_pending_guest_registration(m.from_user.id)
+        bot.reply_to(m, "Подключение гостевого бота отменено.")
+        return
+
+    token_match = _TOKEN_RE.search(text)
+    if not token_match:
         bot.reply_to(
             m,
-            "<b>Создание гостевого бота через BotFather</b>\n\n"
-            "Использование: <code>/newguest Название @username</code>\n\n"
-            "Пример: <code>/newguest Мой гость myguest_bot</code>\n\n"
-            "<i>Последнее слово — username (суффикс «bot» добавляется автоматически).\n"
-            "Требуется авторизованная MTProto-сессия (Telethon).</i>",
+            "Не вижу токен BotFather. Отправь токен целиком одним сообщением или напиши <code>отмена</code>.",
             parse_mode="HTML",
         )
         return
 
-    username = parts[-1].strip().lstrip("@")
-    display_name = " ".join(parts[1:-1]).strip()
-    _start_new_bot_creation(m, display_name, username, role="guest")
+    if _register_bot_token(m, token_match.group(1), role="guest"):
+        _clear_pending_guest_registration(m.from_user.id)
 
 
 def _start_new_bot_creation(m: types.Message, display_name: str, username: str, role: str = "clone") -> None:
