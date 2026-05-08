@@ -1295,7 +1295,6 @@ def cb_pm_settings_open(call: types.CallbackQuery):
     "pm_settings_back",
     "clone_disable:",
     "clone_enable:",
-    "guestbot:",
 )))
 def callback_handler(call: types.CallbackQuery):
     if _is_duplicate_callback_query(call):
@@ -1306,6 +1305,20 @@ def callback_handler(call: types.CallbackQuery):
     data = call.data or ""
     chat_id = call.message.chat.id
     msg_id = call.message.message_id
+
+    if data.startswith("guestbot:"):
+        # Fallback router: handles guest callbacks when guest_bots handlers
+        # were not registered in current runtime (e.g. wrong startup mode).
+        try:
+            import guest_bots as _guest_bots
+            _guest_bots.guest_bots_callback(call)
+            return
+        except Exception:
+            return bot.answer_callback_query(
+                call.id,
+                "Модуль Guest-ботов недоступен. Проверьте IS_CLONE=0 и перезапустите бота.",
+                show_alert=True,
+            )
 
     if data.startswith("devcontact:"):
         action = data.split(":", 1)[1]
