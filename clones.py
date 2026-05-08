@@ -6,6 +6,7 @@ clones.py — Управление клонами бота (только осн�
   /clone_register TOKEN           — зарегистрировать клон по токену из BotFather и запустить
   /clone_unlink <username|bot_id> — удалить клон из реестра
   /newbot <display_name> <username> — создать нового бота через BotFather и запустить как клон
+  /newguest <display_name> <username> — создать гостевого бота и запустить в guest-режиме
 
 Архитектура клонов:
   Клон — это тот же бот с тем же кодом, запущенный как дочерний процесс.
@@ -74,6 +75,11 @@ def _launch_clone_process(entry: dict) -> "_subprocess.Popen | None":
     env = _os.environ.copy()
     env["BOT_TOKEN"] = token
     env["IS_CLONE"] = "1"
+    role = str(entry.get("role", "clone") or "clone").strip().lower()
+    if role == "guest":
+        env["IS_GUEST_BOT"] = "1"
+    else:
+        env.pop("IS_GUEST_BOT", None)
 
     log_path = _os.path.join(DATA_DIR, f"clone_{bot_id}.log")
     try:
@@ -234,8 +240,11 @@ def _format_clones_text(entries: list[dict]) -> str:
         username = _html.escape(str(e.get("username") or "?"))
         name = _html.escape(str(e.get("name") or ""))
         bot_id = e.get("bot_id", "?")
+        role = str(e.get("role", "clone") or "clone").strip().lower()
+        role_label = "гость" if role == "guest" else "клон"
         lines.append(
             f"• <b>@{username}</b> ({name}) — ID: <code>{bot_id}</code>\n"
+            f"  Тип: <i>{role_label}</i>\n"
             f"  Статус: <i>{status_text}</i>"
         )
     return "\n".join(lines)
@@ -321,6 +330,7 @@ def cmd_clone_register(m: types.Message):
         "username": bot_username,
         "name": bot_name,
         "token": token,
+        "role": "clone",
         "status": "running",
         "created_at": int(time.time()),
     }
@@ -477,8 +487,46 @@ def cmd_newbot(m: types.Message):
 
     username = parts[-1].strip().lstrip("@")
     display_name = " ".join(parts[1:-1]).strip()
+    _start_new_bot_creation(m, display_name, username, role="clone")
 
-    wait_msg = bot.reply_to(m, "⏳ Создаю бота через @BotFather…")
+
+@bot.message_handler(commands=["newguest"])
+def cmd_newguest(m: types.Message):
+    """
+    /newguest <display_name> <username>
+    Создаёт нового гостевого бота через BotFather (Telethon MTProto), затем
+    регистрирует и запускает его как гостя.
+    """
+    if should_ignore_text_triggers(m):
+        return
+    if m.chat.type != "private" or not _is_owner(m.from_user):
+        return
+
+    parts = m.text.split()
+    if len(parts) < 3:
+        bot.reply_to(
+            m,
+            "<b>Создание гостевого бота через BotFather</b>\n\n"
+            "Использование: <code>/newguest Название @username</code>\n\n"
+            "Пример: <code>/newguest Мой гость myguest_bot</code>\n\n"
+            "<i>Последнее слово — username (суффикс «bot» добавляется автоматически).\n"
+            "Требуется авторизованная MTProto-сессия (Telethon).</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    username = parts[-1].strip().lstrip("@")
+    display_name = " ".join(parts[1:-1]).strip()
+    _start_new_bot_creation(m, display_name, username, role="guest")
+
+
+def _start_new_bot_creation(m: types.Message, display_name: str, username: str, role: str = "clone") -> None:
+    role = str(role or "clone").strip().lower()
+    is_guest = role == "guest"
+    role_word = "гостя" if is_guest else "бота"
+    role_label = "гостя" if is_guest else "клона"
+
+    wait_msg = bot.reply_to(m, f"⏳ Создаю {role_word} через @BotFather…")
 
     def _do_create() -> None:
         try:
@@ -504,7 +552,6 @@ def cmd_newbot(m: types.Message):
             return
 
         final_username = info  # BotFather confirmed this username
-        # Validate the received token
         try:
             test_bot = _tb.TeleBot(token)
             me = test_bot.get_me()
@@ -521,10 +568,9 @@ def cmd_newbot(m: types.Message):
             )
             return
 
-        # Avoid duplicate registration
         if _find_clone(str(bot_id)) or _find_clone(bot_username):
             bot.edit_message_text(
-                f"Клон <b>@{_html.escape(bot_username)}</b> уже зарегистрирован.",
+                f"Бот <b>@{_html.escape(bot_username)}</b> уже зарегистрирован.",
                 wait_msg.chat.id, wait_msg.message_id,
                 parse_mode="HTML",
             )
@@ -535,6 +581,7 @@ def cmd_newbot(m: types.Message):
             "username": bot_username,
             "name": bot_name,
             "token": token,
+            "role": role,
             "status": "running",
             "created_at": int(time.time()),
         }
@@ -546,17 +593,24 @@ def cmd_newbot(m: types.Message):
             save_clones()
             pid_info = f"\nPID: <code>{proc.pid}</code>"
         else:
-            pid_info = "\n⚠️ Автозапуск не удался — запусти клон вручную."
+            pid_info = "\n⚠️ Автозапуск не удался — запусти бота вручную."
+
+        note = ""
+        if is_guest:
+            note = (
+                "\n\n<i>В гостевом режиме пользовательские команды работают только так:</i>\n"
+                f"<code>@{_html.escape(bot_username)} имя_команды</code>"
+            )
 
         bot.edit_message_text(
             f"✅ Бот <b>@{_html.escape(bot_username)}</b> создан через BotFather "
-            f"и запущен как клон!\n"
-            f"ID: <code>{bot_id}</code>{pid_info}",
+            f"и запущен как {role_label}!\n"
+            f"ID: <code>{bot_id}</code>{pid_info}{note}",
             wait_msg.chat.id, wait_msg.message_id,
             parse_mode="HTML",
         )
 
-    _threading.Thread(target=_do_create, daemon=False, name=f"newbot-{username}").start()
+    _threading.Thread(target=_do_create, daemon=False, name=f"new{role}-{username}").start()
 
 
 # ─────────────────────────── вспомогательные ─────────────────────────────────

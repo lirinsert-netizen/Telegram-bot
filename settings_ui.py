@@ -20,6 +20,7 @@ from config import (
     ApiTelegramException, InlineKeyboardMarkup, InlineKeyboardButton,
     bot, bot_raw, tg_client,
     TOKEN, OWNER_USERNAME, DATA_DIR, API_BASE_URL,
+    IS_GUEST_BOT,
     COMMAND_PREFIXES, MAX_MSG_LEN,
     PREMIUM_PREFIX_EMOJI_ID, EMOJI_RATE_LIMIT_ID,
     EMOJI_DEV_ID, EMOJI_MEMBER_ID, EMOJI_ADMIN_ID, EMOJI_OWNER_ID,
@@ -5657,6 +5658,7 @@ _RESERVED_CMD_NAMES = {
     "closechat", "openchat",
     "verify", "unverify", "vlist", "devverify", "devunverify", "devvlist",
     "clones", "clone_register", "clone_unlink", "newbot",
+    "newguest",
     "del", "delete",
 }
 
@@ -5696,10 +5698,14 @@ def _render_commands_main(chat_id: int) -> str:
     emoji_settings = f'<tg-emoji emoji-id="{EMOJI_ROLE_SETTINGS_SENT_PM_ID}">⚙️</tg-emoji>'
     cmds = _get_commands_dict(chat_id)
     count = len(cmds)
+    trigger_hint = (
+        "ввести <code>@username_бота имя_команды</code> и получить настроенное сообщение с текстом, медиа и кнопками."
+        if IS_GUEST_BOT
+        else "ввести команду и получить настроенное сообщение с текстом, медиа и кнопками."
+    )
     return (
         f'<tg-emoji emoji-id="5377844313575150051">📋</tg-emoji> <b>Команды</b>\n\n'
-        f"Создайте пользовательские команды для этой группы. Пользователи смогут ввести команду "
-        f"и получить настроенное сообщение с текстом, медиа и кнопками.\n\n"
+        f"Создайте пользовательские команды для этой группы. Пользователи смогут {trigger_hint}\n\n"
         f"<b>Количество команд:</b> <code>{count}</code> / <code>{_CMD_MAX_COUNT}</code>"
     )
 
@@ -6012,7 +6018,11 @@ def cb_commands_settings(c: types.CallbackQuery):
             f'<tg-emoji emoji-id="5226945370684140473">➕</tg-emoji> <b>Создание команды</b>\n\n'
             "Пришлите <b>имя</b> новой команды.\n"
             f"<i>Одно слово, до {_CMD_MAX_NAME_LEN} символов. "
-            "Команда срабатывает, когда пользователь напишет только это слово в группе.</i>"
+            + (
+                "Команда срабатывает, когда пользователь напишет «@username_бота имя_команды» в группе.</i>"
+                if IS_GUEST_BOT
+                else "Команда срабатывает, когда пользователь напишет только это слово в группе.</i>"
+            )
         )
         kb_n = InlineKeyboardMarkup()
         kb_n.add(_build_cancel_btn(f"cmd_add_cancel:{chat_id}"))
@@ -6378,28 +6388,49 @@ def cb_cmd_navigate(c: types.CallbackQuery):
 
 @bot.message_handler(func=lambda m: (
     m.chat.type in ("group", "supergroup") and
-    bool(m.text) and
-    len((m.text or "").split()) == 1 and
-    not (m.text or "").lstrip().startswith("/")
+    bool(m.text)
 ))
 def on_custom_command_message(m: types.Message):
     # Посты от привязанного канала или анонимного администратора — пропускаем
     if not m.from_user or _is_channel_sender(m) or _is_anonymous_admin(m):
+        return ContinueHandling()
+    if should_ignore_text_triggers(m):
         return ContinueHandling()
 
     if not is_group_approved(m.chat.id):
         return ContinueHandling()
 
     text = (m.text or "").strip()
-    if not text or len(text) > _CMD_MAX_NAME_LEN + 5:
+    if not text:
         return ContinueHandling()
+
+    parts = text.split()
+    if IS_GUEST_BOT:
+        if len(parts) != 2:
+            return ContinueHandling()
+        mention = (parts[0] or "").strip()
+        if not mention.startswith("@"):
+            return ContinueHandling()
+        bot_username = _get_bot_username_lower()
+        if not bot_username:
+            return ContinueHandling()
+        if mention[1:].lower() != bot_username:
+            return ContinueHandling()
+        cmd_key = (parts[1] or "").strip().lower()
+        if not cmd_key or cmd_key.startswith("/") or len(cmd_key) > _CMD_MAX_NAME_LEN:
+            return ContinueHandling()
+    else:
+        if len(parts) != 1:
+            return ContinueHandling()
+        cmd_key = text.lower()
+        if cmd_key.startswith("/") or len(cmd_key) > _CMD_MAX_NAME_LEN:
+            return ContinueHandling()
 
     st = get_chat_settings(m.chat.id)
     cmds = st.get("commands")
     if not isinstance(cmds, dict) or not cmds:
         return ContinueHandling()
 
-    cmd_key = text.lower()
     cmd_data = cmds.get(cmd_key)
     if not cmd_data:
         return ContinueHandling()
