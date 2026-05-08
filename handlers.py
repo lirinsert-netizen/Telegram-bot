@@ -24,7 +24,6 @@ from config import (
     ApiTelegramException, InlineKeyboardMarkup, InlineKeyboardButton,
     bot, bot_raw, tg_client,
     TOKEN, OWNER_USERNAME, DATA_DIR, API_BASE_URL,
-    IS_GUEST_BOT,
     COMMAND_PREFIXES, MAX_MSG_LEN,
     PREMIUM_STATS_EMOJI_ID, PREMIUM_USER_EMOJI_ID,
     PREMIUM_PREFIX_EMOJI_ID, EMOJI_RATE_LIMIT_ID,
@@ -1294,8 +1293,10 @@ def cb_pm_settings_open(call: types.CallbackQuery):
     "deny_group:",
     "pm_settings_open:",
     "pm_settings_back",
+    "start:newguest",
     "clone_disable:",
     "clone_enable:",
+    "guestbot:",
 )))
 def callback_handler(call: types.CallbackQuery):
     if _is_duplicate_callback_query(call):
@@ -1818,23 +1819,6 @@ def callback_handler(call: types.CallbackQuery):
         _show_dev_contact_new_messages(call.from_user.id)
         return bot.answer_callback_query(call.id, "Отправляю новые сообщения…", show_alert=False)
 
-    if data == 'start:newguest':
-        state = START_MENU_STATE.get((chat_id, msg_id))
-        if not state:
-            return bot.answer_callback_query(call.id, "Меню устарело, открой /start заново.", show_alert=False)
-
-        owner_id = int(state.get('user_id') or 0)
-        if call.from_user.id != owner_id:
-            return bot.answer_callback_query(call.id, "Это меню не для вас.", show_alert=False)
-
-        if not is_owner(call.from_user):
-            return bot.answer_callback_query(call.id, "Кнопка доступна только разработчику.", show_alert=False)
-
-        from clones import start_guest_registration_prompt
-
-        start_guest_registration_prompt(chat_id, call.from_user)
-        return bot.answer_callback_query(call.id, "Жду токен гостевого бота.", show_alert=False)
-
     bot.answer_callback_query(call.id)
 
 
@@ -1974,29 +1958,26 @@ def handle_my_chat_member(update: types.ChatMemberUpdated):
         if old_status in ("member", "administrator"):
             return
 
-        # Для guest-бота не блокируем группу assignment'ом:
-        # он должен работать рядом с основным ботом по mention-триггеру.
-        if not IS_GUEST_BOT:
-            # Бот добавлен в группу — проверяем, нет ли уже другого бота
-            try:
-                me = get_bot_me()
-                my_id = me.id
-                my_username = me.username or ""
-            except Exception:
-                my_id = 0
-                my_username = ""
+        # Бот добавлен в группу — проверяем, нет ли уже другого бота
+        try:
+            me = get_bot_me()
+            my_id = me.id
+            my_username = me.username or ""
+        except Exception:
+            my_id = 0
+            my_username = ""
 
-            ok = assign_bot_to_chat(chat_id, my_id, my_username)
-            if not ok:
-                # Группа уже занята другим клоном — покидаем
-                try:
-                    bot.leave_chat(chat_id)
-                    print(
-                        f"[CLONE] Покинул группу {chat_id}: уже обслуживается другим ботом."
-                    )
-                except Exception as e:
-                    print(f"[CLONE] Не удалось покинуть группу {chat_id}: {e}")
-                return
+        ok = assign_bot_to_chat(chat_id, my_id, my_username)
+        if not ok:
+            # Группа уже занята другим клоном — покидаем
+            try:
+                bot.leave_chat(chat_id)
+                print(
+                    f"[CLONE] Покинул группу {chat_id}: уже обслуживается другим ботом."
+                )
+            except Exception as e:
+                print(f"[CLONE] Не удалось покинуть группу {chat_id}: {e}")
+            return
 
         # Группа добавлена или уже наша — обычная логика одобрения
         adder = update.from_user
@@ -2006,8 +1987,7 @@ def handle_my_chat_member(update: types.ChatMemberUpdated):
 
     elif new_status == "left":
         # Бот удалён из группы — освобождаем привязку
-        if not IS_GUEST_BOT:
-            unassign_bot_from_chat(chat_id)
+        unassign_bot_from_chat(chat_id)
         deny_pending_group(chat_id)
         print(f"[INFO] Бот удалён из группы {chat_id}")
 

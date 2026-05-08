@@ -21,7 +21,6 @@ from config import (
     ApiTelegramException, InlineKeyboardMarkup, InlineKeyboardButton,
     bot, bot_raw, tg_client,
     TOKEN, OWNER_USERNAME, DATA_DIR, API_BASE_URL,
-    IS_GUEST_BOT,
     COMMAND_PREFIXES, MAX_MSG_LEN,
     PREMIUM_PREFIX_EMOJI_ID, EMOJI_RATE_LIMIT_ID,
     EMOJI_DEV_ID, EMOJI_MEMBER_ID, EMOJI_ADMIN_ID, EMOJI_OWNER_ID,
@@ -5662,7 +5661,7 @@ _RESERVED_CMD_NAMES = {
     "closechat", "openchat",
     "verify", "unverify", "vlist", "devverify", "devunverify", "devvlist",
     "clones", "clone_register", "clone_unlink", "newbot",
-    "newguest",
+    "guestbots",
     "del", "delete",
 }
 
@@ -5692,19 +5691,13 @@ def _get_commands_dict(chat_id: int) -> dict:
     cmds = scoped.get(scope_key)
     if not isinstance(cmds, dict):
         legacy_cmds = st.get("commands")
-        if (
-            not IS_GUEST_BOT
-            and isinstance(legacy_cmds, dict)
-            and legacy_cmds
-            and not scoped
-        ):
+        if isinstance(legacy_cmds, dict) and legacy_cmds and not scoped:
             cmds = dict(legacy_cmds)
         else:
             cmds = {}
         scoped[scope_key] = cmds
 
-    if not IS_GUEST_BOT:
-        st["commands"] = cmds
+    st["commands"] = cmds
     CHAT_SETTINGS[str(chat_id)] = st
     return cmds
 
@@ -5716,51 +5709,9 @@ def _save_commands(chat_id: int, cmds: dict):
         scoped = {}
         st[_BOT_SCOPED_COMMANDS_KEY] = scoped
     scoped[_get_commands_scope_key()] = cmds
-    if not IS_GUEST_BOT:
-        st["commands"] = cmds
+    st["commands"] = cmds
     CHAT_SETTINGS[str(chat_id)] = st
     save_chat_settings()
-
-
-def _extract_guest_command_key(text: str, bot_username: str) -> Optional[str]:
-    """Extract command key in guest mode from @username command-like formats."""
-    raw = (text or "").strip()
-    if not raw or not bot_username:
-        return None
-
-    my_username = bot_username.lower()
-    tokens = raw.split()
-    if not tokens:
-        return None
-
-    first = tokens[0]
-    second = tokens[1] if len(tokens) > 1 else ""
-
-    mention = ""
-    cmd = ""
-    if first.startswith("@"):
-        mention = first[1:]
-        cmd = second.lstrip("/")
-    elif first.startswith("/") and "@" in first:
-        cmd_part, separator, mention_part = first[1:].partition("@")
-        if not separator:
-            return None
-        mention = mention_part
-        cmd = cmd_part
-    if not mention or mention.lower() != my_username:
-        return None
-    if not cmd:
-        return None
-
-    cmd = cmd.lower().strip(_CMD_STRIP_CHARS).strip()
-    if (
-        not cmd
-        or cmd.startswith("@")
-        or cmd.startswith("/")
-        or len(cmd) > _CMD_MAX_NAME_LEN
-    ):
-        return None
-    return cmd
 
 
 def _get_commands_scope_key() -> str:
@@ -5783,11 +5734,7 @@ def _render_commands_main(chat_id: int) -> str:
     cmds = _get_commands_dict(chat_id)
     count = len(cmds)
     trigger_suffix = "и получить настроенное сообщение с текстом, медиа и кнопками."
-    trigger_hint = (
-        f"ввести <code>@username_бота имя_команды</code> {trigger_suffix}"
-        if IS_GUEST_BOT
-        else f"ввести команду {trigger_suffix}"
-    )
+    trigger_hint = f"ввести команду {trigger_suffix}"
     return (
         f'<tg-emoji emoji-id="5377844313575150051">📋</tg-emoji> <b>Команды</b>\n\n'
         f"Создайте пользовательские команды для этой группы. Пользователи смогут {trigger_hint}\n\n"
@@ -6103,11 +6050,7 @@ def cb_commands_settings(c: types.CallbackQuery):
             f'<tg-emoji emoji-id="5226945370684140473">➕</tg-emoji> <b>Создание команды</b>\n\n'
             "Пришлите <b>имя</b> новой команды.\n"
             f"<i>Одно слово, до {_CMD_MAX_NAME_LEN} символов. "
-            + (
-                "Команда срабатывает, когда пользователь напишет «@username_бота имя_команды» в группе.</i>"
-                if IS_GUEST_BOT
-                else "Команда срабатывает, когда пользователь напишет только это слово в группе.</i>"
-            )
+            + "Команда срабатывает, когда пользователь напишет только это слово в группе.</i>"
         )
         kb_n = InlineKeyboardMarkup()
         kb_n.add(_build_cancel_btn(f"cmd_add_cancel:{chat_id}"))
@@ -6489,21 +6432,12 @@ def on_custom_command_message(m: types.Message):
     if not text:
         return ContinueHandling()
 
-    if IS_GUEST_BOT:
-        bot_username = _get_bot_username_lower()
-        if not bot_username:
-            logger.warning("[GUEST CMD] Cannot process custom command: bot username is unknown.")
-            return ContinueHandling()
-        cmd_key = _extract_guest_command_key(text, bot_username)
-        if not cmd_key:
-            return ContinueHandling()
-    else:
-        parts = text.split()
-        if len(parts) != 1:
-            return ContinueHandling()
-        cmd_key = text.lower()
-        if cmd_key.startswith("/") or len(cmd_key) > _CMD_MAX_NAME_LEN:
-            return ContinueHandling()
+    parts = text.split()
+    if len(parts) != 1:
+        return ContinueHandling()
+    cmd_key = text.lower()
+    if cmd_key.startswith("/") or len(cmd_key) > _CMD_MAX_NAME_LEN:
+        return ContinueHandling()
 
     cmds = _get_commands_dict(m.chat.id)
     if not cmds:

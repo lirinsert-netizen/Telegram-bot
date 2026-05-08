@@ -125,7 +125,7 @@ def _build_start_home_keyboard(show_owner_button: bool = False) -> types.InlineK
     if show_owner_button:
         btn_new = types.InlineKeyboardButton("Новые сообщения", callback_data="start:newmsgs")
         btn_new.icon_custom_emoji_id = EMOJI_NEW_MSG_OWNER_ID
-        btn_guest = types.InlineKeyboardButton("Создать гостя", callback_data="start:newguest")
+        btn_guest = types.InlineKeyboardButton("Guest-боты", callback_data="start:newguest")
         kb.row(btn_new, btn_guest)
     return kb
 
@@ -402,7 +402,7 @@ def _build_start_commands_text(user: telebot.types.User) -> str:
             "<b>Команды разработчика</b>",
             f"• /log, /broadcast, /sendpm ({legend_dev_only} | {legend_pm_only})",
             f"• Новые сообщения ({legend_dev_only} | {legend_pm_only})",
-            f"• /newguest ({legend_dev_only} | {legend_pm_only})",
+            f"• /guestbots ({legend_dev_only} | {legend_pm_only})",
             f"• /botstatus ({legend_dev_only} | {legend_pm_only})",
             f"• /dbstatus, /sqlite_status, /dbmigrate, /sqlite_migrate ({legend_dev_only} | {legend_pm_only})",
             f"• /testuser, /dbg_users, /dbg_global_users, /migrate_users_to_global ({legend_dev_only} | {legend_pm_only})",

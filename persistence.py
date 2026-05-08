@@ -111,6 +111,43 @@ def _db_connect() -> sqlite3.Connection:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS guest_bots (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_user_id      INTEGER NOT NULL,
+                bot_id             INTEGER NOT NULL UNIQUE,
+                bot_username       TEXT    NOT NULL UNIQUE,
+                bot_token          TEXT    NOT NULL UNIQUE,
+                display_name       TEXT    NOT NULL DEFAULT '',
+                status             TEXT    NOT NULL DEFAULT 'active',
+                enabled            INTEGER NOT NULL DEFAULT 1,
+                linked_modules_json TEXT   NOT NULL DEFAULT '[]',
+                runtime_pid        INTEGER,
+                created_at         INTEGER NOT NULL,
+                updated_at         INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS guest_commands (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                guest_bot_id   INTEGER NOT NULL,
+                name           TEXT    NOT NULL,
+                response_text  TEXT    NOT NULL DEFAULT '',
+                enabled        INTEGER NOT NULL DEFAULT 1,
+                created_at     INTEGER NOT NULL,
+                updated_at     INTEGER NOT NULL,
+                UNIQUE(guest_bot_id, name),
+                FOREIGN KEY(guest_bot_id) REFERENCES guest_bots(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_guest_commands_bot_enabled "
+            "ON guest_commands(guest_bot_id, enabled)"
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS log_channels (
                 chat_id       INTEGER PRIMARY KEY,
                 channel_id    INTEGER NOT NULL,
@@ -926,6 +963,342 @@ def reassign_bot_in_chat(chat_id: int, bot_id: int, bot_username: str) -> None:
             conn.commit()
     except Exception as e:
         print(f"[REASSIGN BOT] Error: {e}")
+
+
+# ──────────────────── guest_bots helpers ──────────────────────────────────────
+
+def _guest_modules_to_json(modules: list[str] | None) -> str:
+    norm: list[str] = []
+    for item in (modules or []):
+        value = str(item).strip().lower()
+        if not value or value in norm:
+            continue
+        if not value.replace("_", "").replace("-", "").isalnum():
+            continue
+        norm.append(value)
+    if not norm:
+        norm = ["commands"]
+    return json.dumps(norm, ensure_ascii=False)
+
+
+def _guest_bot_row_to_dict(row: sqlite3.Row | tuple | None) -> dict | None:
+    if not row:
+        return None
+    data = {
+        "id": int(row[0]),
+        "owner_user_id": int(row[1]),
+        "bot_id": int(row[2]),
+        "bot_username": str(row[3] or ""),
+        "bot_token": str(row[4] or ""),
+        "display_name": str(row[5] or ""),
+        "status": str(row[6] or "active"),
+        "enabled": bool(int(row[7] or 0)),
+        "runtime_pid": int(row[8] or 0),
+        "created_at": int(row[9] or 0),
+        "updated_at": int(row[10] or 0),
+    }
+    try:
+        data["linked_modules"] = json.loads(row[11] or "[]")
+    except Exception:
+        data["linked_modules"] = ["commands"]
+    if not isinstance(data["linked_modules"], list):
+        data["linked_modules"] = ["commands"]
+    return data
+
+
+def list_guest_bots(owner_user_id: int | None = None) -> list[dict]:
+    try:
+        with _DB_LOCK:
+            conn = _db_connect()
+            if owner_user_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT id, owner_user_id, bot_id, bot_username, bot_token, display_name,
+                           status, enabled, runtime_pid, created_at, updated_at, linked_modules_json
+                    FROM guest_bots
+                    ORDER BY created_at DESC
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, owner_user_id, bot_id, bot_username, bot_token, display_name,
+                           status, enabled, runtime_pid, created_at, updated_at, linked_modules_json
+                    FROM guest_bots
+                    WHERE owner_user_id = ?
+                    ORDER BY created_at DESC
+                    """,
+                    (int(owner_user_id),),
+                ).fetchall()
+        return [item for item in (_guest_bot_row_to_dict(r) for r in rows) if item]
+    except Exception as e:
+        print(f"[LIST GUEST BOTS] Error: {e}")
+        return []
+
+
+def get_guest_bot_by_id(guest_bot_id: int) -> dict | None:
+    try:
+        with _DB_LOCK:
+            conn = _db_connect()
+            row = conn.execute(
+                """
+                SELECT id, owner_user_id, bot_id, bot_username, bot_token, display_name,
+                       status, enabled, runtime_pid, created_at, updated_at, linked_modules_json
+                FROM guest_bots
+                WHERE id = ?
+                """,
+                (int(guest_bot_id),),
+            ).fetchone()
+        return _guest_bot_row_to_dict(row)
+    except Exception as e:
+        print(f"[GET GUEST BOT] Error: {e}")
+        return None
+
+
+def get_guest_bot_by_username(bot_username: str) -> dict | None:
+    uname = str(bot_username or "").strip().lstrip("@").lower()
+    if not uname:
+        return None
+    try:
+        with _DB_LOCK:
+            conn = _db_connect()
+            row = conn.execute(
+                """
+                SELECT id, owner_user_id, bot_id, bot_username, bot_token, display_name,
+                       status, enabled, runtime_pid, created_at, updated_at, linked_modules_json
+                FROM guest_bots
+                WHERE lower(bot_username) = ?
+                """,
+                (uname,),
+            ).fetchone()
+        return _guest_bot_row_to_dict(row)
+    except Exception as e:
+        print(f"[GET GUEST BOT BY USERNAME] Error: {e}")
+        return None
+
+
+def create_guest_bot(
+    owner_user_id: int,
+    bot_id: int,
+    bot_username: str,
+    bot_token: str,
+    display_name: str,
+    linked_modules: list[str] | None = None,
+) -> tuple[bool, str, dict | None]:
+    uname = str(bot_username or "").strip().lstrip("@").lower()
+    token = str(bot_token or "").strip()
+    if not owner_user_id or not bot_id or not uname or not token:
+        return False, "Некорректные данные guest-бота.", None
+
+    ts = int(time.time())
+    modules_json = _guest_modules_to_json(linked_modules)
+    try:
+        with _DB_LOCK:
+            conn = _db_connect()
+            conflict = conn.execute(
+                """
+                SELECT id, owner_user_id, bot_id, bot_username, bot_token, display_name,
+                       status, enabled, runtime_pid, created_at, updated_at, linked_modules_json
+                FROM guest_bots
+                WHERE bot_id = ? OR lower(bot_username) = ? OR bot_token = ?
+                LIMIT 1
+                """,
+                (int(bot_id), uname, token),
+            ).fetchone()
+            if conflict:
+                existing = _guest_bot_row_to_dict(conflict)
+                return False, "Этот guest-бот уже зарегистрирован.", existing
+
+            conn.execute(
+                """
+                INSERT INTO guest_bots(
+                    owner_user_id, bot_id, bot_username, bot_token, display_name,
+                    status, enabled, linked_modules_json, runtime_pid, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'active', 1, ?, 0, ?, ?)
+                """,
+                (
+                    int(owner_user_id),
+                    int(bot_id),
+                    uname,
+                    token,
+                    str(display_name or uname),
+                    modules_json,
+                    ts,
+                    ts,
+                ),
+            )
+            guest_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            conn.commit()
+        return True, "", get_guest_bot_by_id(guest_id)
+    except Exception as e:
+        print(f"[CREATE GUEST BOT] Error: {e}")
+        return False, "Не удалось сохранить guest-бота.", None
+
+
+def set_guest_bot_enabled(guest_bot_id: int, enabled: bool) -> bool:
+    ts = int(time.time())
+    try:
+        with _DB_LOCK:
+            conn = _db_connect()
+            conn.execute(
+                """
+                UPDATE guest_bots
+                SET enabled = ?, status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (1 if enabled else 0, "active" if enabled else "disabled", ts, int(guest_bot_id)),
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"[SET GUEST BOT ENABLED] Error: {e}")
+        return False
+
+
+def update_guest_bot_modules(guest_bot_id: int, linked_modules: list[str]) -> bool:
+    ts = int(time.time())
+    try:
+        with _DB_LOCK:
+            conn = _db_connect()
+            conn.execute(
+                """
+                UPDATE guest_bots
+                SET linked_modules_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (_guest_modules_to_json(linked_modules), ts, int(guest_bot_id)),
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"[UPDATE GUEST BOT MODULES] Error: {e}")
+        return False
+
+
+def set_guest_bot_runtime_pid(guest_bot_id: int, pid: int) -> bool:
+    ts = int(time.time())
+    try:
+        with _DB_LOCK:
+            conn = _db_connect()
+            conn.execute(
+                "UPDATE guest_bots SET runtime_pid = ?, updated_at = ? WHERE id = ?",
+                (int(pid or 0), ts, int(guest_bot_id)),
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"[SET GUEST BOT PID] Error: {e}")
+        return False
+
+
+def list_guest_commands(guest_bot_id: int, enabled_only: bool = False) -> list[dict]:
+    try:
+        with _DB_LOCK:
+            conn = _db_connect()
+            if enabled_only:
+                rows = conn.execute(
+                    """
+                    SELECT id, guest_bot_id, name, response_text, enabled, created_at, updated_at
+                    FROM guest_commands
+                    WHERE guest_bot_id = ? AND enabled = 1
+                    ORDER BY name ASC
+                    """,
+                    (int(guest_bot_id),),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, guest_bot_id, name, response_text, enabled, created_at, updated_at
+                    FROM guest_commands
+                    WHERE guest_bot_id = ?
+                    ORDER BY name ASC
+                    """,
+                    (int(guest_bot_id),),
+                ).fetchall()
+        out: list[dict] = []
+        for row in rows:
+            out.append(
+                {
+                    "id": int(row[0]),
+                    "guest_bot_id": int(row[1]),
+                    "name": str(row[2] or ""),
+                    "response_text": str(row[3] or ""),
+                    "enabled": bool(int(row[4] or 0)),
+                    "created_at": int(row[5] or 0),
+                    "updated_at": int(row[6] or 0),
+                }
+            )
+        return out
+    except Exception as e:
+        print(f"[LIST GUEST COMMANDS] Error: {e}")
+        return []
+
+
+def upsert_guest_command(guest_bot_id: int, name: str, response_text: str, enabled: bool = True) -> bool:
+    cmd_name = str(name or "").strip().lower()
+    if not cmd_name:
+        return False
+    ts = int(time.time())
+    try:
+        with _DB_LOCK:
+            conn = _db_connect()
+            conn.execute(
+                """
+                INSERT INTO guest_commands(guest_bot_id, name, response_text, enabled, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guest_bot_id, name) DO UPDATE SET
+                    response_text = excluded.response_text,
+                    enabled = excluded.enabled,
+                    updated_at = excluded.updated_at
+                """,
+                (int(guest_bot_id), cmd_name, str(response_text or ""), 1 if enabled else 0, ts, ts),
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"[UPSERT GUEST COMMAND] Error: {e}")
+        return False
+
+
+def delete_guest_command(guest_bot_id: int, name: str) -> bool:
+    cmd_name = str(name or "").strip().lower()
+    if not cmd_name:
+        return False
+    try:
+        with _DB_LOCK:
+            conn = _db_connect()
+            conn.execute(
+                "DELETE FROM guest_commands WHERE guest_bot_id = ? AND name = ?",
+                (int(guest_bot_id), cmd_name),
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"[DELETE GUEST COMMAND] Error: {e}")
+        return False
+
+
+def set_guest_command_enabled(guest_bot_id: int, name: str, enabled: bool) -> bool:
+    cmd_name = str(name or "").strip().lower()
+    if not cmd_name:
+        return False
+    ts = int(time.time())
+    try:
+        with _DB_LOCK:
+            conn = _db_connect()
+            conn.execute(
+                """
+                UPDATE guest_commands
+                SET enabled = ?, updated_at = ?
+                WHERE guest_bot_id = ? AND name = ?
+                """,
+                (1 if enabled else 0, ts, int(guest_bot_id), cmd_name),
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"[SET GUEST COMMAND ENABLED] Error: {e}")
+        return False
 
 
 # ──────────────────── log_channels helpers ───────────────────────────────────
