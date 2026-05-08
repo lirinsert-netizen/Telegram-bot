@@ -1455,7 +1455,7 @@ def cb_bw_settings(c: types.CallbackQuery) -> None:
 # ─────────────────────────────────────────────
 
 @bot.message_handler(
-    func=lambda m: m.chat.type in ('group', 'supergroup') and match_command(m.text or "", 'badd'),
+    func=lambda m: m.chat.type in ('group', 'supergroup') and match_command(m, 'badd'),
 )
 def cmd_badd(m: types.Message) -> None:
     user = m.from_user
@@ -1500,7 +1500,7 @@ def cmd_badd(m: types.Message) -> None:
 
 
 @bot.message_handler(
-    func=lambda m: m.chat.type in ('group', 'supergroup') and match_command(m.text or "", 'bdel'),
+    func=lambda m: m.chat.type in ('group', 'supergroup') and match_command(m, 'bdel'),
 )
 def cmd_bdel(m: types.Message) -> None:
     user = m.from_user
@@ -1537,7 +1537,7 @@ def cmd_bdel(m: types.Message) -> None:
 
 
 @bot.message_handler(
-    func=lambda m: m.chat.type in ('group', 'supergroup') and match_command(m.text or "", 'btest'),
+    func=lambda m: m.chat.type in ('group', 'supergroup') and match_command(m, 'btest'),
 )
 def cmd_btest(m: types.Message) -> None:
     user = m.from_user

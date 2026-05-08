@@ -328,7 +328,7 @@ def send_group_stats(chat: types.Chat, manual: bool = False):
     })
 
 
-@bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'] and is_exact_stat(m.text))
+@bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'] and is_exact_stat(m))
 def cmd_group_stats_manual(m: types.Message):
     add_stat_message(m)
     add_stat_command('group_stat')
@@ -424,22 +424,22 @@ def _stats_limited_guard(m: types.Message, period: str, chart_type: str) -> None
     })
 
 
-@bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'] and is_exact_stat_day(m.text))
+@bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'] and is_exact_stat_day(m))
 def cmd_stats_day(m: types.Message):
     _stats_limited_guard(m, period='1d', chart_type='users')
 
 
-@bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'] and is_exact_stat_week(m.text))
+@bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'] and is_exact_stat_week(m))
 def cmd_stats_week(m: types.Message):
     _stats_limited_guard(m, period='7d', chart_type='users')
 
 
-@bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'] and is_exact_stat_month(m.text))
+@bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'] and is_exact_stat_month(m))
 def cmd_stats_month(m: types.Message):
     _stats_limited_guard(m, period='30d', chart_type='users')
 
 
-@bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'] and is_exact_stat_all(m.text))
+@bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'] and is_exact_stat_all(m))
 def cmd_stats_all(m: types.Message):
     _stats_limited_guard(m, period='all', chart_type='users')
 
@@ -2001,4 +2001,3 @@ def all_other(m: types.Message):
 
 
 __all__ = [name for name in globals() if not name.startswith('__')]
-

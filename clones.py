@@ -245,6 +245,8 @@ def _format_clones_text(entries: list[dict]) -> str:
 
 @bot.message_handler(commands=["clones"])
 def cmd_clones(m: types.Message):
+    if should_ignore_text_triggers(m):
+        return
     if m.chat.type != "private" or not _is_owner(m.from_user):
         return
 
@@ -267,6 +269,8 @@ def cmd_clone_register(m: types.Message):
     /clone_register TOKEN
     Регистрирует клон по токену, полученному от BotFather (/newbot).
     """
+    if should_ignore_text_triggers(m):
+        return
     if m.chat.type != "private" or not _is_owner(m.from_user):
         return
 
@@ -352,6 +356,8 @@ def cmd_clone_unlink(m: types.Message):
     /clone_unlink <username|bot_id>
     Удаляет клон из реестра и освобождает все его группы.
     """
+    if should_ignore_text_triggers(m):
+        return
     if m.chat.type != "private" or not _is_owner(m.from_user):
         return
 
@@ -451,6 +457,8 @@ def cmd_newbot(m: types.Message):
     и запускает его как клон.
     Последнее слово — username (@…bot), всё перед ним — display name.
     """
+    if should_ignore_text_triggers(m):
+        return
     if m.chat.type != "private" or not _is_owner(m.from_user):
         return
 

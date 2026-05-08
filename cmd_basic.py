@@ -666,7 +666,7 @@ def _send_start_menu(chat_id: int, user: telebot.types.User):
         "show_owner_button": show_owner_button,
     }
 
-@bot.message_handler(func=lambda m: match_command(m.text, 'start'))
+@bot.message_handler(func=lambda m: match_command(m, 'start'))
 def cmd_start(m: types.Message):
     add_stat_message(m)
     add_stat_command('start')
@@ -679,7 +679,7 @@ def cmd_start(m: types.Message):
 
 
 @bot.message_handler(func=lambda m: m.chat.type == 'private' and (
-    text_starts_with_ci(m.text, 'связь с разработчиком') or text_starts_with_ci(m.text, 'связь')
+    text_starts_with_ci(m, 'связь с разработчиком') or text_starts_with_ci(m, 'связь')
 ))
 def cmd_contact_developer(m: types.Message):
     add_stat_message(m)
@@ -695,7 +695,7 @@ def cmd_contact_developer(m: types.Message):
     )
 
 
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and text_starts_with_ci(m.text, 'новые сообщения'))
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and text_starts_with_ci(m, 'новые сообщения'))
 def cmd_dev_new_messages(m: types.Message):
     add_stat_message(m)
 
@@ -835,7 +835,7 @@ def handle_dev_contact_non_text_input(m: types.Message):
     return ContinueHandling()
 
 
-@bot.message_handler(func=lambda m: match_command_aliases(m.text, ['ping', 'пинг']))
+@bot.message_handler(func=lambda m: match_command_aliases(m, ['ping', 'пинг']))
 def cmd_ping(m: types.Message):
     add_stat_message(m)
     add_stat_command('ping')
@@ -919,7 +919,7 @@ def cmd_ping(m: types.Message):
     )
 
 
-@bot.message_handler(func=lambda m: match_command(m.text, 'log'))
+@bot.message_handler(func=lambda m: match_command(m, 'log'))
 def cmd_log(m: types.Message):
     add_stat_message(m)
     add_stat_command('log')
@@ -995,7 +995,7 @@ def cmd_log(m: types.Message):
         bot.reply_to(m, premium_prefix(f"Не удалось отправить лог в ЛС: <code>{e}</code>"))
 
 
-@bot.message_handler(func=lambda m: match_command(m.text, 'broadcast'))
+@bot.message_handler(func=lambda m: match_command(m, 'broadcast'))
 def cmd_broadcast(m: types.Message):
     add_stat_message(m)
     add_stat_command('broadcast')
@@ -1039,7 +1039,7 @@ def cmd_broadcast(m: types.Message):
     )
 
 
-@bot.message_handler(func=lambda m: match_command(m.text, 'sendpm'))
+@bot.message_handler(func=lambda m: match_command(m, 'sendpm'))
 def cmd_sendpm(m: types.Message):
     add_stat_message(m)
     add_stat_command('sendpm')
@@ -1293,17 +1293,10 @@ def build_profile_text(chat: types.Chat, target: telebot.types.User) -> str:
 
     user_tag = get_user_custom_tag(chat.id, uid)
     if user_tag:
-        is_admin_tag = False
-        try:
-            m_obj = tg_get_chat_member(chat.id, uid)
-            is_admin_tag = getattr(m_obj, 'status', '') in ('administrator', 'creator')
-        except Exception:
-            pass
-        tag_type_label = "Администраторский тег" if is_admin_tag else "Пользовательский тег"
         text += (
             f"<b>Тег:</b>\n"
             f"<code>{_html.escape(user_tag)}</code>\n"
-            f"<i>{tag_type_label}</i>\n\n"
+            "\n"
         )
 
     return text
@@ -1375,7 +1368,7 @@ def build_profile_keyboard(chat_id: int, target_id: int, viewer_id: int) -> Inli
     )
     return kb
 
-@bot.message_handler(func=lambda m: text_starts_with_ci(m.text, "профиль"))
+@bot.message_handler(func=lambda m: text_starts_with_ci(m, "профиль"))
 def cmd_profile(m: types.Message):
     add_stat_message(m)
     add_stat_command('profile')
@@ -1643,7 +1636,7 @@ def _is_target_owner(target_id: int) -> bool:
         return False
 
 
-@bot.message_handler(func=lambda m: text_starts_with_ci(m.text, "наградить"))
+@bot.message_handler(func=lambda m: text_starts_with_ci(m, "наградить"))
 def cmd_award(m: types.Message):
     add_stat_message(m)
     add_stat_command('award')
@@ -1760,7 +1753,7 @@ def cmd_award(m: types.Message):
     )
 
 
-@bot.message_handler(func=lambda m: text_starts_with_ci(m.text, "снять награду"))
+@bot.message_handler(func=lambda m: text_starts_with_ci(m, "снять награду"))
 def cmd_remove_award(m: types.Message):
     add_stat_message(m)
     add_stat_command('remove_award')
@@ -1875,7 +1868,7 @@ def cmd_remove_award(m: types.Message):
     )
 
 
-@bot.message_handler(func=lambda m: text_starts_with_ci(m.text, "снять все награды"))
+@bot.message_handler(func=lambda m: text_starts_with_ci(m, "снять все награды"))
 def cmd_remove_all_awards(m: types.Message):
     add_stat_message(m)
     add_stat_command('remove_all_awards')
@@ -1997,6 +1990,8 @@ def _normalize_tag_text(tag_text: str) -> str:
 def cmd_settag(m: types.Message):
     add_stat_message(m)
     add_stat_command('settag')
+    if should_ignore_text_triggers(m):
+        return
 
     if m.chat.type not in ['group', 'supergroup']:
         return reply_error(m, "group_only")
@@ -2034,6 +2029,8 @@ def cmd_settag(m: types.Message):
 def cmd_removetag(m: types.Message):
     add_stat_message(m)
     add_stat_command('removetag')
+    if should_ignore_text_triggers(m):
+        return
 
     if m.chat.type not in ['group', 'supergroup']:
         return reply_error(m, "group_only")
@@ -2069,6 +2066,8 @@ def cmd_removetag(m: types.Message):
 def cmd_taglist(m: types.Message):
     add_stat_message(m)
     add_stat_command('taglist')
+    if should_ignore_text_triggers(m):
+        return
 
     wait_seconds = cooldown_hit('chat', int(m.chat.id), 'taglist', 15)
     if wait_seconds > 0:
@@ -2141,6 +2140,8 @@ def cmd_taglist(m: types.Message):
 
 
 def _extract_command_info(m: types.Message) -> tuple[str | None, str | None, str]:
+    if should_ignore_text_triggers(m):
+        return None, None, ""
     text = (m.text or "").strip()
     if not text:
         return None, None, ""
@@ -2174,14 +2175,14 @@ def cmd_taglist_ru_alias(m: types.Message):
     cmd_taglist(fake)
 
 
-@bot.message_handler(func=lambda m: text_starts_with_ci(m.text, "список тегов"))
+@bot.message_handler(func=lambda m: text_starts_with_ci(m, "список тегов"))
 def cmd_taglist_text(m: types.Message):
     fake = m
     fake.text = "/taglist"
     cmd_taglist(fake)
 
 
-@bot.message_handler(func=lambda m: text_starts_with_ci(m.text, "выдать тег"))
+@bot.message_handler(func=lambda m: text_starts_with_ci(m, "выдать тег"))
 def cmd_settag_text(m: types.Message):
     parts = m.text.split(maxsplit=2)
     rest = parts[2] if len(parts) >= 3 else ""
@@ -2190,7 +2191,7 @@ def cmd_settag_text(m: types.Message):
     cmd_settag(fake)
 
 
-@bot.message_handler(func=lambda m: text_starts_with_ci(m.text, "снять тег"))
+@bot.message_handler(func=lambda m: text_starts_with_ci(m, "снять тег"))
 def cmd_removetag_text(m: types.Message):
     parts = m.text.split(maxsplit=2)
     rest = parts[2] if len(parts) >= 3 else ""
@@ -2355,6 +2356,8 @@ def _resolve_target_and_promote_rank(m: types.Message) -> tuple[int | None, int 
 def cmd_promote(m: types.Message):
     add_stat_message(m)
     add_stat_command('promote')
+    if should_ignore_text_triggers(m):
+        return
 
     if m.chat.type not in ['group', 'supergroup']:
         return bot.reply_to(
@@ -2427,6 +2430,8 @@ def cmd_promote(m: types.Message):
 def cmd_demote(m: types.Message):
     add_stat_message(m)
     add_stat_command('demote')
+    if should_ignore_text_triggers(m):
+        return
 
     if m.chat.type not in ['group', 'supergroup']:
         return bot.reply_to(
@@ -2483,7 +2488,7 @@ def cmd_demote(m: types.Message):
     _send_role_change_log(m.chat.id, m.from_user.id, target_id, action="demote", new_rank=new_rank)
 
 
-@bot.message_handler(func=lambda m: text_starts_with_ci(m.text, "повысить"))
+@bot.message_handler(func=lambda m: text_starts_with_ci(m, "повысить"))
 def cmd_promote_text(m: types.Message):
     # "Повысить @user" или reply + "Повысить"
     parts = m.text.split(maxsplit=1)
@@ -2493,7 +2498,7 @@ def cmd_promote_text(m: types.Message):
     cmd_promote(fake)
 
 
-@bot.message_handler(func=lambda m: text_starts_with_ci(m.text, "понизить"))
+@bot.message_handler(func=lambda m: text_starts_with_ci(m, "понизить"))
 def cmd_demote_text(m: types.Message):
     parts = m.text.split(maxsplit=1)
     rest = parts[1] if len(parts) > 1 else ""
@@ -2505,6 +2510,8 @@ def cmd_demote_text(m: types.Message):
 def cmd_staff(m: types.Message):
     add_stat_message(m)
     add_stat_command('staff')
+    if should_ignore_text_triggers(m):
+        return
 
     wait_seconds = cooldown_hit('chat', int(m.chat.id), 'staff', 10)
     if wait_seconds > 0:
@@ -2669,7 +2676,7 @@ def _format_inactive_window(seconds: int) -> str:
     return f"{seconds // (365 * 24 * 60 * 60)}г"
 
 
-@bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'] and match_command_aliases(m.text, ['inactive', 'inactive_users', 'неактив', 'неактивные']))
+@bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'] and match_command_aliases(m, ['inactive', 'inactive_users', 'неактив', 'неактивные']))
 def cmd_inactive_users(m: types.Message):
     add_stat_message(m)
     _, cmd, _ = _extract_command_info(m)
@@ -2793,6 +2800,8 @@ def cmd_inactive_users(m: types.Message):
 
 @bot.message_handler(commands=['myrank'])
 def cmd_myrank(m: types.Message):
+    if should_ignore_text_triggers(m):
+        return
     wait_seconds = cooldown_hit('user', int(m.from_user.id), 'myrank', 10)
     if wait_seconds > 0:
         return reply_cooldown_message(m, wait_seconds, scope='user', bucket=int(m.from_user.id), action='myrank')
@@ -2808,7 +2817,7 @@ def cmd_myrank(m: types.Message):
 # DESCRIPTION – описание профиля
 # ==============================
 
-@bot.message_handler(func=lambda m: text_starts_with_ci(m.text, "+описание"))
+@bot.message_handler(func=lambda m: text_starts_with_ci(m, "+описание"))
 def cmd_set_description(m: types.Message):
     add_stat_message(m)
     add_stat_command("setdesc")
@@ -2915,7 +2924,7 @@ def cmd_set_description(m: types.Message):
     )
 
 
-@bot.message_handler(func=lambda m: text_starts_with_ci(m.text, "-описание"))
+@bot.message_handler(func=lambda m: text_starts_with_ci(m, "-описание"))
 def cmd_clear_description(m: types.Message):
     add_stat_message(m)
     add_stat_command("cleardesc")
@@ -3004,7 +3013,7 @@ def cmd_clear_description(m: types.Message):
     )
 
 
-@bot.message_handler(func=lambda m: text_starts_with_ci(m.text, "награды"))
+@bot.message_handler(func=lambda m: text_starts_with_ci(m, "награды"))
 def cmd_show_awards(m: types.Message):
     add_stat_message(m)
     add_stat_command('awards')
@@ -3057,7 +3066,7 @@ def cmd_show_awards(m: types.Message):
     )
 
 
-@bot.message_handler(func=lambda m: m.text and text_starts_with_ci(m.text, "описание") and not text_starts_with_ci(m.text, "+описание") and not text_starts_with_ci(m.text, "-описание"))
+@bot.message_handler(func=lambda m: m.text and text_starts_with_ci(m, "описание") and not text_starts_with_ci(m, "+описание") and not text_starts_with_ci(m, "-описание"))
 def cmd_show_description(m: types.Message):
     add_stat_message(m)
     add_stat_command('showdesc')
@@ -3293,6 +3302,8 @@ def send_closechat_message(chatid: int, actorid: int, durationseconds: int | Non
 def cmd_closechat(m: types.Message):
     add_stat_message(m)
     add_stat_command('closechat')
+    if should_ignore_text_triggers(m):
+        return
 
     if m.chat.type not in ['group', 'supergroup']:
         return bot.reply_to(
@@ -3363,7 +3374,7 @@ def cmd_closechat(m: types.Message):
         schedulereopenchat(chatid, durationseconds)
 
 
-@bot.message_handler(func=lambda m: text_starts_with_ci(m.text, "закрыть чат"))
+@bot.message_handler(func=lambda m: text_starts_with_ci(m, "закрыть чат"))
 def cmd_closechat_text(m: types.Message):
     add_stat_message(m)
     add_stat_command('closechat_text')
@@ -3441,6 +3452,8 @@ def cmd_closechat_text(m: types.Message):
 def cmd_openchat(m: types.Message):
     add_stat_message(m)
     add_stat_command('openchat')
+    if should_ignore_text_triggers(m):
+        return
 
     if m.chat.type not in ['group', 'supergroup']:
         return bot.reply_to(
@@ -3503,7 +3516,7 @@ def cmd_openchat(m: types.Message):
     )
 
 
-@bot.message_handler(func=lambda m: text_starts_with_ci(m.text, "открыть чат"))
+@bot.message_handler(func=lambda m: text_starts_with_ci(m, "открыть чат"))
 def cmd_openchat_text(m: types.Message):
     add_stat_message(m)
     add_stat_command('openchat_text')
@@ -3623,6 +3636,7 @@ TIKTOK_AUDIO_METADATA_MAX_LEN = 128
 TIKTOK_URL_TRAILING_CHARS = "]})>,.!?:;\"'"
 TIKTOK_DEFAULT_AUDIO_TITLE = "TikTok audio"
 TIKTOK_DEFAULT_AUDIO_PERFORMER = "TikTok"
+TIKTOK_ALBUM_CHUNK_SIZE = 10
 DOWNLOAD_TOGGLE_NO_PERM_TEXT = (
     "Недостаточно прав. Нужны права «Управление настройками группы», либо статус владельца чата, владельца бота или dev."
 )
@@ -3771,7 +3785,7 @@ def _tiktok_build_choice_keyboard(token: str) -> types.InlineKeyboardMarkup:
     return kb
 
 
-def _tiktok_download_file(url: str, mode: str) -> tuple[str, dict[str, Any], str]:
+def _tiktok_download_file(url: str, mode: str) -> tuple[list[str], dict[str, Any], str, str]:
     temp_dir = tempfile.mkdtemp(prefix="tiktok_dl_")
     if mode == "audio":
         ffmpeg_path = shutil.which("ffmpeg")
@@ -3811,26 +3825,41 @@ def _tiktok_download_file(url: str, mode: str) -> tuple[str, dict[str, Any], str
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        file_path = None
+        files: list[str] = []
         requested = (info or {}).get("requested_downloads") or []
         for entry in requested:
             if not isinstance(entry, dict):
                 continue
             candidate = (entry.get("filepath") or "").strip()
-            if candidate and os.path.exists(candidate):
-                file_path = candidate
-                break
-        if not file_path:
+            if candidate and os.path.exists(candidate) and candidate.lower().endswith(expected_exts):
+                files.append(candidate)
+
+        if not files:
             for file_name in os.listdir(temp_dir):
                 candidate = os.path.join(temp_dir, file_name)
                 if not os.path.isfile(candidate):
                     continue
                 if candidate.lower().endswith(expected_exts):
-                    file_path = candidate
-                    break
-        if not file_path:
-            raise RuntimeError(f"Не удалось подготовить {'аудио' if mode == 'audio' else 'видео'} для отправки.")
-        return file_path, (info or {}), temp_dir
+                    files.append(candidate)
+
+        files = sorted(list(dict.fromkeys(files)))
+        if files:
+            return files, (info or {}), temp_dir, ("audio" if mode == "audio" else "video")
+
+        if mode == "video":
+            image_exts = (".jpg", ".jpeg", ".png", ".webp")
+            image_files: list[str] = []
+            for file_name in os.listdir(temp_dir):
+                candidate = os.path.join(temp_dir, file_name)
+                if not os.path.isfile(candidate):
+                    continue
+                if candidate.lower().endswith(image_exts):
+                    image_files.append(candidate)
+            image_files = sorted(image_files)
+            if image_files:
+                return image_files, (info or {}), temp_dir, "photo"
+
+        raise RuntimeError(f"Не удалось подготовить {'аудио' if mode == 'audio' else 'видео'} для отправки.")
 
 
 def _send_with_optional_reply(send_func, reply_to_message_id: int | None):
@@ -3868,17 +3897,19 @@ def _run_tiktok_download_job(
     temp_dir = None
     try:
         bot.send_chat_action(chat_id, "upload_video" if mode == "video" else "upload_audio")
-        file_path, info, temp_dir = _tiktok_download_file(url, mode)
-
-        file_size = os.path.getsize(file_path)
-        if file_size > TIKTOK_MAX_FILE_SIZE_BYTES:
-            raise RuntimeError(
-                f"Файл слишком большой для отправки ботом (размер: {format_bytes_mb(file_size)}, "
-                f"максимум: {format_bytes_mb(TIKTOK_MAX_FILE_SIZE_BYTES)})."
-            )
+        media_paths, info, temp_dir, media_kind = _tiktok_download_file(url, mode)
+        if not media_paths:
+            raise RuntimeError("Не удалось подготовить файл для отправки.")
 
         user_link = _tiktok_user_link_html(user_name, user_username)
-        if mode == "video":
+        if media_kind == "video":
+            file_path = media_paths[0]
+            file_size = os.path.getsize(file_path)
+            if file_size > TIKTOK_MAX_FILE_SIZE_BYTES:
+                raise RuntimeError(
+                    f"Файл слишком большой для отправки ботом (размер: {format_bytes_mb(file_size)}, "
+                    f"максимум: {format_bytes_mb(TIKTOK_MAX_FILE_SIZE_BYTES)})."
+                )
             caption = (
                 f'<tg-emoji emoji-id="{PREMIUM_TIKTOK_PROMPT_EMOJI_ID}">📥</tg-emoji> '
                 f'{user_link}, ваше видео.'
@@ -3899,7 +3930,77 @@ def _run_tiktok_download_job(
                     )
 
             _send_with_optional_reply(_send_video, source_message_id)
+        elif media_kind == "photo":
+            caption = (
+                f'<tg-emoji emoji-id="{PREMIUM_TIKTOK_PROMPT_EMOJI_ID}">📥</tg-emoji> '
+                f'{user_link}, ваши фото.'
+            )
+            first_chunk = True
+            for i in range(0, len(media_paths), TIKTOK_ALBUM_CHUNK_SIZE):
+                chunk = media_paths[i:i + TIKTOK_ALBUM_CHUNK_SIZE]
+                if not chunk:
+                    continue
+
+                if len(chunk) == 1:
+                    photo_path = chunk[0]
+
+                    def _send_single_photo(reply_to_id: int | None):
+                        with open(photo_path, "rb") as photo_file:
+                            kwargs = {}
+                            if reply_to_id:
+                                kwargs["reply_to_message_id"] = reply_to_id
+                            return bot.send_photo(
+                                chat_id,
+                                photo_file,
+                                caption=caption if first_chunk else None,
+                                parse_mode='HTML' if first_chunk else None,
+                                **kwargs,
+                            )
+
+                    if first_chunk:
+                        _send_with_optional_reply(_send_single_photo, source_message_id)
+                    else:
+                        _send_single_photo(None)
+                    first_chunk = False
+                    continue
+
+                photo_files = []
+                try:
+                    media = []
+                    for idx, file_path in enumerate(chunk):
+                        fobj = open(file_path, "rb")
+                        photo_files.append(fobj)
+                        kwargs = {}
+                        if first_chunk and idx == 0:
+                            kwargs["caption"] = caption
+                            kwargs["parse_mode"] = "HTML"
+                        media.append(types.InputMediaPhoto(fobj, **kwargs))
+                    if first_chunk:
+                        _send_with_optional_reply(
+                            lambda reply_to_id: bot.send_media_group(
+                                chat_id,
+                                media,
+                                reply_to_message_id=reply_to_id,
+                            ) if reply_to_id else bot.send_media_group(chat_id, media),
+                            source_message_id,
+                        )
+                    else:
+                        bot.send_media_group(chat_id, media)
+                finally:
+                    for fobj in photo_files:
+                        try:
+                            fobj.close()
+                        except Exception:
+                            pass
+                first_chunk = False
         else:
+            file_path = media_paths[0]
+            file_size = os.path.getsize(file_path)
+            if file_size > TIKTOK_MAX_FILE_SIZE_BYTES:
+                raise RuntimeError(
+                    f"Файл слишком большой для отправки ботом (размер: {format_bytes_mb(file_size)}, "
+                    f"максимум: {format_bytes_mb(TIKTOK_MAX_FILE_SIZE_BYTES)})."
+                )
             caption = (
                 f'<tg-emoji emoji-id="{PREMIUM_TIKTOK_PROMPT_EMOJI_ID}">📥</tg-emoji> '
                 f'{user_link}, ваш звук.'
@@ -3961,6 +4062,8 @@ def _run_tiktok_download_job(
 def on_tiktok_link_message(m: types.Message):
     add_stat_message(m)
     add_stat_command("tiktok_link")
+    if should_ignore_text_triggers(m):
+        return
 
     if not m.from_user:
         return
@@ -4063,7 +4166,7 @@ def cb_tiktok_actions(c: types.CallbackQuery):
     ).start()
 
 
-@bot.message_handler(func=lambda m: match_command_aliases(m.text, ['musicoff']))
+@bot.message_handler(func=lambda m: match_command_aliases(m, ['musicoff']))
 def cmd_music_off(m: types.Message):
     add_stat_message(m)
     add_stat_command("musicoff")
@@ -4103,7 +4206,7 @@ def cmd_music_off(m: types.Message):
     )
 
 
-@bot.message_handler(func=lambda m: match_command_aliases(m.text, ['tiktokoff']))
+@bot.message_handler(func=lambda m: match_command_aliases(m, ['tiktokoff']))
 def cmd_tiktok_off(m: types.Message):
     add_stat_message(m)
     add_stat_command("tiktokoff")
@@ -4143,7 +4246,7 @@ def cmd_tiktok_off(m: types.Message):
     )
 
 
-@bot.message_handler(func=lambda m: match_command_aliases(m.text, ['musicon']))
+@bot.message_handler(func=lambda m: match_command_aliases(m, ['musicon']))
 def cmd_music_on(m: types.Message):
     add_stat_message(m)
     add_stat_command("musicon")
@@ -4183,7 +4286,7 @@ def cmd_music_on(m: types.Message):
     )
 
 
-@bot.message_handler(func=lambda m: match_command_aliases(m.text, ['tiktokon']))
+@bot.message_handler(func=lambda m: match_command_aliases(m, ['tiktokon']))
 def cmd_tiktok_on(m: types.Message):
     add_stat_message(m)
     add_stat_command("tiktokon")
@@ -4424,7 +4527,7 @@ def _music_extract_query(m: types.Message) -> tuple[str | None, str]:
     return cmd, (rest or "").strip()
 
 
-@bot.message_handler(func=lambda m: match_command_aliases(m.text, ['music', 'музыка']))
+@bot.message_handler(func=lambda m: match_command_aliases(m, ['music', 'музыка']))
 def cmd_music_search(m: types.Message):
     add_stat_message(m)
     cmd, query = _music_extract_query(m)
