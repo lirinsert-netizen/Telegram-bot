@@ -80,6 +80,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 #   - отключается broadcast от имени владельца
 # Основные функции (модерация, статистика, настройки) работают у всех ботов.
 IS_CLONE: bool = os.getenv("IS_CLONE", "0").strip() in {"1", "true", "yes", "on"}
+IS_GUEST_BOT: bool = os.getenv("IS_GUEST_BOT", "0").strip() in {"1", "true", "yes", "on"}
 
 BOT_THREADS = max(2, int(os.getenv("BOT_THREADS", "16")))
 DB_FLUSH_INTERVAL_SECONDS = max(1, int(os.getenv("DB_FLUSH_INTERVAL_SECONDS", "5")))

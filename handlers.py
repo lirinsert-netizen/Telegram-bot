@@ -1817,6 +1817,33 @@ def callback_handler(call: types.CallbackQuery):
         _show_dev_contact_new_messages(call.from_user.id)
         return bot.answer_callback_query(call.id, "Отправляю новые сообщения…", show_alert=False)
 
+    if data == 'start:newguest':
+        state = START_MENU_STATE.get((chat_id, msg_id))
+        if not state:
+            return bot.answer_callback_query(call.id, "Меню устарело, открой /start заново.", show_alert=False)
+
+        owner_id = int(state.get('user_id') or 0)
+        if call.from_user.id != owner_id:
+            return bot.answer_callback_query(call.id, "Это меню не для вас.", show_alert=False)
+
+        if not is_owner(call.from_user):
+            return bot.answer_callback_query(call.id, "Кнопка доступна только разработчику.", show_alert=False)
+
+        bot.send_message(
+            chat_id,
+            "<b>Создание гостевого бота</b>\n\n"
+            "Использование:\n"
+            "<code>/newguest Название @username</code>\n\n"
+            "Пример:\n"
+            "<code>/newguest Гостевой бот myguesthelper</code>\n\n"
+            "<i>После создания в гостевом боте пользовательские команды "
+            "срабатывают только в формате:</i>\n"
+            "<code>@username_бота имя_команды</code>",
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+        return bot.answer_callback_query(call.id, "Отправил инструкцию по созданию гостя.", show_alert=False)
+
     bot.answer_callback_query(call.id)
 
 
