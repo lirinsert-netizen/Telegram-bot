@@ -147,7 +147,6 @@ def raw_request(method: str, payload: dict):
 
 def raw_set_chat_member_tag(chat_id: int, user_id: int, tag: str | None) -> tuple[bool, str | None]:
     clean_tag = (tag or "").strip()
-    is_admin = False
     try:
         member = tg_get_chat_member(chat_id, user_id)
         is_admin = getattr(member, "status", "") in ("administrator", "creator")
@@ -1879,11 +1878,11 @@ def is_reply_to_linked_channel_post(m: types.Message | None) -> bool:
     sender_chat = getattr(reply, "sender_chat", None)
     if not sender_chat or getattr(sender_chat, "type", None) != "channel":
         return False
-    linked_id = get_linked_channel_id(int(getattr(m.chat, "id", 0) or 0))
+    linked_id = get_linked_channel_id(m.chat.id)
     if not linked_id:
         return False
     try:
-        return int(getattr(sender_chat, "id", 0) or 0) == int(linked_id)
+        return sender_chat.id == linked_id
     except Exception:
         return False
 

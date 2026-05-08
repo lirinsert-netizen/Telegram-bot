@@ -3786,6 +3786,14 @@ def _tiktok_build_choice_keyboard(token: str) -> types.InlineKeyboardMarkup:
 
 
 def _tiktok_download_file(url: str, mode: str) -> tuple[list[str], dict[str, Any], str, str]:
+    """
+    Download TikTok media.
+    Returns:
+      - files: list of downloaded file paths (1+ files for video/photo, usually 1 for audio)
+      - info: yt-dlp metadata dict
+      - temp_dir: temporary directory with downloaded artifacts
+      - media_kind: "audio", "video", or "photo"
+    """
     temp_dir = tempfile.mkdtemp(prefix="tiktok_dl_")
     if mode == "audio":
         ffmpeg_path = shutil.which("ffmpeg")
@@ -3975,17 +3983,16 @@ def _run_tiktok_download_job(
                             kwargs["caption"] = caption
                             kwargs["parse_mode"] = "HTML"
                         media.append(types.InputMediaPhoto(fobj, **kwargs))
+                    def _send_photo_group(reply_to_id: int | None):
+                        kwargs = {}
+                        if reply_to_id:
+                            kwargs["reply_to_message_id"] = reply_to_id
+                        return bot.send_media_group(chat_id, media, **kwargs)
+
                     if first_chunk:
-                        _send_with_optional_reply(
-                            lambda reply_to_id: bot.send_media_group(
-                                chat_id,
-                                media,
-                                reply_to_message_id=reply_to_id,
-                            ) if reply_to_id else bot.send_media_group(chat_id, media),
-                            source_message_id,
-                        )
+                        _send_with_optional_reply(_send_photo_group, source_message_id)
                     else:
-                        bot.send_media_group(chat_id, media)
+                        _send_photo_group(None)
                 finally:
                     for fobj in photo_files:
                         try:

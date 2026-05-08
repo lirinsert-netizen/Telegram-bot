@@ -80,6 +80,13 @@ MOD_ERR = {
 _FAREWELL_SUPPRESS: dict[tuple[int, int], float] = {}
 FAREWELL_SUPPRESS_SECONDS = 120
 
+_REPLY_BLOCKED_ON_LINKED_CHANNEL_CMDS = {
+    "mute", "мут", "ban", "бан", "warn", "варн", "kick", "кик",
+    "delmute", "delban", "delwarn", "делмут", "делбан", "делварн",
+    "unmute", "размут", "анмут", "unban", "разбан", "unwarn", "снятьварн", "анварн",
+    "del", "дел",
+}
+
 
 def _mark_farewell_suppressed(chat_id: int, user_id: int, seconds: int = FAREWELL_SUPPRESS_SECONDS):
     _FAREWELL_SUPPRESS[(int(chat_id), int(user_id))] = time.time() + max(1, int(seconds))
@@ -1642,12 +1649,7 @@ def cmd_moderation_main(m: types.Message):
     prefix, cmd, rest = _extract_command_info(m)
     if not cmd:
         return
-    if cmd in {
-        "mute", "мут", "ban", "бан", "warn", "варн", "kick", "кик",
-        "delmute", "delban", "delwarn", "делмут", "делбан", "делварн",
-        "unmute", "размут", "анмут", "unban", "разбан", "unwarn", "снятьварн", "анварн",
-        "del", "дел",
-    } and is_reply_to_linked_channel_post(m):
+    if cmd in _REPLY_BLOCKED_ON_LINKED_CHANNEL_CMDS and is_reply_to_linked_channel_post(m):
         return
 
     if cmd in ("del", "дел") and prefix in ('/', '.'):
@@ -2413,4 +2415,3 @@ def cb_adminstats_nav(c: types.CallbackQuery):
         pass
 
     return bot.answer_callback_query(c.id)
-
