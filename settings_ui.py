@@ -5641,6 +5641,7 @@ def _send_section_payload(chat_id: int, sec: str, viewer_user, chat_title: str, 
 _CMD_MAX_NAME_LEN = 30
 _CMD_MAX_COUNT = 100
 _CMD_USER_COOLDOWN_SECONDS = 10
+_BOT_SCOPED_COMMANDS_KEY = "commands_by_bot"
 
 _cmd_user_cooldown: dict[tuple[int, int], float] = {}
 _cmd_user_cooldown_lock = threading.Lock()
@@ -5679,21 +5680,85 @@ def _cmd_cooldown_check(chat_id: int, user_id: int) -> float:
 
 
 def _get_commands_dict(chat_id: int) -> dict:
-    """Get the commands dict for a chat (chat-local)."""
+    """Get the commands dict for a chat, scoped by current bot id."""
     st = get_chat_settings(chat_id)
-    cmds = st.get("commands")
+    scoped = st.get(_BOT_SCOPED_COMMANDS_KEY)
+    if not isinstance(scoped, dict):
+        scoped = {}
+        st[_BOT_SCOPED_COMMANDS_KEY] = scoped
+
+    scope_key = str(_get_bot_id() or 0)
+    cmds = scoped.get(scope_key)
     if not isinstance(cmds, dict):
-        cmds = {}
+        legacy_cmds = st.get("commands")
+        if (
+            not IS_GUEST_BOT
+            and isinstance(legacy_cmds, dict)
+            and legacy_cmds
+            and not scoped
+        ):
+            cmds = dict(legacy_cmds)
+        else:
+            cmds = {}
+        scoped[scope_key] = cmds
+
+    if not IS_GUEST_BOT:
         st["commands"] = cmds
-        CHAT_SETTINGS[str(chat_id)] = st
+    CHAT_SETTINGS[str(chat_id)] = st
     return cmds
 
 
 def _save_commands(chat_id: int, cmds: dict):
     st = get_chat_settings(chat_id)
-    st["commands"] = cmds
+    scoped = st.get(_BOT_SCOPED_COMMANDS_KEY)
+    if not isinstance(scoped, dict):
+        scoped = {}
+        st[_BOT_SCOPED_COMMANDS_KEY] = scoped
+    scoped[str(_get_bot_id() or 0)] = cmds
+    if not IS_GUEST_BOT:
+        st["commands"] = cmds
     CHAT_SETTINGS[str(chat_id)] = st
     save_chat_settings()
+
+
+def _extract_guest_command_key(text: str, bot_username: str) -> Optional[str]:
+    """Extract command key in guest mode from @username command-like formats."""
+    raw = (text or "").strip()
+    if not raw or not bot_username:
+        return None
+
+    my_username = bot_username.lower()
+    tokens = raw.split()
+    if not tokens:
+        return None
+
+    first = tokens[0]
+    second = tokens[1] if len(tokens) > 1 else ""
+
+    mention = ""
+    cmd = ""
+    if first.startswith("@"):
+        mention = first[1:]
+        cmd = second.lstrip("/")
+    elif first.startswith("/") and "@" in first:
+        cmd_part, _, mention_part = first[1:].partition("@")
+        mention = mention_part
+        cmd = cmd_part
+    if not mention or mention.lower() != my_username:
+        return None
+    if not cmd:
+        return None
+
+    cmd = cmd.strip().lower()
+    cmd = cmd.strip("`'\"«»()[]{}<>.,;:!?")
+    if (
+        not cmd
+        or cmd.startswith("@")
+        or cmd.startswith("/")
+        or len(cmd) > _CMD_MAX_NAME_LEN
+    ):
+        return None
+    return cmd
 
 
 def _render_commands_main(chat_id: int) -> str:
@@ -6407,32 +6472,24 @@ def on_custom_command_message(m: types.Message):
     if not text:
         return ContinueHandling()
 
-    parts = text.split()
     if IS_GUEST_BOT:
-        if len(parts) != 2:
-            return ContinueHandling()
-        mention = parts[0]
-        if not mention.startswith("@"):
-            return ContinueHandling()
         bot_username = _get_bot_username_lower()
         if not bot_username:
             logger.warning("[GUEST CMD] Cannot process custom command: bot username is unknown.")
             return ContinueHandling()
-        if mention[1:].lower() != bot_username:
-            return ContinueHandling()
-        cmd_key = parts[1].lower()
-        if not cmd_key or cmd_key.startswith("/") or len(cmd_key) > _CMD_MAX_NAME_LEN:
+        cmd_key = _extract_guest_command_key(text, bot_username)
+        if not cmd_key:
             return ContinueHandling()
     else:
+        parts = text.split()
         if len(parts) != 1:
             return ContinueHandling()
         cmd_key = text.lower()
         if cmd_key.startswith("/") or len(cmd_key) > _CMD_MAX_NAME_LEN:
             return ContinueHandling()
 
-    st = get_chat_settings(m.chat.id)
-    cmds = st.get("commands")
-    if not isinstance(cmds, dict) or not cmds:
+    cmds = _get_commands_dict(m.chat.id)
+    if not cmds:
         return ContinueHandling()
 
     cmd_data = cmds.get(cmd_key)
