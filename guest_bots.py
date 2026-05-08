@@ -82,6 +82,18 @@ def _normalize_command_name(name: str) -> str:
     return str(name or "").strip().lower()
 
 
+def _guest_bot_username(entry: dict) -> str:
+    return _html.escape((entry.get("bot_username") or "").strip().lstrip("@"))
+
+
+def _guest_usage_examples(uname: str) -> tuple[str, str, str]:
+    return (
+        f"<code>@{uname} test</code>",
+        f"<code>/test@{uname}</code>",
+        "<code>test</code>",
+    )
+
+
 def _safe_int(value: object) -> int:
     try:
         return int(value)
@@ -271,11 +283,56 @@ def _guest_commands_text(entry: dict) -> str:
     return "\n".join(lines)
 
 
+def _guest_commands_usage_text(entry: dict) -> str:
+    uname = _guest_bot_username(entry)
+    ex_mention, ex_slash, ex_plain = _guest_usage_examples(uname)
+    return (
+        f"{_premium_emoji(EMOJI_LIST_ID)} <b>Инструкция guest-команд</b>\n\n"
+        "После включения guest-бота команды можно вызывать так:\n"
+        f"• {ex_mention}\n"
+        f"• {ex_slash}\n"
+        f"• {ex_plain}\n\n"
+        "Рекомендуемые тестовые команды:\n"
+        "• <code>test</code> — проверка ответа\n"
+        "• <code>ping</code> — быстрый пинг\n"
+        "• <code>guest_help</code> — подсказка по формату"
+    )
+
+
+def _guest_seed_test_commands(entry: dict) -> tuple[int, int]:
+    guest_id = int(entry.get("id") or 0)
+    if guest_id <= 0:
+        return 0, 0
+
+    uname = _guest_bot_username(entry)
+    ex_mention, ex_slash, ex_plain = _guest_usage_examples(uname)
+    test_payloads = [
+        ("test", f"✅ Guest-режим работает.\nПример: <code>@{uname} ping</code>"),
+        ("ping", "pong"),
+        (
+            "guest_help",
+            "Формат guest-команд:\n"
+            f"{ex_mention} | {ex_slash} | {ex_plain}",
+        ),
+    ]
+
+    success = 0
+    failed = 0
+    for cmd_name, response_text in test_payloads:
+        if upsert_guest_command(guest_id, cmd_name, response_text, enabled=True):
+            success += 1
+        else:
+            failed += 1
+    return success, failed
+
+
 def _guest_commands_kb(entry: dict) -> types.InlineKeyboardMarkup:
     guest_id = int(entry.get("id") or 0)
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(_btn("Добавить / обновить", callback_data=f"guestbot:cmdadd:{guest_id}", icon_id=EMOJI_ROLE_SETTINGS_SAVE_ID))
     kb.add(_btn("Удалить", callback_data=f"guestbot:cmddel:{guest_id}", icon_id=EMOJI_ROLE_SETTINGS_CANCEL_ID))
+    kb.add(_btn("Тест-команды", callback_data=f"guestbot:cmdseed:{guest_id}", icon_id=EMOJI_SENT_OK_ID))
+    kb.add(_btn("Инструкция", callback_data=f"guestbot:cmdhelp:{guest_id}", icon_id=EMOJI_LIST_ID))
     for item in list_guest_commands(guest_id)[:10]:
         name = _normalize_command_name(item.get("name") or "")
         icon_id = EMOJI_SENT_OK_ID if item.get("enabled") else EMOJI_ROLE_SETTINGS_CANCEL_ID
@@ -503,6 +560,53 @@ def guest_bots_callback(call: types.CallbackQuery):
         _PENDING_COMMAND_INPUT[int(call.from_user.id)] = {"mode": "del", "guest_bot_id": guest_id}
         bot.send_message(chat_id, "Отправьте имя команды для удаления.", parse_mode="HTML")
         bot.answer_callback_query(call.id, "Ожидаю имя команды.", show_alert=False)
+        return
+
+    if data.startswith("guestbot:cmdseed:"):
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
+            return
+        guest_id = _safe_int(parts[2])
+        entry = get_guest_bot_by_id(guest_id)
+        if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
+            bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
+            return
+        success, failed = _guest_seed_test_commands(entry)
+        refreshed = get_guest_bot_by_id(guest_id) or entry
+        try:
+            bot.edit_message_text(
+                _guest_commands_text(refreshed),
+                chat_id,
+                msg_id,
+                parse_mode="HTML",
+                reply_markup=_guest_commands_kb(refreshed),
+            )
+        except Exception:
+            pass
+        if failed:
+            bot.answer_callback_query(call.id, f"Создано {success}, ошибок {failed}.", show_alert=False)
+        else:
+            bot.answer_callback_query(call.id, f"Готово: {success} тест-команды.", show_alert=False)
+        return
+
+    if data.startswith("guestbot:cmdhelp:"):
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
+            return
+        guest_id = _safe_int(parts[2])
+        entry = get_guest_bot_by_id(guest_id)
+        if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
+            bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
+            return
+        bot.send_message(
+            chat_id,
+            _guest_commands_usage_text(entry),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        bot.answer_callback_query(call.id, "Инструкция отправлена.", show_alert=False)
         return
 
     if data.startswith("guestbot:cmdtog:"):
