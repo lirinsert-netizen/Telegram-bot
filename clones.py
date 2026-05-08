@@ -57,7 +57,8 @@ _CLONE_PROC_LOCK = _threading.Lock()
 
 # Regex to extract a Telegram bot token from BotFather's reply.
 _TOKEN_RE = _re.compile(r'\b(\d{8,10}:[A-Za-z0-9_-]{35,})\b')
-_PENDING_GUEST_REGISTRATION: dict[int, dict[str, int]] = {}
+_GUEST_REG_CANCEL_WORDS = {"отмена", "cancel", "/cancel"}
+_PENDING_GUEST_REGISTRATION: set[int] = set()
 
 
 def _normalize_role(value: object) -> str:
@@ -66,14 +67,11 @@ def _normalize_role(value: object) -> str:
 
 
 def _set_pending_guest_registration(user_id: int, chat_id: int) -> None:
-    _PENDING_GUEST_REGISTRATION[int(user_id)] = {
-        "chat_id": int(chat_id),
-        "created_at": int(time.time()),
-    }
+    _PENDING_GUEST_REGISTRATION.add(int(user_id))
 
 
 def _clear_pending_guest_registration(user_id: int) -> None:
-    _PENDING_GUEST_REGISTRATION.pop(int(user_id), None)
+    _PENDING_GUEST_REGISTRATION.discard(int(user_id))
 
 
 def start_guest_registration_prompt(chat_id: int, user: types.User | None) -> bool:
@@ -578,14 +576,14 @@ def _is_waiting_for_guest_token(m: types.Message) -> bool:
         return False
 
     command = (m.text or "").strip().split(maxsplit=1)[0].lower()
-    return not command.startswith("/") or command == "/cancel"
+    return command in _GUEST_REG_CANCEL_WORDS or not command.startswith("/")
 
 
 @bot.message_handler(func=_is_waiting_for_guest_token)
 def on_guest_token_message(m: types.Message):
     text = (m.text or "").strip()
     lower_text = text.lower()
-    if lower_text in {"отмена", "cancel", "/cancel"}:
+    if lower_text in _GUEST_REG_CANCEL_WORDS:
         _clear_pending_guest_registration(m.from_user.id)
         bot.reply_to(m, "Подключение гостевого бота отменено.")
         return
