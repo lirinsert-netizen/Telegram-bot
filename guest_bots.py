@@ -295,7 +295,7 @@ def _guest_commands_usage_text(entry: dict) -> str:
         "Рекомендуемые тестовые команды:\n"
         "• <code>test</code> — проверка ответа\n"
         "• <code>ping</code> — быстрый пинг\n"
-        "• <code>guesthelp</code> — подсказка по формату"
+        "• <code>guest_help</code> — подсказка по формату"
     )
 
 
@@ -310,7 +310,7 @@ def _guest_seed_test_commands(entry: dict) -> tuple[int, int]:
         ("test", f"✅ Guest-режим работает.\nПример: <code>@{uname} ping</code>"),
         ("ping", "pong"),
         (
-            "guesthelp",
+            "guest_help",
             "Формат guest-команд:\n"
             f"{ex_mention} | {ex_slash} | {ex_plain}",
         ),
