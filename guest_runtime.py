@@ -220,6 +220,8 @@ def _answer_guest_query(guest_query_id: str, response_text: str) -> bool:
     if not guest_query_id or not response_text:
         return False
 
+    # Bot API 10.0 уже поддерживает answerGuestQuery, но в экосистеме часть
+    # прокси/обвязок пока ожидают альтернативные имена поля текста.
     payloads = [
         {
             "guest_query_id": guest_query_id,
@@ -274,7 +276,6 @@ def _handle_guest_update(update_obj: dict) -> None:
     try:
         conn = _db_connect()
         if not _bot_is_enabled(conn, _BOT_USERNAME):
-            _STOP_EVENT.set()
             return
         response = _resolve_guest_response(conn, _BOT_USERNAME, cmd_key)
         if not response:
