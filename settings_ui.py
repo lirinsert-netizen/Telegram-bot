@@ -5752,8 +5752,7 @@ def _extract_guest_command_key(text: str, bot_username: str) -> Optional[str]:
     if not cmd:
         return None
 
-    cmd = cmd.strip().lower()
-    cmd = cmd.strip(_CMD_STRIP_CHARS)
+    cmd = cmd.lower().strip(_CMD_STRIP_CHARS).strip()
     if (
         not cmd
         or cmd.startswith("@")
@@ -5769,18 +5768,14 @@ def _get_commands_scope_key() -> str:
     if bot_id:
         return str(bot_id)
 
-    token_bot_id = str(TOKEN).strip().split(":", 1)[0]
-    if token_bot_id.isdigit():
-        logger.warning("[CMD SCOPE] bot_id unavailable, using token-derived bot_id scope for commands.")
-        return f"t:{token_bot_id}"
-
     fallback_username = _get_bot_username_lower()
     if fallback_username:
         logger.warning("[CMD SCOPE] bot_id unavailable, using username scope for commands.")
         return f"u:{fallback_username}"
 
-    logger.warning("[CMD SCOPE] bot_id, token id and username unavailable, using emergency isolated scope key.")
-    return "unknown"
+    pid_scope = int(os.getpid())
+    logger.warning("[CMD SCOPE] bot_id and username unavailable, using process-local emergency scope key.")
+    return f"p:{pid_scope}"
 
 
 def _render_commands_main(chat_id: int) -> str:
