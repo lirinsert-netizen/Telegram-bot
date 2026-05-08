@@ -52,6 +52,13 @@ def _normalize_command_name(name: str) -> str:
     return str(name or "").strip().lower()
 
 
+def _safe_int(value: object) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return 0
+
+
 def _is_command_name_valid(name: str) -> bool:
     return bool(_COMMAND_NAME_RE.fullmatch(_normalize_command_name(name)))
 
@@ -94,24 +101,26 @@ def _launch_guest_runtime(entry: dict) -> bool:
     env["BOT_THREADS"] = "4"
 
     log_path = _os.path.join(DATA_DIR, f"guest_bot_{guest_bot_id}.log")
+    log_file = None
     try:
         log_file = open(log_path, "a")
     except OSError:
-        log_file = _subprocess.DEVNULL
+        pass
+    stdout_target = log_file if log_file is not None else _subprocess.DEVNULL
 
     try:
         proc = _subprocess.Popen(
             [_sys.executable, _GUEST_RUNTIME_SCRIPT],
             env=env,
-            stdout=log_file,
-            stderr=log_file,
+            stdout=stdout_target,
+            stderr=stdout_target,
         )
     except Exception:
-        if hasattr(log_file, "close"):
+        if log_file is not None:
             log_file.close()
         return False
 
-    if hasattr(log_file, "close"):
+    if log_file is not None:
         log_file.close()
 
     with _GUEST_PROCESSES_LOCK:
@@ -307,7 +316,11 @@ def guest_bots_callback(call: types.CallbackQuery):
         return
 
     if data.startswith("guestbot:open:"):
-        guest_id = int(data.split(":")[2] or 0)
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
+            return
+        guest_id = _safe_int(parts[2])
         entry = get_guest_bot_by_id(guest_id)
         if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
             bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
@@ -326,7 +339,11 @@ def guest_bots_callback(call: types.CallbackQuery):
         return
 
     if data.startswith("guestbot:toggle:"):
-        guest_id = int(data.split(":")[2] or 0)
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
+            return
+        guest_id = _safe_int(parts[2])
         entry = get_guest_bot_by_id(guest_id)
         if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
             bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
@@ -353,7 +370,11 @@ def guest_bots_callback(call: types.CallbackQuery):
         return
 
     if data.startswith("guestbot:modules:"):
-        guest_id = int(data.split(":")[2] or 0)
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
+            return
+        guest_id = _safe_int(parts[2])
         entry = get_guest_bot_by_id(guest_id)
         if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
             bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
@@ -369,8 +390,12 @@ def guest_bots_callback(call: types.CallbackQuery):
         return
 
     if data.startswith("guestbot:modtog:"):
-        _, _, guest_id_str, module_key = data.split(":", 3)
-        guest_id = int(guest_id_str or 0)
+        parts = data.split(":", 3)
+        if len(parts) < 4:
+            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
+            return
+        _, _, guest_id_str, module_key = parts
+        guest_id = _safe_int(guest_id_str)
         entry = get_guest_bot_by_id(guest_id)
         if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
             bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
@@ -393,7 +418,11 @@ def guest_bots_callback(call: types.CallbackQuery):
         return
 
     if data.startswith("guestbot:commands:"):
-        guest_id = int(data.split(":")[2] or 0)
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
+            return
+        guest_id = _safe_int(parts[2])
         entry = get_guest_bot_by_id(guest_id)
         if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
             bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
@@ -409,7 +438,11 @@ def guest_bots_callback(call: types.CallbackQuery):
         return
 
     if data.startswith("guestbot:cmdadd:"):
-        guest_id = int(data.split(":")[2] or 0)
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
+            return
+        guest_id = _safe_int(parts[2])
         entry = get_guest_bot_by_id(guest_id)
         if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
             bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
@@ -424,7 +457,11 @@ def guest_bots_callback(call: types.CallbackQuery):
         return
 
     if data.startswith("guestbot:cmddel:"):
-        guest_id = int(data.split(":")[2] or 0)
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
+            return
+        guest_id = _safe_int(parts[2])
         entry = get_guest_bot_by_id(guest_id)
         if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
             bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
@@ -435,8 +472,12 @@ def guest_bots_callback(call: types.CallbackQuery):
         return
 
     if data.startswith("guestbot:cmdtog:"):
-        _, _, guest_id_str, cmd_name = data.split(":", 3)
-        guest_id = int(guest_id_str or 0)
+        parts = data.split(":", 3)
+        if len(parts) < 4:
+            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
+            return
+        _, _, guest_id_str, cmd_name = parts
+        guest_id = _safe_int(guest_id_str)
         entry = get_guest_bot_by_id(guest_id)
         if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
             bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
