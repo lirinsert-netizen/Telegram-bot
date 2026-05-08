@@ -29,6 +29,7 @@ from persistence import (
 _TOKEN_RE = _re.compile(r"\b(\d{8,10}:[A-Za-z0-9_-]{35,})\b")
 _COMMAND_NAME_RE = _re.compile(r"^[A-Za-zА-Яа-я0-9_]{1,30}$")
 _GUEST_RUNTIME_SCRIPT = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "guest_runtime.py")
+_MAX_COMMAND_RESPONSE_LEN = 3500
 
 _PENDING_TOKEN_USERS: set[int] = set()
 _PENDING_COMMAND_INPUT: dict[int, dict] = {}
@@ -96,7 +97,7 @@ def _launch_guest_runtime(entry: dict) -> bool:
     try:
         log_file = open(log_path, "a")
     except OSError:
-        log_file = _subprocess.DEVNULL  # type: ignore[assignment]
+        log_file = _subprocess.DEVNULL
 
     try:
         proc = _subprocess.Popen(
@@ -551,8 +552,8 @@ def on_guest_pending_input(m: types.Message):
         if not response_text:
             bot.reply_to(m, "Текст ответа не должен быть пустым.")
             return
-        if len(response_text) > 3500:
-            bot.reply_to(m, "Текст ответа слишком длинный (макс. 3500 символов).")
+        if len(response_text) > _MAX_COMMAND_RESPONSE_LEN:
+            bot.reply_to(m, f"Текст ответа слишком длинный (макс. {_MAX_COMMAND_RESPONSE_LEN} символов).")
             return
         ok = upsert_guest_command(guest_bot_id, cmd_name, response_text, enabled=True)
         if not ok:

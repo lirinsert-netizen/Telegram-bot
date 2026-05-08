@@ -6,6 +6,7 @@ import re
 import sqlite3
 import time
 import json
+import threading
 
 import telebot
 
@@ -180,8 +181,6 @@ if __name__ == "__main__":
         raise RuntimeError("Guest runtime requires bot username")
 
     logger.info("Starting guest runtime for @%s", _BOT_USERNAME)
-
-    import threading
 
     threading.Thread(target=_wait_until_disabled, daemon=True, name="guest-disable-watch").start()
     bot.infinity_polling(timeout=60, long_polling_timeout=60)

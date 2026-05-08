@@ -984,21 +984,35 @@ def _guest_modules_to_json(modules: list[str] | None) -> str:
 def _guest_bot_row_to_dict(row: sqlite3.Row | tuple | None) -> dict | None:
     if not row:
         return None
+    (
+        gid,
+        owner_uid,
+        bot_id,
+        bot_username,
+        bot_token,
+        display_name,
+        status,
+        enabled,
+        runtime_pid,
+        created_at,
+        updated_at,
+        linked_modules_json,
+    ) = row
     data = {
-        "id": int(row[0]),
-        "owner_user_id": int(row[1]),
-        "bot_id": int(row[2]),
-        "bot_username": str(row[3] or ""),
-        "bot_token": str(row[4] or ""),
-        "display_name": str(row[5] or ""),
-        "status": str(row[6] or "active"),
-        "enabled": bool(int(row[7] or 0)),
-        "runtime_pid": int(row[8] or 0),
-        "created_at": int(row[9] or 0),
-        "updated_at": int(row[10] or 0),
+        "id": int(gid),
+        "owner_user_id": int(owner_uid),
+        "bot_id": int(bot_id),
+        "bot_username": str(bot_username or ""),
+        "bot_token": str(bot_token or ""),
+        "display_name": str(display_name or ""),
+        "status": str(status or "active"),
+        "enabled": bool(int(enabled or 0)),
+        "runtime_pid": int(runtime_pid or 0),
+        "created_at": int(created_at or 0),
+        "updated_at": int(updated_at or 0),
     }
     try:
-        data["linked_modules"] = json.loads(row[11] or "[]")
+        data["linked_modules"] = json.loads(linked_modules_json or "[]")
     except Exception:
         data["linked_modules"] = ["commands"]
     if not isinstance(data["linked_modules"], list):
