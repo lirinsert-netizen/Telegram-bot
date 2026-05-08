@@ -5642,6 +5642,7 @@ _CMD_MAX_NAME_LEN = 30
 _CMD_MAX_COUNT = 100
 _CMD_USER_COOLDOWN_SECONDS = 10
 _BOT_SCOPED_COMMANDS_KEY = "commands_by_bot"
+_CMD_STRIP_CHARS = "`'\"«»()[]{}<>.,;:!?"
 
 _cmd_user_cooldown: dict[tuple[int, int], float] = {}
 _cmd_user_cooldown_lock = threading.Lock()
@@ -5687,7 +5688,7 @@ def _get_commands_dict(chat_id: int) -> dict:
         scoped = {}
         st[_BOT_SCOPED_COMMANDS_KEY] = scoped
 
-    scope_key = str(_get_bot_id() or 0)
+    scope_key = _get_commands_scope_key()
     cmds = scoped.get(scope_key)
     if not isinstance(cmds, dict):
         legacy_cmds = st.get("commands")
@@ -5714,7 +5715,7 @@ def _save_commands(chat_id: int, cmds: dict):
     if not isinstance(scoped, dict):
         scoped = {}
         st[_BOT_SCOPED_COMMANDS_KEY] = scoped
-    scoped[str(_get_bot_id() or 0)] = cmds
+    scoped[_get_commands_scope_key()] = cmds
     if not IS_GUEST_BOT:
         st["commands"] = cmds
     CHAT_SETTINGS[str(chat_id)] = st
@@ -5750,7 +5751,7 @@ def _extract_guest_command_key(text: str, bot_username: str) -> Optional[str]:
         return None
 
     cmd = cmd.strip().lower()
-    cmd = cmd.strip("`'\"«»()[]{}<>.,;:!?")
+    cmd = cmd.strip(_CMD_STRIP_CHARS)
     if (
         not cmd
         or cmd.startswith("@")
@@ -5759,6 +5760,20 @@ def _extract_guest_command_key(text: str, bot_username: str) -> Optional[str]:
     ):
         return None
     return cmd
+
+
+def _get_commands_scope_key() -> str:
+    bot_id = _get_bot_id()
+    if bot_id:
+        return str(bot_id)
+
+    fallback_username = _get_bot_username_lower()
+    if fallback_username:
+        logger.warning("[CMD SCOPE] bot_id unavailable, using username scope for commands.")
+        return f"u:{fallback_username}"
+
+    logger.warning("[CMD SCOPE] bot_id and username unavailable, using emergency scope key.")
+    return "unknown"
 
 
 def _render_commands_main(chat_id: int) -> str:
