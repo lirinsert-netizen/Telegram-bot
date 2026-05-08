@@ -75,7 +75,7 @@ def _launch_clone_process(entry: dict) -> "_subprocess.Popen | None":
     env = _os.environ.copy()
     env["BOT_TOKEN"] = token
     env["IS_CLONE"] = "1"
-    role = str(entry.get("role", "clone") or "clone").strip().lower()
+    role = str(entry.get("role", "clone")).strip().lower()
     if role == "guest":
         env["IS_GUEST_BOT"] = "1"
     else:
@@ -521,7 +521,7 @@ def cmd_newguest(m: types.Message):
 
 
 def _start_new_bot_creation(m: types.Message, display_name: str, username: str, role: str = "clone") -> None:
-    role = str(role or "clone").strip().lower()
+    role = str(role).strip().lower()
     is_guest = role == "guest"
     role_word = "гостя" if is_guest else "бота"
     role_label = "гостя" if is_guest else "клона"

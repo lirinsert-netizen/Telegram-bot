@@ -6408,7 +6408,7 @@ def on_custom_command_message(m: types.Message):
     if IS_GUEST_BOT:
         if len(parts) != 2:
             return ContinueHandling()
-        mention = (parts[0] or "").strip()
+        mention = parts[0]
         if not mention.startswith("@"):
             return ContinueHandling()
         bot_username = _get_bot_username_lower()
@@ -6416,7 +6416,7 @@ def on_custom_command_message(m: types.Message):
             return ContinueHandling()
         if mention[1:].lower() != bot_username:
             return ContinueHandling()
-        cmd_key = (parts[1] or "").strip().lower()
+        cmd_key = parts[1].lower()
         if not cmd_key or cmd_key.startswith("/") or len(cmd_key) > _CMD_MAX_NAME_LEN:
             return ContinueHandling()
     else:
