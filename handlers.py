@@ -1829,20 +1829,10 @@ def callback_handler(call: types.CallbackQuery):
         if not is_owner(call.from_user):
             return bot.answer_callback_query(call.id, "Кнопка доступна только разработчику.", show_alert=False)
 
-        bot.send_message(
-            chat_id,
-            "<b>Создание гостевого бота</b>\n\n"
-            "Использование:\n"
-            "<code>/newguest Название @username</code>\n\n"
-            "Пример:\n"
-            "<code>/newguest Гостевой бот myguesthelper</code>\n\n"
-            "<i>После создания в гостевом боте пользовательские команды "
-            "срабатывают только в формате:</i>\n"
-            "<code>@username_бота имя_команды</code>",
-            parse_mode='HTML',
-            disable_web_page_preview=True,
-        )
-        return bot.answer_callback_query(call.id, "Отправил инструкцию по созданию гостя.", show_alert=False)
+        from clones import start_guest_registration_prompt
+
+        start_guest_registration_prompt(chat_id, call.from_user)
+        return bot.answer_callback_query(call.id, "Жду токен гостевого бота.", show_alert=False)
 
     bot.answer_callback_query(call.id)
 
