@@ -220,8 +220,8 @@ def _answer_guest_query(guest_query_id: str, response_text: str) -> bool:
     if not guest_query_id or not response_text:
         return False
 
-    # Bot API 10.0 уже поддерживает answerGuestQuery, но в экосистеме часть
-    # прокси/обвязок пока ожидают альтернативные имена поля текста.
+    # Bot API 10.0 supports answerGuestQuery, but some wrappers still expect
+    # alternative text field names, so we retry with compatible payload keys.
     payloads = [
         {
             "guest_query_id": guest_query_id,

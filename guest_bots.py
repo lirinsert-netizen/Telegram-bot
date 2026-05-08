@@ -584,7 +584,7 @@ def on_guest_pending_input(m: types.Message):
             linked_modules=["commands"],
         )
         if not created:
-            err_text = _html.escape(_html.unescape(str(err or "Ошибка")))
+            err_text = _html.escape(str(err or "Ошибка"))
             bot.reply_to(m, f"{_premium_emoji(PREMIUM_PREFIX_EMOJI_ID)} {err_text}", parse_mode="HTML")
             return
 
