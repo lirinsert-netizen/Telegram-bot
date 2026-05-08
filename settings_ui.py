@@ -9,6 +9,7 @@ from __future__ import annotations
 import time
 import threading
 import asyncio
+import logging
 import re as _re
 import html as _html
 from functools import lru_cache
@@ -100,6 +101,7 @@ from cmd_basic import _sendpm_render_panel_text, _build_sendpm_panel_keyboard, S
 
 # ==== НАСТРОЙКИ ЧАТА (/settings) + WELCOME / FAREWELL / RULES
 # ============================================
+logger = logging.getLogger(__name__)
 
 def _now_ts() -> int:
     return int(time.time())
@@ -6414,7 +6416,7 @@ def on_custom_command_message(m: types.Message):
             return ContinueHandling()
         bot_username = _get_bot_username_lower()
         if not bot_username:
-            print("[GUEST CMD] Cannot process custom command: bot username is unknown.")
+            logger.warning("[GUEST CMD] Cannot process custom command: bot username is unknown.")
             return ContinueHandling()
         if mention[1:].lower() != bot_username:
             return ContinueHandling()
