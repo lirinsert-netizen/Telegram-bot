@@ -5698,10 +5698,11 @@ def _render_commands_main(chat_id: int) -> str:
     emoji_settings = f'<tg-emoji emoji-id="{EMOJI_ROLE_SETTINGS_SENT_PM_ID}">⚙️</tg-emoji>'
     cmds = _get_commands_dict(chat_id)
     count = len(cmds)
+    trigger_suffix = "и получить настроенное сообщение с текстом, медиа и кнопками."
     trigger_hint = (
-        "ввести <code>@username_бота имя_команды</code> и получить настроенное сообщение с текстом, медиа и кнопками."
+        f"ввести <code>@username_бота имя_команды</code> {trigger_suffix}"
         if IS_GUEST_BOT
-        else "ввести команду и получить настроенное сообщение с текстом, медиа и кнопками."
+        else f"ввести команду {trigger_suffix}"
     )
     return (
         f'<tg-emoji emoji-id="5377844313575150051">📋</tg-emoji> <b>Команды</b>\n\n'
@@ -6413,6 +6414,7 @@ def on_custom_command_message(m: types.Message):
             return ContinueHandling()
         bot_username = _get_bot_username_lower()
         if not bot_username:
+            print("[GUEST CMD] Cannot process custom command: bot username is unknown.")
             return ContinueHandling()
         if mention[1:].lower() != bot_username:
             return ContinueHandling()

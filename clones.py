@@ -58,6 +58,11 @@ _CLONE_PROC_LOCK = _threading.Lock()
 _TOKEN_RE = _re.compile(r'\b(\d{8,10}:[A-Za-z0-9_-]{35,})\b')
 
 
+def _normalize_role(value: object) -> str:
+    role = str(value).strip().lower()
+    return "guest" if role == "guest" else "clone"
+
+
 def _launch_clone_process(entry: dict) -> "_subprocess.Popen | None":
     """Spawn a clone bot as a child process.
 
@@ -75,7 +80,7 @@ def _launch_clone_process(entry: dict) -> "_subprocess.Popen | None":
     env = _os.environ.copy()
     env["BOT_TOKEN"] = token
     env["IS_CLONE"] = "1"
-    role = str(entry.get("role", "clone")).strip().lower()
+    role = _normalize_role(entry.get("role", "clone"))
     if role == "guest":
         env["IS_GUEST_BOT"] = "1"
     else:
@@ -240,7 +245,7 @@ def _format_clones_text(entries: list[dict]) -> str:
         username = _html.escape(str(e.get("username") or "?"))
         name = _html.escape(str(e.get("name") or ""))
         bot_id = e.get("bot_id", "?")
-        role = str(e.get("role", "clone") or "clone").strip().lower()
+        role = _normalize_role(e.get("role", "clone"))
         role_label = "гость" if role == "guest" else "клон"
         lines.append(
             f"• <b>@{username}</b> ({name}) — ID: <code>{bot_id}</code>\n"
@@ -521,7 +526,7 @@ def cmd_newguest(m: types.Message):
 
 
 def _start_new_bot_creation(m: types.Message, display_name: str, username: str, role: str = "clone") -> None:
-    role = str(role).strip().lower()
+    role = _normalize_role(role)
     is_guest = role == "guest"
     role_word = "гостя" if is_guest else "бота"
     role_label = "гостя" if is_guest else "клона"
