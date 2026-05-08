@@ -5742,7 +5742,9 @@ def _extract_guest_command_key(text: str, bot_username: str) -> Optional[str]:
         mention = first[1:]
         cmd = second.lstrip("/")
     elif first.startswith("/") and "@" in first:
-        cmd_part, _, mention_part = first[1:].partition("@")
+        cmd_part, separator, mention_part = first[1:].partition("@")
+        if not separator:
+            return None
         mention = mention_part
         cmd = cmd_part
     if not mention or mention.lower() != my_username:
@@ -5767,12 +5769,17 @@ def _get_commands_scope_key() -> str:
     if bot_id:
         return str(bot_id)
 
+    token_bot_id = str(TOKEN).strip().split(":", 1)[0]
+    if token_bot_id.isdigit():
+        logger.warning("[CMD SCOPE] bot_id unavailable, using token-derived bot_id scope for commands.")
+        return f"t:{token_bot_id}"
+
     fallback_username = _get_bot_username_lower()
     if fallback_username:
         logger.warning("[CMD SCOPE] bot_id unavailable, using username scope for commands.")
         return f"u:{fallback_username}"
 
-    logger.warning("[CMD SCOPE] bot_id and username unavailable, using emergency scope key.")
+    logger.warning("[CMD SCOPE] bot_id, token id and username unavailable, using emergency isolated scope key.")
     return "unknown"
 
 
