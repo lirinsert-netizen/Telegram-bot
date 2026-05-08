@@ -25,7 +25,11 @@ BOT_THREADS = max(1, int(os.getenv("BOT_THREADS", "4")))
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is required for guest runtime")
 
-bot = telebot.TeleBot(TOKEN, parse_mode="HTML", num_threads=BOT_THREADS)
+try:
+    bot = telebot.TeleBot(TOKEN, parse_mode="HTML", num_threads=BOT_THREADS)
+except Exception as e:
+    raise RuntimeError(f"Failed to initialize guest bot runtime: {e}") from e
+
 _BOT_USERNAME = ""
 
 _CMD_MAX_NAME_LEN = 30

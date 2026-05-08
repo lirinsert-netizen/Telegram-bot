@@ -1293,7 +1293,6 @@ def cb_pm_settings_open(call: types.CallbackQuery):
     "deny_group:",
     "pm_settings_open:",
     "pm_settings_back",
-    "start:newguest",
     "clone_disable:",
     "clone_enable:",
     "guestbot:",

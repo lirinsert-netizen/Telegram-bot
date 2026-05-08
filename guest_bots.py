@@ -276,7 +276,7 @@ def cmd_guestbots(m: types.Message):
     _show_guest_bots_menu(m.chat.id, m.from_user)
 
 
-@bot.callback_query_handler(func=lambda c: bool(c.data) and (c.data == "start:newguest" or c.data.startswith("guestbot:")))
+@bot.callback_query_handler(func=lambda c: bool(c.data) and c.data.startswith("guestbot:"))
 def guest_bots_callback(call: types.CallbackQuery):
     if not _is_owner(call.from_user):
         bot.answer_callback_query(call.id, "Недостаточно прав.", show_alert=False)
@@ -286,7 +286,7 @@ def guest_bots_callback(call: types.CallbackQuery):
     chat_id = call.message.chat.id
     msg_id = call.message.message_id
 
-    if data == "start:newguest" or data == "guestbot:create":
+    if data == "guestbot:create":
         _begin_guest_creation(chat_id, call.from_user)
         bot.answer_callback_query(call.id, "Ожидаю токен guest-бота.", show_alert=False)
         return

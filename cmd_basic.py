@@ -125,7 +125,7 @@ def _build_start_home_keyboard(show_owner_button: bool = False) -> types.InlineK
     if show_owner_button:
         btn_new = types.InlineKeyboardButton("Новые сообщения", callback_data="start:newmsgs")
         btn_new.icon_custom_emoji_id = EMOJI_NEW_MSG_OWNER_ID
-        btn_guest = types.InlineKeyboardButton("Guest-боты", callback_data="start:newguest")
+        btn_guest = types.InlineKeyboardButton("Guest-боты", callback_data="guestbot:list")
         kb.row(btn_new, btn_guest)
     return kb
 
