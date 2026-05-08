@@ -66,7 +66,7 @@ def _normalize_role(value: object) -> str:
     return "guest" if role == "guest" else "clone"
 
 
-def _set_pending_guest_registration(user_id: int, chat_id: int) -> None:
+def _set_pending_guest_registration(user_id: int) -> None:
     _PENDING_GUEST_REGISTRATION.add(int(user_id))
 
 
@@ -78,7 +78,7 @@ def start_guest_registration_prompt(chat_id: int, user: types.User | None) -> bo
     if not _is_owner(user):
         return False
 
-    _set_pending_guest_registration(user.id, chat_id)
+    _set_pending_guest_registration(user.id)
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("Открыть BotFather", url="https://t.me/BotFather"))
     bot.send_message(
@@ -575,13 +575,13 @@ def _is_waiting_for_guest_token(m: types.Message) -> bool:
     if int(m.from_user.id) not in _PENDING_GUEST_REGISTRATION:
         return False
 
-    command = (m.text or "").strip().split(maxsplit=1)[0].lower()
+    command = m.text.strip().split(maxsplit=1)[0].lower()
     return command in _GUEST_REG_CANCEL_WORDS or not command.startswith("/")
 
 
 @bot.message_handler(func=_is_waiting_for_guest_token)
 def on_guest_token_message(m: types.Message):
-    text = (m.text or "").strip()
+    text = m.text.strip()
     lower_text = text.lower()
     if lower_text in _GUEST_REG_CANCEL_WORDS:
         _clear_pending_guest_registration(m.from_user.id)
