@@ -146,18 +146,32 @@ def raw_request(method: str, payload: dict):
 
 
 def raw_set_chat_member_tag(chat_id: int, user_id: int, tag: str | None) -> tuple[bool, str | None]:
-    payload = {
-        "chat_id": chat_id,
-        "user_id": user_id,
-        "tag": (tag or "").strip(),
-    }
+    clean_tag = (tag or "").strip()
+    try:
+        member = tg_get_chat_member(chat_id, user_id)
+        is_admin = getattr(member, "status", "") in ("administrator", "creator")
+    except Exception:
+        is_admin = False
 
     try:
-        set_tag_method = getattr(bot, "set_chat_member_tag", None)
-        if callable(set_tag_method):
-            set_tag_method(chat_id, user_id, payload["tag"])
+        if is_admin:
+            set_admin_title = getattr(bot, "set_chat_administrator_custom_title", None)
+            if callable(set_admin_title):
+                set_admin_title(chat_id, user_id, clean_tag)
+            else:
+                apihelper._make_request(
+                    TOKEN,
+                    "setChatAdministratorCustomTitle",
+                    method="post",
+                    params={"chat_id": chat_id, "user_id": user_id, "custom_title": clean_tag},
+                )
         else:
-            apihelper._make_request(TOKEN, "setChatMemberTag", method="post", params=payload)
+            payload = {"chat_id": chat_id, "user_id": user_id, "tag": clean_tag}
+            set_tag_method = getattr(bot, "set_chat_member_tag", None)
+            if callable(set_tag_method):
+                set_tag_method(chat_id, user_id, clean_tag)
+            else:
+                apihelper._make_request(TOKEN, "setChatMemberTag", method="post", params=payload)
         tg_invalidate_chat_member_caches(chat_id, user_id)
         return True, None
     except ApiTelegramException as e:
@@ -676,6 +690,8 @@ def parse_closechat_duration(value: str, is_russian: bool) -> int | None:
 
 @bot.message_handler(commands=['dbg_users'])
 def cmd_dbg_users(m: types.Message):
+    if should_ignore_text_triggers(m):
+        return
     chat_id_s = str(m.chat.id)
     chat_users = USERS.get(chat_id_s) or {}
     lines = [f"USERS для чата {m.chat.id}:"]
@@ -1817,31 +1833,117 @@ def is_chat_admin(chat_id: int, user_id: int) -> bool:
 def deny_access(chat_id):
     bot.send_message(chat_id, premium_prefix("Бот недоступен для вашего аккаунта."))
 
-def is_exact_stat(text: str) -> bool:
-    return bool(text) and text.strip().lower() == 'статистика'
+def is_channel_post_message(m: types.Message | None) -> bool:
+    if not m:
+        return False
+    sender_chat = getattr(m, "sender_chat", None)
+    return bool(sender_chat and getattr(sender_chat, "type", None) == "channel")
 
-def is_exact_stat_day(text: str) -> bool:
-    return bool(text) and text.strip().lower() == 'статистика день'
 
-def is_exact_stat_week(text: str) -> bool:
-    return bool(text) and text.strip().lower() == 'статистика неделя'
+def should_ignore_text_triggers(m: types.Message | None) -> bool:
+    return is_channel_post_message(m)
 
-def is_exact_stat_month(text: str) -> bool:
-    return bool(text) and text.strip().lower() == 'статистика месяц'
 
-def is_exact_stat_all(text: str) -> bool:
-    return bool(text) and text.strip().lower() == 'статистика вся'
+_LINKED_CHANNEL_ID_CACHE: dict[int, tuple[float, int | None]] = {}
+_LINKED_CHANNEL_ID_CACHE_LOCK = threading.Lock()
+_LINKED_CHANNEL_ID_CACHE_TTL = 300.0
 
-def text_starts_with_ci(text: str, prefix: str) -> bool:
-    return bool(text) and text.strip().lower().startswith(prefix.lower())
+
+def get_linked_channel_id(chat_id: int) -> int | None:
+    now = time.monotonic()
+    cid = int(chat_id)
+    with _LINKED_CHANNEL_ID_CACHE_LOCK:
+        cached = _LINKED_CHANNEL_ID_CACHE.get(cid)
+        if cached and (now - cached[0]) < _LINKED_CHANNEL_ID_CACHE_TTL:
+            return cached[1]
+
+    linked_id: int | None = None
+    try:
+        chat_obj = tg_get_chat(cid)
+        raw_linked_id = getattr(chat_obj, "linked_chat_id", None)
+        if raw_linked_id is not None:
+            linked_id = int(raw_linked_id)
+    except Exception:
+        linked_id = None
+
+    with _LINKED_CHANNEL_ID_CACHE_LOCK:
+        _LINKED_CHANNEL_ID_CACHE[cid] = (now, linked_id)
+    return linked_id
+
+
+def is_reply_to_linked_channel_post(m: types.Message | None) -> bool:
+    if not m or not getattr(m, "reply_to_message", None):
+        return False
+    reply = m.reply_to_message
+    sender_chat = getattr(reply, "sender_chat", None)
+    if not sender_chat or getattr(sender_chat, "type", None) != "channel":
+        return False
+    linked_id = get_linked_channel_id(m.chat.id)
+    if not linked_id:
+        return False
+    try:
+        return sender_chat.id == linked_id
+    except Exception:
+        return False
+
+
+def _coerce_trigger_text(value: str | types.Message | None) -> tuple[str, types.Message | None]:
+    if isinstance(value, types.Message):
+        return str(getattr(value, "text", "") or ""), value
+    return str(value or ""), None
+
+
+def is_exact_stat(text: str | types.Message) -> bool:
+    txt, msg = _coerce_trigger_text(text)
+    if msg and should_ignore_text_triggers(msg):
+        return False
+    return bool(txt) and txt.strip().lower() == 'статистика'
+
+
+def is_exact_stat_day(text: str | types.Message) -> bool:
+    txt, msg = _coerce_trigger_text(text)
+    if msg and should_ignore_text_triggers(msg):
+        return False
+    return bool(txt) and txt.strip().lower() == 'статистика день'
+
+
+def is_exact_stat_week(text: str | types.Message) -> bool:
+    txt, msg = _coerce_trigger_text(text)
+    if msg and should_ignore_text_triggers(msg):
+        return False
+    return bool(txt) and txt.strip().lower() == 'статистика неделя'
+
+
+def is_exact_stat_month(text: str | types.Message) -> bool:
+    txt, msg = _coerce_trigger_text(text)
+    if msg and should_ignore_text_triggers(msg):
+        return False
+    return bool(txt) and txt.strip().lower() == 'статистика месяц'
+
+
+def is_exact_stat_all(text: str | types.Message) -> bool:
+    txt, msg = _coerce_trigger_text(text)
+    if msg and should_ignore_text_triggers(msg):
+        return False
+    return bool(txt) and txt.strip().lower() == 'статистика вся'
+
+
+def text_starts_with_ci(text: str | types.Message, prefix: str) -> bool:
+    txt, msg = _coerce_trigger_text(text)
+    if msg and should_ignore_text_triggers(msg):
+        return False
+    return bool(txt) and txt.strip().lower().startswith(prefix.lower())
 
 def format_bytes_mb(num_bytes: int) -> str:
     return f"{num_bytes / (1024 * 1024):.1f} MB"
 
-def match_command(text: str, name: str) -> bool:
-    if not text:
+def match_command(text: str | types.Message, name: str) -> bool:
+    txt, msg = _coerce_trigger_text(text)
+    if msg and should_ignore_text_triggers(msg):
         return False
-    t = text.strip()
+    if not txt:
+        return False
+    t = txt.strip()
     first = t.split(maxsplit=1)[0].lower()
     for prefix in COMMAND_PREFIXES:
         if first.startswith(prefix):
@@ -1851,11 +1953,14 @@ def match_command(text: str, name: str) -> bool:
     return False
 
 
-def match_command_aliases(text: str, names: list[str]) -> bool:
-    if not text:
+def match_command_aliases(text: str | types.Message, names: list[str]) -> bool:
+    txt, msg = _coerce_trigger_text(text)
+    if msg and should_ignore_text_triggers(msg):
+        return False
+    if not txt:
         return False
 
-    first = text.strip().split(maxsplit=1)[0].lower()
+    first = txt.strip().split(maxsplit=1)[0].lower()
     normalized = {str(n).lower() for n in (names or []) if str(n).strip()}
     if not normalized:
         return False
@@ -2132,6 +2237,8 @@ def is_verified_admin(chat: types.Chat, user_id: int) -> bool:
 
 @bot.message_handler(commands=['verify'])
 def cmd_verify(m: types.Message):
+    if should_ignore_text_triggers(m):
+        return
     add_stat_message(m)
     add_stat_command('verify')
 
@@ -2179,6 +2286,8 @@ def cmd_verify(m: types.Message):
 
 @bot.message_handler(commands=['unverify'])
 def cmd_unverify(m: types.Message):
+    if should_ignore_text_triggers(m):
+        return
     add_stat_message(m)
     add_stat_command('unverify')
 
@@ -2225,6 +2334,8 @@ def cmd_unverify(m: types.Message):
 
 @bot.message_handler(commands=['vlist'])
 def cmd_vlist(m: types.Message):
+    if should_ignore_text_triggers(m):
+        return
     add_stat_message(m)
     add_stat_command('vlist')
 
@@ -2270,6 +2381,8 @@ def cmd_vlist(m: types.Message):
 
 @bot.message_handler(commands=['devverify'])
 def cmd_devverify(m: types.Message):
+    if should_ignore_text_triggers(m):
+        return
     add_stat_message(m)
     add_stat_command('devverify')
 
@@ -2317,6 +2430,8 @@ def cmd_devverify(m: types.Message):
 
 @bot.message_handler(commands=['devunverify'])
 def cmd_devunverify(m: types.Message):
+    if should_ignore_text_triggers(m):
+        return
     add_stat_message(m)
     add_stat_command('devunverify')
 
@@ -2364,6 +2479,8 @@ def cmd_devunverify(m: types.Message):
 
 @bot.message_handler(commands=['devvlist'])
 def cmd_devvlist(m: types.Message):
+    if should_ignore_text_triggers(m):
+        return
     add_stat_message(m)
     add_stat_command('devvlist')
 
@@ -2424,6 +2541,8 @@ def cmd_devvlist(m: types.Message):
 
 @bot.message_handler(commands=['dbg_global_users'])
 def cmd_dbg_global_users(m: types.Message):
+    if should_ignore_text_triggers(m):
+        return
     add_stat_message(m)
     add_stat_command('dbg_global_users')
 
@@ -2469,6 +2588,8 @@ def cmd_dbg_global_users(m: types.Message):
 
 @bot.message_handler(commands=['migrate_users_to_global'])
 def cmd_migrate_users_to_global(m: types.Message):
+    if should_ignore_text_triggers(m):
+        return
     add_stat_message(m)
     add_stat_command('migrate_users_to_global')
 
@@ -2520,6 +2641,8 @@ def cmd_migrate_users_to_global(m: types.Message):
 
 @bot.message_handler(commands=['dbmigrate', 'sqlite_migrate'])
 def cmd_dbmigrate(m: types.Message):
+    if should_ignore_text_triggers(m):
+        return
     add_stat_message(m)
     add_stat_command('dbmigrate')
 
@@ -2541,6 +2664,8 @@ def cmd_dbmigrate(m: types.Message):
 
 @bot.message_handler(commands=['dbstatus', 'sqlite_status'])
 def cmd_dbstatus(m: types.Message):
+    if should_ignore_text_triggers(m):
+        return
     add_stat_message(m)
     add_stat_command('dbstatus')
 
@@ -2575,6 +2700,8 @@ def cmd_dbstatus(m: types.Message):
 
 @bot.message_handler(commands=['botstatus'])
 def cmd_botstatus(m: types.Message):
+    if should_ignore_text_triggers(m):
+        return
     add_stat_message(m)
     add_stat_command('botstatus')
 

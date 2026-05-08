@@ -80,6 +80,13 @@ MOD_ERR = {
 _FAREWELL_SUPPRESS: dict[tuple[int, int], float] = {}
 FAREWELL_SUPPRESS_SECONDS = 120
 
+_REPLY_BLOCKED_ON_LINKED_CHANNEL_CMDS = {
+    "mute", "мут", "ban", "бан", "warn", "варн", "kick", "кик",
+    "delmute", "delban", "delwarn", "делмут", "делбан", "делварн",
+    "unmute", "размут", "анмут", "unban", "разбан", "unwarn", "снятьварн", "анварн",
+    "del", "дел",
+}
+
 
 def _mark_farewell_suppressed(chat_id: int, user_id: int, seconds: int = FAREWELL_SUPPRESS_SECONDS):
     _FAREWELL_SUPPRESS[(int(chat_id), int(user_id))] = time.time() + max(1, int(seconds))
@@ -916,11 +923,10 @@ def _extract_command_info(m: types.Message) -> tuple[str | None, str | None, str
 def _is_mod_trigger(m: types.Message) -> bool:
     if m.chat.type not in ['group', 'supergroup']:
         return False
-    # Пропускаем сообщения от привязанного канала и анонимных администраторов
+    # Пропускаем сообщения от каналов и анонимных администраторов
     if not m.from_user:
         return False
-    sender_chat = getattr(m, "sender_chat", None)
-    if sender_chat and getattr(sender_chat, "type", None) == "channel" and not getattr(m, "is_automatic_forward", False):
+    if should_ignore_text_triggers(m):
         return False
     prefix, cmd, rest = _extract_command_info(m)
     if not cmd:
@@ -1643,6 +1649,8 @@ def cmd_moderation_main(m: types.Message):
     prefix, cmd, rest = _extract_command_info(m)
     if not cmd:
         return
+    if cmd in _REPLY_BLOCKED_ON_LINKED_CHANNEL_CMDS and is_reply_to_linked_channel_post(m):
+        return
 
     if cmd in ("del", "дел") and prefix in ('/', '.'):
         add_stat_command('del')
@@ -2275,7 +2283,7 @@ def _adminstats_keyboard(chat_id: int, view: str, page: int, total: int, viewer_
     return kb
 
 
-@bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'] and match_command_aliases(m.text, ['adminstats', 'adminstat', 'админстата']))
+@bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'] and match_command_aliases(m, ['adminstats', 'adminstat', 'админстата']))
 def cmd_adminstats(m: types.Message):
     add_stat_message(m)
     _, cmd, _ = _extract_command_info(m)
@@ -2407,5 +2415,3 @@ def cb_adminstats_nav(c: types.CallbackQuery):
         pass
 
     return bot.answer_callback_query(c.id)
-
-

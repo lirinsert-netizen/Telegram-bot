@@ -2776,20 +2776,13 @@ def _only_back_kb(chat_id: int, sec: str) -> InlineKeyboardMarkup:
 
 def _is_channel_sender(m: types.Message) -> bool:
     """
-    Возвращает True, если сообщение отправлено ПРИВЯЗАННЫМ КАНАЛОМ (не автоматически
-    пересланный пост, а прямое сообщение от канала в группе).
+    Возвращает True, если сообщение отправлено от имени любого канала.
     Такие сообщения должны игнорироваться командными обработчиками.
     """
     sender_chat = getattr(m, "sender_chat", None)
     if not sender_chat:
         return False
-    if getattr(sender_chat, "type", None) == "channel":
-        # Автоматически пересланные посты (is_automatic_forward=True) — это
-        # корректные посты канала, которые должны получить первый комментарий.
-        # Все остальные сообщения от канала — обрабатываем только как первый
-        # комментарий, командные обработчики их игнорируют.
-        return not bool(getattr(m, "is_automatic_forward", False))
-    return False
+    return getattr(sender_chat, "type", None) == "channel"
 
 
 def _is_anonymous_admin(m: types.Message) -> bool:
@@ -2867,7 +2860,7 @@ def _find_settings_groups_for_user(user: types.User) -> list[tuple[int, str]]:
     return result
 
 
-@bot.message_handler(func=lambda m: match_command(m.text, 'settings') and bool(m.from_user) and not _is_channel_sender(m))
+@bot.message_handler(func=lambda m: match_command(m, 'settings') and bool(m.from_user) and not _is_channel_sender(m))
 def cmd_settings(m: types.Message):
     add_stat_message(m)
     add_stat_command('settings')
@@ -6664,7 +6657,11 @@ def on_channel_post_in_group(m: types.Message):
 
 @bot.message_handler(
     content_types=["text"],
-    func=lambda m: (m.chat.type in ("group", "supergroup")) and _is_rules_trigger(getattr(m, "text", None))
+    func=lambda m: (
+        m.chat.type in ("group", "supergroup")
+        and not should_ignore_text_triggers(m)
+        and _is_rules_trigger(getattr(m, "text", None))
+    )
 )
 def on_rules_trigger(m: types.Message):
     chat_id = m.chat.id

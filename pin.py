@@ -460,6 +460,8 @@ def _is_exact_command(m: types.Message, names: list[str]) -> bool:
     Текст — ровно команда из списка (без аргументов),
     с префиксом из COMMAND_PREFIXES или русское слово без префикса.
     """
+    if should_ignore_text_triggers(m):
+        return False
     text = (m.text or "").strip()
     if not text:
         return False
