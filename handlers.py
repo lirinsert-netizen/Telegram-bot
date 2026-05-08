@@ -1758,7 +1758,7 @@ def callback_handler(call: types.CallbackQuery):
         finally:
             return bot.answer_callback_query(call.id)
 
-    if data in ('start:home', 'start:commands', 'start:about', 'start:usage'):
+    if data in ('start:home', 'start:commands', 'start:about', 'start:usage', 'start:guestbots'):
         state = START_MENU_STATE.get((chat_id, msg_id))
         if not state:
             return bot.answer_callback_query(call.id, "Меню устарело, открой /start заново.", show_alert=False)
@@ -1778,6 +1778,19 @@ def callback_handler(call: types.CallbackQuery):
         elif data == 'start:about':
             text = _build_start_about_text()
             kb = _build_start_back_keyboard('start:home')
+        elif data == 'start:guestbots':
+            if not is_owner(call.from_user):
+                return bot.answer_callback_query(call.id, "Кнопка доступна только разработчику.", show_alert=False)
+            try:
+                import guest_bots as _guest_bots
+                text = _guest_bots._guest_bots_menu_text(call.from_user)
+                kb = _guest_bots._guest_bots_menu_kb(call.from_user)
+            except Exception:
+                return bot.answer_callback_query(
+                    call.id,
+                    "Раздел Guest-ботов сейчас недоступен. Проверьте IS_CLONE=0 и перезапустите бота.",
+                    show_alert=True,
+                )
         else:
             text = _build_start_usage_text()
             kb = _build_start_back_keyboard('start:commands')
