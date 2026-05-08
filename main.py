@@ -19,6 +19,7 @@ main.py — Точка входа бота.
   clones        — управление клонами (только основной бот, IS_CLONE=False);
                     ДОЛЖЕН быть до handlers, чтобы /clone_* команды регистрировались
                     раньше all_other (иначе all_other перехватывает их первым)
+  guest_bots    — управление отдельными guest-ботами (только основной бот, IS_CLONE=False)
   handlers      — group stats UI, approve/deny_group, my_chat_member,
                     главный callback_handler, all_other (ДОЛЖЕН БЫТЬ ПОСЛЕДНИМ)
 
@@ -54,6 +55,7 @@ from config import bot, IS_CLONE, get_bot_me
 
 if not IS_CLONE:
     import clones   # noqa: F401  — команды /clones, /clone_register и т.д.
+    import guest_bots  # noqa: F401
 
 import handlers     # noqa: F401  — all_other ДОЛЖЕН БЫТЬ ПОСЛЕДНИМ
 
@@ -120,7 +122,7 @@ if __name__ == "__main__":
     else:
         # Основной бот: запускаем все зарегистрированные клоны.
         clones.autostart_clones()
+        guest_bots.autostart_guest_bots()
 
     logger.info("[Polling] Запуск long polling…")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
-
