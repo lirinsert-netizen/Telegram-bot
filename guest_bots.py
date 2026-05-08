@@ -82,6 +82,18 @@ def _normalize_command_name(name: str) -> str:
     return str(name or "").strip().lower()
 
 
+def _guest_bot_username(entry: dict) -> str:
+    return _html.escape((entry.get("bot_username") or "").strip().lstrip("@"))
+
+
+def _guest_usage_examples(uname: str) -> tuple[str, str, str]:
+    return (
+        f"<code>@{uname} test</code>",
+        f"<code>/test@{uname}</code>",
+        "<code>test</code>",
+    )
+
+
 def _safe_int(value: object) -> int:
     try:
         return int(value)
@@ -272,13 +284,14 @@ def _guest_commands_text(entry: dict) -> str:
 
 
 def _guest_commands_usage_text(entry: dict) -> str:
-    uname = _html.escape((entry.get("bot_username") or "").strip().lstrip("@"))
+    uname = _guest_bot_username(entry)
+    ex_mention, ex_slash, ex_plain = _guest_usage_examples(uname)
     return (
         f"{_premium_emoji(EMOJI_LIST_ID)} <b>Инструкция guest-команд</b>\n\n"
         "После включения guest-бота команды можно вызывать так:\n"
-        f"• <code>@{uname} test</code>\n"
-        f"• <code>/test@{uname}</code>\n"
-        "• <code>test</code>\n\n"
+        f"• {ex_mention}\n"
+        f"• {ex_slash}\n"
+        f"• {ex_plain}\n\n"
         "Рекомендуемые тестовые команды:\n"
         "• <code>test</code> — проверка ответа\n"
         "• <code>ping</code> — быстрый пинг\n"
@@ -291,14 +304,15 @@ def _guest_seed_test_commands(entry: dict) -> tuple[int, int]:
     if guest_id <= 0:
         return 0, 0
 
-    uname = _html.escape((entry.get("bot_username") or "").strip().lstrip("@"))
+    uname = _guest_bot_username(entry)
+    ex_mention, ex_slash, ex_plain = _guest_usage_examples(uname)
     test_payloads = [
         ("test", f"✅ Guest-режим работает.\nПример: <code>@{uname} ping</code>"),
         ("ping", "pong"),
         (
             "guesthelp",
             "Формат guest-команд:\n"
-            f"<code>@{uname} test</code> | <code>/test@{uname}</code> | <code>test</code>",
+            f"{ex_mention} | {ex_slash} | {ex_plain}",
         ),
     ]
 
