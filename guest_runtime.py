@@ -1,14 +1,13 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
+import requests
 import sqlite3
-import time
-import json
 import threading
-
-import telebot
+import time
 
 
 logging.basicConfig(
@@ -21,14 +20,12 @@ TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DATA_DIR = os.getenv("DATA_DIR", "/data").strip()
 DB_PATH = os.path.join(DATA_DIR, "bot_data.sqlite3")
 BOT_THREADS = max(1, int(os.getenv("BOT_THREADS", "4")))
+API_BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
+_HTTP_SESSION = requests.Session()
+_STOP_EVENT = threading.Event()
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is required for guest runtime")
-
-try:
-    bot = telebot.TeleBot(TOKEN, parse_mode="HTML", num_threads=BOT_THREADS)
-except Exception as e:
-    raise RuntimeError(f"Failed to initialize guest bot runtime: {e}") from e
 
 _BOT_USERNAME = ""
 
@@ -88,6 +85,36 @@ def _extract_command_key(text: str, bot_username: str) -> str | None:
     return cmd_key
 
 
+def _extract_guest_command_key(text: str, bot_username: str) -> str | None:
+    direct_key = _extract_command_key(text, bot_username)
+    if direct_key:
+        return direct_key
+
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    first = raw.split()[0].strip()
+    if not first:
+        return None
+
+    if first.startswith("/"):
+        cmd = first[1:]
+        if "@" in cmd:
+            cmd_part, sep, mention_part = cmd.partition("@")
+            if not sep or mention_part.strip().lower() != bot_username.lower():
+                return None
+            cmd = cmd_part
+        key = _normalize_key(cmd)
+        if not key or len(key) > _CMD_MAX_NAME_LEN:
+            return None
+        return key
+
+    key = _normalize_key(first)
+    if not key or len(key) > _CMD_MAX_NAME_LEN:
+        return None
+    return key
+
+
 def _bot_is_enabled(conn: sqlite3.Connection, bot_username: str) -> bool:
     row = conn.execute(
         """
@@ -127,15 +154,119 @@ def _resolve_guest_response(conn: sqlite3.Connection, bot_username: str, cmd_key
     return text or None
 
 
-@bot.message_handler(func=lambda m: m.chat.type in ("group", "supergroup") and bool(getattr(m, "text", None)))
-def on_guest_command(m: telebot.types.Message):
-    if not m.from_user:
+def _api_request(method: str, params: dict | None = None, timeout: tuple[float, float] = (10.0, 70.0)) -> dict | None:
+    try:
+        response = _HTTP_SESSION.post(
+            f"{API_BASE_URL}/{method}",
+            data=params or {},
+            timeout=timeout,
+        )
+        data = response.json()
+        if isinstance(data, dict):
+            return data
+    except Exception as e:
+        logger.warning("[GUEST RUNTIME] API request failed %s: %s", method, e)
+    return None
+
+
+def _get_bot_username() -> str:
+    data = _api_request("getMe", timeout=(10.0, 20.0))
+    if not isinstance(data, dict) or not data.get("ok"):
+        return ""
+    result = data.get("result") or {}
+    if not isinstance(result, dict):
+        return ""
+    return str(result.get("username") or "").strip().lower()
+
+
+def _poll_guest_updates(offset: int | None) -> list[dict]:
+    payload: dict[str, str | int] = {
+        "timeout": 50,
+        "allowed_updates": json.dumps(["guest_message"], ensure_ascii=False),
+    }
+    if offset is not None:
+        payload["offset"] = int(offset)
+    data = _api_request("getUpdates", params=payload, timeout=(10.0, 70.0))
+    if not isinstance(data, dict):
+        return []
+    if not data.get("ok"):
+        logger.warning("[GUEST RUNTIME] getUpdates failed: %s", data.get("description"))
+        time.sleep(2)
+        return []
+    result = data.get("result")
+    if not isinstance(result, list):
+        return []
+    return [item for item in result if isinstance(item, dict)]
+
+
+def _extract_guest_query_id(message_obj: dict) -> str:
+    value = message_obj.get("guest_query_id")
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _extract_message_text(message_obj: dict) -> str:
+    text = message_obj.get("text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    caption = message_obj.get("caption")
+    if isinstance(caption, str) and caption.strip():
+        return caption.strip()
+    return ""
+
+
+def _answer_guest_query(guest_query_id: str, response_text: str) -> bool:
+    if not guest_query_id or not response_text:
+        return False
+
+    payloads = [
+        {
+            "guest_query_id": guest_query_id,
+            "text": response_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        {
+            "guest_query_id": guest_query_id,
+            "message_text": response_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        {
+            "guest_query_id": guest_query_id,
+            "response_text": response_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+    ]
+
+    last_error = ""
+    for payload in payloads:
+        result = _api_request("answerGuestQuery", params=payload, timeout=(10.0, 30.0))
+        if isinstance(result, dict) and result.get("ok"):
+            return True
+        if isinstance(result, dict):
+            last_error = str(result.get("description") or "")
+    if last_error:
+        logger.warning("[GUEST RUNTIME] answerGuestQuery failed: %s", last_error)
+    return False
+
+
+def _handle_guest_update(update_obj: dict) -> None:
+    guest_message = update_obj.get("guest_message")
+    if not isinstance(guest_message, dict):
         return
-    text = (m.text or "").strip()
+
+    guest_query_id = _extract_guest_query_id(guest_message)
+    if not guest_query_id:
+        return
+
+    text = _extract_message_text(guest_message)
     if not text:
         return
 
-    cmd_key = _extract_command_key(text, _BOT_USERNAME)
+    cmd_key = _extract_guest_command_key(text, _BOT_USERNAME)
     if not cmd_key:
         return
 
@@ -143,11 +274,12 @@ def on_guest_command(m: telebot.types.Message):
     try:
         conn = _db_connect()
         if not _bot_is_enabled(conn, _BOT_USERNAME):
+            _STOP_EVENT.set()
             return
         response = _resolve_guest_response(conn, _BOT_USERNAME, cmd_key)
         if not response:
             return
-        bot.send_message(m.chat.id, response, reply_to_message_id=m.message_id)
+        _answer_guest_query(guest_query_id, response)
     except Exception as e:
         logger.warning("[GUEST RUNTIME] command handling failed: %s", e)
     finally:
@@ -158,15 +290,33 @@ def on_guest_command(m: telebot.types.Message):
                 pass
 
 
+def _run_guest_polling_loop() -> None:
+    offset: int | None = None
+    while not _STOP_EVENT.is_set():
+        updates = _poll_guest_updates(offset)
+        if not updates:
+            continue
+        for update_obj in updates:
+            update_id = update_obj.get("update_id")
+            if isinstance(update_id, int):
+                offset = update_id + 1
+            else:
+                try:
+                    offset = int(update_id) + 1
+                except Exception:
+                    pass
+            _handle_guest_update(update_obj)
+
+
 def _wait_until_disabled() -> None:
-    while True:
+    while not _STOP_EVENT.is_set():
         time.sleep(10)
         conn = None
         try:
             conn = _db_connect()
             if not _bot_is_enabled(conn, _BOT_USERNAME):
                 logger.info("[GUEST RUNTIME] bot @%s disabled in DB; stopping", _BOT_USERNAME)
-                bot.stop_polling()
+                _STOP_EVENT.set()
                 return
         except Exception as e:
             logger.warning("[GUEST RUNTIME] disable watcher error: %s", e)
@@ -179,12 +329,11 @@ def _wait_until_disabled() -> None:
 
 
 if __name__ == "__main__":
-    me = bot.get_me()
-    _BOT_USERNAME = (getattr(me, "username", "") or "").lower()
+    _BOT_USERNAME = _get_bot_username()
     if not _BOT_USERNAME:
         raise RuntimeError("Guest runtime requires bot username")
 
     logger.info("Starting guest runtime for @%s", _BOT_USERNAME)
 
     threading.Thread(target=_wait_until_disabled, daemon=True, name="guest-disable-watch").start()
-    bot.infinity_polling(timeout=60, long_polling_timeout=60)
+    _run_guest_polling_loop()

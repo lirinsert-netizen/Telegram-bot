@@ -10,7 +10,20 @@ from typing import Optional
 
 import telebot as _tb
 
-from config import OWNER_USERNAME, DATA_DIR, bot, types
+from config import (
+    OWNER_USERNAME,
+    DATA_DIR,
+    bot,
+    types,
+    EMOJI_LIST_ID,
+    EMOJI_ADMIN_RIGHTS_ID,
+    EMOJI_ROLE_SETTINGS_BACK_PREMIUM_ID,
+    EMOJI_ROLE_SETTINGS_SAVE_ID,
+    EMOJI_ROLE_SETTINGS_CANCEL_ID,
+    EMOJI_ROLE_SETTINGS_SENT_PM_ID,
+    EMOJI_SENT_OK_ID,
+    PREMIUM_PREFIX_EMOJI_ID,
+)
 from helpers import should_ignore_text_triggers
 from persistence import (
     create_guest_bot,
@@ -40,6 +53,23 @@ _GUEST_PROCESSES_LOCK = _threading.Lock()
 _AVAILABLE_MODULES: list[tuple[str, str]] = [
     ("commands", "Команды"),
 ]
+
+
+def _premium_emoji(emoji_id: object, fallback: str = "•") -> str:
+    return f'<tg-emoji emoji-id="{_html.escape(str(emoji_id))}">{fallback}</tg-emoji>'
+
+
+def _btn(
+    text: str,
+    *,
+    callback_data: str | None = None,
+    url: str | None = None,
+    icon_id: object | None = None,
+) -> types.InlineKeyboardButton:
+    btn = types.InlineKeyboardButton(text, callback_data=callback_data, url=url)
+    if icon_id is not None:
+        btn.icon_custom_emoji_id = str(icon_id)
+    return btn
 
 
 def _is_owner(user: types.User | None) -> bool:
@@ -138,18 +168,20 @@ def autostart_guest_bots() -> None:
 
 def _guest_bots_menu_text(user: types.User) -> str:
     bots = list_guest_bots(owner_user_id=int(user.id))
+    hdr = _premium_emoji(EMOJI_LIST_ID)
     if not bots:
         return (
-            "<b>Guest-боты</b>\n\n"
+            f"{hdr} <b>Guest-боты</b>\n\n"
             "У вас пока нет guest-ботов.\n"
             "Нажмите «Подключить guest-бота» и отправьте токен BotFather."
         )
 
-    lines = ["<b>Guest-боты</b>\n"]
+    lines = [f"{hdr} <b>Guest-боты</b>\n"]
     for item in bots:
         uname = _html.escape(item.get("bot_username") or "unknown")
         enabled = bool(item.get("enabled"))
-        status = "✅ включён" if enabled else "⛔ выключен"
+        status_icon = _premium_emoji(EMOJI_SENT_OK_ID) if enabled else _premium_emoji(EMOJI_ROLE_SETTINGS_CANCEL_ID)
+        status = f"{status_icon} {'включён' if enabled else 'выключен'}"
         lines.append(f"• <b>@{uname}</b> — {status}")
     return "\n".join(lines)
 
@@ -159,9 +191,9 @@ def _guest_bots_menu_kb(user: types.User) -> types.InlineKeyboardMarkup:
     for item in list_guest_bots(owner_user_id=int(user.id)):
         guest_id = int(item.get("id") or 0)
         uname = _html.escape(item.get("bot_username") or str(guest_id))
-        kb.add(types.InlineKeyboardButton(f"⚙️ @{uname}", callback_data=f"guestbot:open:{guest_id}"))
-    kb.add(types.InlineKeyboardButton("➕ Подключить guest-бота", callback_data="guestbot:create"))
-    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="start:home"))
+        kb.add(_btn(f"Открыть @{uname}", callback_data=f"guestbot:open:{guest_id}", icon_id=EMOJI_ADMIN_RIGHTS_ID))
+    kb.add(_btn("Подключить guest-бота", callback_data="guestbot:create", icon_id=EMOJI_ROLE_SETTINGS_SAVE_ID))
+    kb.add(_btn("Назад", callback_data="start:home", icon_id=EMOJI_ROLE_SETTINGS_BACK_PREMIUM_ID))
     return kb
 
 
@@ -169,11 +201,12 @@ def _guest_detail_text(entry: dict) -> str:
     guest_id = int(entry.get("id") or 0)
     uname = _html.escape(entry.get("bot_username") or "")
     dname = _html.escape(entry.get("display_name") or uname)
-    status = "✅ активен" if bool(entry.get("enabled")) else "⛔ отключён"
+    status_icon = _premium_emoji(EMOJI_SENT_OK_ID) if bool(entry.get("enabled")) else _premium_emoji(EMOJI_ROLE_SETTINGS_CANCEL_ID)
+    status = f"{status_icon} {'активен' if bool(entry.get('enabled')) else 'отключён'}"
     modules = ", ".join(str(v) for v in (entry.get("linked_modules") or [])) or "commands"
     commands_count = len(list_guest_commands(guest_id))
     return (
-        f"<b>Guest-бот @{uname}</b>\n\n"
+        f"{_premium_emoji(EMOJI_ADMIN_RIGHTS_ID)} <b>Guest-бот @{uname}</b>\n\n"
         f"<b>ID:</b> <code>{guest_id}</code>\n"
         f"<b>Название:</b> <code>{dname}</code>\n"
         f"<b>Статус:</b> {status}\n"
@@ -186,24 +219,25 @@ def _guest_detail_kb(entry: dict) -> types.InlineKeyboardMarkup:
     guest_id = int(entry.get("id") or 0)
     enabled = bool(entry.get("enabled"))
     kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("🧩 Модули", callback_data=f"guestbot:modules:{guest_id}"))
-    kb.add(types.InlineKeyboardButton("📋 Команды", callback_data=f"guestbot:commands:{guest_id}"))
+    kb.add(_btn("Модули", callback_data=f"guestbot:modules:{guest_id}", icon_id=EMOJI_ADMIN_RIGHTS_ID))
+    kb.add(_btn("Команды", callback_data=f"guestbot:commands:{guest_id}", icon_id=EMOJI_LIST_ID))
     kb.add(
-        types.InlineKeyboardButton(
-            "⛔ Выключить" if enabled else "✅ Включить",
+        _btn(
+            "Выключить" if enabled else "Включить",
             callback_data=f"guestbot:toggle:{guest_id}",
+            icon_id=EMOJI_ROLE_SETTINGS_CANCEL_ID if enabled else EMOJI_SENT_OK_ID,
         )
     )
-    kb.add(types.InlineKeyboardButton("⬅️ К списку", callback_data="guestbot:list"))
+    kb.add(_btn("К списку", callback_data="guestbot:list", icon_id=EMOJI_ROLE_SETTINGS_BACK_PREMIUM_ID))
     return kb
 
 
 def _guest_modules_text(entry: dict) -> str:
     enabled_modules = set(str(m) for m in (entry.get("linked_modules") or []))
-    lines = [f"<b>Модули guest-бота @{_html.escape(entry.get('bot_username') or '')}</b>\n"]
+    lines = [f"{_premium_emoji(EMOJI_ADMIN_RIGHTS_ID)} <b>Модули guest-бота @{_html.escape(entry.get('bot_username') or '')}</b>\n"]
     lines.append("Выберите, какие функции доступны этому guest-боту.")
     for key, title in _AVAILABLE_MODULES:
-        mark = "✅" if key in enabled_modules else "◻️"
+        mark = _premium_emoji(EMOJI_SENT_OK_ID) if key in enabled_modules else _premium_emoji(EMOJI_ROLE_SETTINGS_CANCEL_ID)
         lines.append(f"{mark} <code>{_html.escape(title)}</code>")
     return "\n".join(lines)
 
@@ -213,21 +247,21 @@ def _guest_modules_kb(entry: dict) -> types.InlineKeyboardMarkup:
     enabled_modules = set(str(m) for m in (entry.get("linked_modules") or []))
     kb = types.InlineKeyboardMarkup(row_width=1)
     for key, title in _AVAILABLE_MODULES:
-        mark = "✅" if key in enabled_modules else "◻️"
-        kb.add(types.InlineKeyboardButton(f"{mark} {title}", callback_data=f"guestbot:modtog:{guest_id}:{key}"))
-    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"guestbot:open:{guest_id}"))
+        icon_id = EMOJI_SENT_OK_ID if key in enabled_modules else EMOJI_ROLE_SETTINGS_CANCEL_ID
+        kb.add(_btn(title, callback_data=f"guestbot:modtog:{guest_id}:{key}", icon_id=icon_id))
+    kb.add(_btn("Назад", callback_data=f"guestbot:open:{guest_id}", icon_id=EMOJI_ROLE_SETTINGS_BACK_PREMIUM_ID))
     return kb
 
 
 def _guest_commands_text(entry: dict) -> str:
     guest_id = int(entry.get("id") or 0)
     items = list_guest_commands(guest_id)
-    lines = [f"<b>Команды guest-бота @{_html.escape(entry.get('bot_username') or '')}</b>\n"]
+    lines = [f"{_premium_emoji(EMOJI_LIST_ID)} <b>Команды guest-бота @{_html.escape(entry.get('bot_username') or '')}</b>\n"]
     if not items:
         lines.append("Команд пока нет.")
     else:
         for item in items[:20]:
-            mark = "✅" if item.get("enabled") else "⛔"
+            mark = _premium_emoji(EMOJI_SENT_OK_ID) if item.get("enabled") else _premium_emoji(EMOJI_ROLE_SETTINGS_CANCEL_ID)
             name = _html.escape(item.get("name") or "")
             text_preview = _html.escape((item.get("response_text") or "")[:50])
             lines.append(f"{mark} <code>{name}</code> — {text_preview}")
@@ -240,13 +274,13 @@ def _guest_commands_text(entry: dict) -> str:
 def _guest_commands_kb(entry: dict) -> types.InlineKeyboardMarkup:
     guest_id = int(entry.get("id") or 0)
     kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("➕ Добавить / обновить", callback_data=f"guestbot:cmdadd:{guest_id}"))
-    kb.add(types.InlineKeyboardButton("🗑️ Удалить", callback_data=f"guestbot:cmddel:{guest_id}"))
+    kb.add(_btn("Добавить / обновить", callback_data=f"guestbot:cmdadd:{guest_id}", icon_id=EMOJI_ROLE_SETTINGS_SAVE_ID))
+    kb.add(_btn("Удалить", callback_data=f"guestbot:cmddel:{guest_id}", icon_id=EMOJI_ROLE_SETTINGS_CANCEL_ID))
     for item in list_guest_commands(guest_id)[:10]:
         name = _normalize_command_name(item.get("name") or "")
-        mark = "✅" if item.get("enabled") else "⛔"
-        kb.add(types.InlineKeyboardButton(f"{mark} {name}", callback_data=f"guestbot:cmdtog:{guest_id}:{name}"))
-    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"guestbot:open:{guest_id}"))
+        icon_id = EMOJI_SENT_OK_ID if item.get("enabled") else EMOJI_ROLE_SETTINGS_CANCEL_ID
+        kb.add(_btn(name, callback_data=f"guestbot:cmdtog:{guest_id}:{name}", icon_id=icon_id))
+    kb.add(_btn("Назад", callback_data=f"guestbot:open:{guest_id}", icon_id=EMOJI_ROLE_SETTINGS_BACK_PREMIUM_ID))
     return kb
 
 
@@ -263,10 +297,10 @@ def _show_guest_bots_menu(chat_id: int, user: types.User) -> None:
 def _begin_guest_creation(chat_id: int, user: types.User) -> None:
     _PENDING_TOKEN_USERS.add(int(user.id))
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("Открыть BotFather", url="https://t.me/BotFather"))
+    kb.add(_btn("Открыть BotFather", url="https://t.me/BotFather", icon_id=EMOJI_ROLE_SETTINGS_SENT_PM_ID))
     bot.send_message(
         chat_id,
-        "<b>Подключение guest-бота</b>\n\n"
+        f"{_premium_emoji(EMOJI_ROLE_SETTINGS_SENT_PM_ID)} <b>Подключение guest-бота</b>\n\n"
         "1) Создайте отдельного бота в @BotFather\n"
         "2) Отправьте токен следующим сообщением\n"
         "3) После регистрации guest-бот запустится как отдельный процесс\n\n"
@@ -536,7 +570,7 @@ def on_guest_pending_input(m: types.Message):
         except Exception as e:
             bot.reply_to(
                 m,
-                f"❌ Невалидный токен: <code>{_html.escape(str(e))}</code>",
+                f"{_premium_emoji(PREMIUM_PREFIX_EMOJI_ID)} Невалидный токен: <code>{_html.escape(str(e))}</code>",
                 parse_mode="HTML",
             )
             return
@@ -550,7 +584,7 @@ def on_guest_pending_input(m: types.Message):
             linked_modules=["commands"],
         )
         if not created:
-            bot.reply_to(m, f"❌ {err}")
+            bot.reply_to(m, f"{_premium_emoji(PREMIUM_PREFIX_EMOJI_ID)} {_html.escape(str(err or 'Ошибка'))}", parse_mode="HTML")
             return
 
         _PENDING_TOKEN_USERS.discard(uid)
@@ -560,7 +594,7 @@ def on_guest_pending_input(m: types.Message):
         bot.reply_to(
             m,
             (
-                f"✅ Guest-бот <b>@{uname}</b> подключён.\n"
+                f"{_premium_emoji(EMOJI_SENT_OK_ID)} Guest-бот <b>@{uname}</b> подключён.\n"
                 "Создайте guest-команды в меню управления.\n"
                 "В группах вызов: <code>@username_бота команда</code>."
             ),
@@ -601,7 +635,11 @@ def on_guest_pending_input(m: types.Message):
             bot.reply_to(m, "Не удалось сохранить команду.")
             return
         _PENDING_COMMAND_INPUT.pop(uid, None)
-        bot.reply_to(m, f"✅ Команда <code>{_html.escape(cmd_name)}</code> сохранена.", parse_mode="HTML")
+        bot.reply_to(
+            m,
+            f"{_premium_emoji(EMOJI_SENT_OK_ID)} Команда <code>{_html.escape(cmd_name)}</code> сохранена.",
+            parse_mode="HTML",
+        )
         _show_guest_bots_menu(m.chat.id, m.from_user)
         return
 
@@ -613,7 +651,11 @@ def on_guest_pending_input(m: types.Message):
         ok = delete_guest_command(guest_bot_id, cmd_name)
         _PENDING_COMMAND_INPUT.pop(uid, None)
         if ok:
-            bot.reply_to(m, f"✅ Команда <code>{_html.escape(cmd_name)}</code> удалена.", parse_mode="HTML")
+            bot.reply_to(
+                m,
+                f"{_premium_emoji(EMOJI_SENT_OK_ID)} Команда <code>{_html.escape(cmd_name)}</code> удалена.",
+                parse_mode="HTML",
+            )
         else:
             bot.reply_to(m, "Не удалось удалить команду.")
         _show_guest_bots_menu(m.chat.id, m.from_user)
