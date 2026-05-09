@@ -456,9 +456,9 @@ def on_guest_pending_input(m: types.Message):
     text = (m.text or "").strip()
     uid = int(m.from_user.id)
     lower_text = text.lower()
-    _try_delete_message(m.chat.id, m.message_id)
 
     if lower_text in {"/cancel", "отмена", "cancel"}:
+        _try_delete_message(m.chat.id, m.message_id)
         _clear_guest_creation_state(uid, chat_id=m.chat.id)
         bot.send_message(
             m.chat.id,
@@ -470,6 +470,7 @@ def on_guest_pending_input(m: types.Message):
 
     # ---- token input ----
     if uid in _PENDING_TOKEN_USERS:
+        _try_delete_message(m.chat.id, m.message_id)
         token_match = _TOKEN_RE.search(text)
         if not token_match:
             _send_guest_creation_prompt(

@@ -98,7 +98,7 @@ def _extract_command_key(text: str, bot_username: str) -> str | None:
 
     if first.startswith("@"):
         mention = first[1:].strip().lower()
-        cmd = " ".join(tokens[1:]).lstrip("/").strip()
+        cmd = " ".join(tokens[1:]).removeprefix("/").strip()
     elif first.startswith("/") and "@" in first:
         cmd_part, sep, mention_part = first[1:].partition("@")
         if not sep:
