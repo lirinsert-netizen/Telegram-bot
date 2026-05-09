@@ -453,6 +453,11 @@ def _rt_inline_kb(*rows: list[dict]) -> dict:
 
 
 def _rt_btn(text: str, callback_data: str, style: str | None = None) -> dict:
+    """Build an inline keyboard button dict.
+
+    The 'style' field is a non-standard Telegram Bot API extension supported
+    by this server for button colouring. Valid values: 'primary', 'danger', 'success'.
+    """
     btn: dict = {"text": text, "callback_data": callback_data}
     if style:
         btn["style"] = style
@@ -460,12 +465,14 @@ def _rt_btn(text: str, callback_data: str, style: str | None = None) -> dict:
 
 
 # ---- Emoji constants for UI ----
-_E_LIST    = '<tg-emoji emoji-id="5334882760735598374">📋</tg-emoji>'
-_E_ADD     = '<tg-emoji emoji-id="5226945370684140473">➕</tg-emoji>'
-_E_OK      = '<tg-emoji emoji-id="5427009714745517609">✅</tg-emoji>'
-_E_OFF     = '<tg-emoji emoji-id="5465665476971471368">❌</tg-emoji>'
-_E_BACK    = '<tg-emoji emoji-id="5963223853231509569">←</tg-emoji>'
-_E_TEXT    = '<tg-emoji emoji-id="5334882760735598374">📝</tg-emoji>'
+_E_LIST     = '<tg-emoji emoji-id="5334882760735598374">📋</tg-emoji>'
+_E_ADD      = '<tg-emoji emoji-id="5226945370684140473">➕</tg-emoji>'
+_E_OK       = '<tg-emoji emoji-id="5427009714745517609">✅</tg-emoji>'
+_E_OFF      = '<tg-emoji emoji-id="5465665476971471368">❌</tg-emoji>'
+_E_BACK     = '<tg-emoji emoji-id="5963223853231509569">←</tg-emoji>'
+# Note: _E_TEXT uses the same custom emoji ID as _E_LIST; this mirrors the main bot config
+# where EMOJI_LIST_ID == EMOJI_WELCOME_TEXT_ID == "5334882760735598374".
+_E_TEXT     = _E_LIST
 _E_SETTINGS = '<tg-emoji emoji-id="5341715473882955310">⚙️</tg-emoji>'
 
 
@@ -573,7 +580,7 @@ def _rt_build_list_kb(cmds: list[dict], page: int = 0) -> dict:
         nav.append(_rt_btn("▶", f"gcmd:list:{page + 1}"))
     if nav:
         rows.append(nav)
-    rows.append([_rt_btn("← Назад", "gcmd:main", style="primary")])
+    rows.append([_rt_btn(f"{_E_BACK} Назад", "gcmd:main", style="primary")])
     return _rt_inline_kb(*rows)
 
 
@@ -608,7 +615,7 @@ def _rt_build_draft_kb(draft: dict) -> dict:
         [btn_text],
         [btn_owner, btn_all],
         [btn_discard, btn_save],
-        [_rt_btn("← Назад", "gcmd:main", style="primary")],
+        [_rt_btn(f"{_E_BACK} Назад", "gcmd:main", style="primary")],
     )
 
 
@@ -910,8 +917,9 @@ def _rt_entities_to_html(text: str, entities: list[dict]) -> str:
                 uid = int((entity.get("user") or {}).get("id") or 0)
                 return f'<a href="tg://user?id={uid}">{inner}</a>'
             if t in ("blockquote", "expandable_blockquote"):
-                expandable = 'expandable="true" ' if t == "expandable_blockquote" else ""
-                return f"<blockquote {expandable}>{inner}</blockquote>"
+                if t == "expandable_blockquote":
+                    return f'<blockquote expandable="true">{inner}</blockquote>'
+                return f"<blockquote>{inner}</blockquote>"
             if t == "custom_emoji":
                 eid = str(entity.get("custom_emoji_id") or "")
                 return f'<tg-emoji emoji-id="{eid}">{inner}</tg-emoji>'
