@@ -9,6 +9,7 @@ import requests
 import sqlite3
 import threading
 import time
+from html.parser import HTMLParser
 
 
 logging.basicConfig(
@@ -33,8 +34,38 @@ _BOT_USERNAME = ""
 _CMD_MAX_NAME_LEN = 30
 _CMD_STRIP_CHARS = "`'\"«»()[]{}<>.,;:!?"
 _OWNER_DEBUG_MAX_LEN = 400
+# answerGuestQuery returns a message-like text payload, so keep it within the
+# standard Telegram text ceiling.
 _GUEST_QUERY_TEXT_MAX_LEN = 4000
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+class _GuestQueryHTMLStripper(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._chunks: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        if data:
+            self._chunks.append(data)
+
+    def get_text(self) -> str:
+        return "".join(self._chunks)
+
+
+def _prepare_guest_query_text(response_text: str) -> str:
+    raw_text = str(response_text or "").strip()
+    if not raw_text:
+        return ""
+    parser = _GuestQueryHTMLStripper()
+    try:
+        parser.feed(raw_text)
+        parser.close()
+        clean_text = parser.get_text().strip()
+    except Exception:
+        clean_text = ""
+    if not clean_text:
+        clean_text = _html.unescape(raw_text).strip()
+    return clean_text[:_GUEST_QUERY_TEXT_MAX_LEN]
 
 
 def _db_connect() -> sqlite3.Connection:
@@ -425,11 +456,10 @@ def _answer_guest_query(guest_query_id: str, response_text: str) -> bool:
     if not guest_query_id or not response_text:
         return False
 
-    clean_response_text = _HTML_TAG_RE.sub("", str(response_text or ""))
-    clean_response_text = _html.unescape(clean_response_text).strip()
+    clean_response_text = _prepare_guest_query_text(response_text)
     if not clean_response_text:
+        logger.warning("[GUEST RUNTIME] answerGuestQuery skipped: empty text after cleanup")
         return False
-    clean_response_text = clean_response_text[:_GUEST_QUERY_TEXT_MAX_LEN]
 
     # answerGuestQuery accepts plain text, so we avoid sendMessage-only fields.
     payloads = [
