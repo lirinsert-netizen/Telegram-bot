@@ -5661,7 +5661,6 @@ _RESERVED_CMD_NAMES = {
     "closechat", "openchat",
     "verify", "unverify", "vlist", "devverify", "devunverify", "devvlist",
     "clones", "clone_register", "clone_unlink", "newbot",
-    "guestbots",
     "del", "delete",
 }
 
