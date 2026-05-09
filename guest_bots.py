@@ -55,7 +55,7 @@ _AVAILABLE_MODULES: list[tuple[str, str]] = [
 
 
 def _premium_emoji(emoji_id: object, fallback: str = "•") -> str:
-    return f'<tg-emoji emoji-id="{_html.escape(str(emoji_id))}">{fallback}</tg-emoji>'
+    return fallback
 
 
 def _btn(
