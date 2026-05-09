@@ -34,8 +34,8 @@ _BOT_USERNAME = ""
 _CMD_MAX_NAME_LEN = 30
 _CMD_STRIP_CHARS = "`'\"«»()[]{}<>.,;:!?"
 _OWNER_DEBUG_MAX_LEN = 400
-# answerGuestQuery returns a message-like text payload, so keep it within the
-# standard Telegram text ceiling.
+# answerGuestQuery returns a message-like text payload. We keep a small reserve
+# below Telegram's 4096-char ceiling to avoid edge-case overflows after cleanup.
 _GUEST_QUERY_TEXT_MAX_LEN = 4000
 
 
@@ -61,7 +61,8 @@ def _prepare_guest_query_text(response_text: str) -> str:
         parser.feed(raw_text)
         parser.close()
         clean_text = parser.get_text().strip()
-    except Exception:
+    except Exception as e:
+        logger.warning("[GUEST RUNTIME] failed to strip HTML from guest response: %s", e)
         clean_text = ""
     if not clean_text:
         clean_text = _html.unescape(raw_text).strip()
