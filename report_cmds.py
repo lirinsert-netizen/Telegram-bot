@@ -29,7 +29,7 @@ from helpers import (
 
 
 REPORTS_COOLDOWN_SECONDS = 30
-REPORT_MENTION_ALIASES = {"@admin", "@админ", "админ"}
+REPORT_MENTION_ALIASES = {"@admin", "@админ"}
 
 
 def _get_reports_state(chat_id: int) -> dict:
