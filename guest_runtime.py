@@ -34,8 +34,8 @@ _BOT_USERNAME = ""
 _CMD_MAX_NAME_LEN = 30
 _CMD_STRIP_CHARS = "`'\"«»()[]{}<>.,;:!?"
 _OWNER_DEBUG_MAX_LEN = 400
-# answerGuestQuery returns a message-like text payload. We keep a small reserve
-# below Telegram's 4096-char ceiling to avoid edge-case overflows after cleanup.
+# answerGuestQuery returns a message-like text payload. We keep a 96-char reserve
+# below Telegram's 4096-char ceiling to stay safe after cleanup and future tweaks.
 _GUEST_QUERY_TEXT_MAX_LEN = 4000
 
 
@@ -380,11 +380,11 @@ def _extract_guest_query_id(payload_obj: dict, update_obj: dict | None = None) -
 
     Supports IDs in guest_message, guest_query, and nested guest_query payloads.
     """
-    def _candidate_id(candidate: object, *, allow_plain_id: bool = False) -> str:
+    def _candidate_id(candidate: object, *, allow_fallback_id: bool = False) -> str:
         if not isinstance(candidate, dict):
             return ""
         value = candidate.get("guest_query_id")
-        if value is None and allow_plain_id:
+        if value is None and allow_fallback_id:
             value = candidate.get("id")
         return str(value).strip() if value is not None else ""
 
@@ -396,7 +396,7 @@ def _extract_guest_query_id(payload_obj: dict, update_obj: dict | None = None) -
         if not isinstance(source, dict):
             continue
         nested_guest_query = source.get("guest_query")
-        nested_id = _candidate_id(nested_guest_query, allow_plain_id=True)
+        nested_id = _candidate_id(nested_guest_query, allow_fallback_id=True)
         if nested_id:
             return nested_id
 
@@ -407,7 +407,7 @@ def _extract_guest_query_id(payload_obj: dict, update_obj: dict | None = None) -
                 return nested_id
             if isinstance(nested_payload, dict):
                 nested_guest_query = nested_payload.get("guest_query")
-                nested_id = _candidate_id(nested_guest_query, allow_plain_id=True)
+                nested_id = _candidate_id(nested_guest_query, allow_fallback_id=True)
                 if nested_id:
                     return nested_id
     return ""
