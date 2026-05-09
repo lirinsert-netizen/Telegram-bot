@@ -459,6 +459,8 @@ def _rt_btn(text: str, callback_data: str, style: str | None = None) -> dict:
     by this server for button colouring. Valid values: 'primary', 'danger', 'success'.
     """
     btn: dict = {"text": text, "callback_data": callback_data}
+    if text == "Назад":
+        btn["icon_custom_emoji_id"] = "5963223853231509569"
     if style:
         btn["style"] = style
     return btn
@@ -469,7 +471,6 @@ _E_LIST     = '<tg-emoji emoji-id="5334882760735598374">📋</tg-emoji>'
 _E_ADD      = '<tg-emoji emoji-id="5226945370684140473">➕</tg-emoji>'
 _E_OK       = '<tg-emoji emoji-id="5427009714745517609">✅</tg-emoji>'
 _E_OFF      = '<tg-emoji emoji-id="5465665476971471368">❌</tg-emoji>'
-_E_BACK     = '<tg-emoji emoji-id="5963223853231509569">←</tg-emoji>'
 # Note: _E_TEXT uses the same custom emoji ID as _E_LIST; this mirrors the main bot config
 # where EMOJI_LIST_ID == EMOJI_WELCOME_TEXT_ID == "5334882760735598374".
 _E_TEXT     = _E_LIST
@@ -537,6 +538,7 @@ def _rt_build_main_kb() -> dict:
     return _rt_inline_kb(
         [_rt_btn("📋 Список команд", "gcmd:list:0")],
         [_rt_btn("➕ Добавить команду", "gcmd:add")],
+        [_rt_btn("Удалить команду", "gcmd:del_list")],
     )
 
 
@@ -553,9 +555,8 @@ def _rt_build_list_text(cmds: list[dict], page: int = 0) -> str:
     header = f"{_E_SETTINGS} <b>Список команд ({page + 1}/{total_pages})</b>\n"
     lines = [header]
     for i, cmd in enumerate(chunk, start=start + 1):
-        mark = _E_OK if cmd["enabled"] else _E_OFF
-        access = " <i>(владелец)</i>" if cmd["owner_only"] else ""
-        lines.append(f"{i}. {mark} <code>{_html.escape(cmd['name'])}</code>{access}")
+        access_label = "Для владельца" if cmd["owner_only"] else "Все пользователи"
+        lines.append(f"{i}. <code>{_html.escape(cmd['name'])}</code> — {_html.escape(access_label)}")
     return "\n".join(lines)
 
 
@@ -563,16 +564,7 @@ def _rt_build_list_kb(cmds: list[dict], page: int = 0) -> dict:
     page_size = 10
     total_pages = max(1, (len(cmds) + page_size - 1) // page_size)
     page = max(0, min(page, total_pages - 1))
-    start = page * page_size
-    chunk = cmds[start:start + page_size]
     rows: list[list[dict]] = []
-    for cmd in chunk:
-        name = cmd["name"]
-        status = "✅" if cmd["enabled"] else "❌"
-        rows.append([
-            _rt_btn(f"{status} {name}", f"gcmd:tog:{name}"),
-            _rt_btn("🗑", f"gcmd:del:{name}"),
-        ])
     nav: list[dict] = []
     if page > 0:
         nav.append(_rt_btn("◀", f"gcmd:list:{page - 1}"))
@@ -580,7 +572,7 @@ def _rt_build_list_kb(cmds: list[dict], page: int = 0) -> dict:
         nav.append(_rt_btn("▶", f"gcmd:list:{page + 1}"))
     if nav:
         rows.append(nav)
-    rows.append([_rt_btn(f"{_E_BACK} Назад", "gcmd:main", style="primary")])
+    rows.append([_rt_btn("Назад", "gcmd:main", style="primary")])
     return _rt_inline_kb(*rows)
 
 
@@ -615,7 +607,19 @@ def _rt_build_draft_kb(draft: dict) -> dict:
         [btn_text],
         [btn_owner, btn_all],
         [btn_discard, btn_save],
-        [_rt_btn(f"{_E_BACK} Назад", "gcmd:main", style="primary")],
+        [_rt_btn("Назад", "gcmd:main", style="primary")],
+    )
+
+
+def _rt_build_delete_prompt(cmds: list[dict]) -> str:
+    cmd_names_list = "\n".join(
+        f"{i + 1}. <code>{_html.escape(cmd.get('name') or '')}</code>"
+        for i, cmd in enumerate(cmds)
+    )
+    return (
+        f"{_E_SETTINGS} <b>Удалить команду</b>\n\n"
+        "Введите <b>имя команды</b> для удаления.\n\n"
+        f"<b>Список команд:</b>\n{cmd_names_list}"
     )
 
 
@@ -728,11 +732,32 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
             chat_id,
             f"{_E_ADD} <b>Создание команды</b>\n\n"
             f"Пришлите <b>имя</b> новой команды.\n"
-            f"<i>Одно слово, до {_CMD_MAX_NAME_LEN_RT} символов. Допустимы любые символы без пробелов.</i>\n\n"
-            "Для отмены: <code>отмена</code>",
-            _rt_inline_kb([_rt_btn("❌ Отмена", "gcmd:add_cancel")]),
+            f"<i>Одно слово, до {_CMD_MAX_NAME_LEN_RT} символов. "
+            + "Команда срабатывает, когда пользователь напишет только это слово в группе.</i>",
+            _rt_inline_kb([_rt_btn("Отмена", "gcmd:add_cancel")]),
         )
         _rt_answer_cq(query_id)
+        return
+
+    if data == "gcmd:del_list":
+        cmds = _rt_list_commands_for_bot(conn, _BOT_USERNAME)
+        if not cmds:
+            _go_main()
+            _rt_answer_cq(query_id)
+            return
+        _RT_PENDING[sender_id] = {"step": "await_delete"}
+        _rt_send(
+            chat_id,
+            _rt_build_delete_prompt(cmds),
+            _rt_inline_kb([_rt_btn("Отмена", "gcmd:del_cancel")]),
+        )
+        _rt_answer_cq(query_id)
+        return
+
+    if data == "gcmd:del_cancel":
+        _RT_PENDING.pop(sender_id, None)
+        _rt_answer_cq(query_id, "Отменено.")
+        _go_main()
         return
 
     if data == "gcmd:add_cancel":
@@ -741,29 +766,9 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
         _go_main()
         return
 
-    # ---- delete command ----
-    if data.startswith("gcmd:del:"):
-        name = data[len("gcmd:del:"):]
-        if not name:
-            _rt_answer_cq(query_id, "Ошибка.", show_alert=True)
-            return
-        ok = _rt_delete_command(conn, _BOT_USERNAME, name)
-        if ok:
-            _rt_answer_cq(query_id, f"Команда «{name}» удалена.")
-        else:
-            _rt_answer_cq(query_id, "Не удалось удалить.", show_alert=True)
-        _go_list(0)
-        return
-
-    # ---- toggle command ----
-    if data.startswith("gcmd:tog:"):
-        name = data[len("gcmd:tog:"):]
-        if not name:
-            _rt_answer_cq(query_id, "Ошибка.", show_alert=True)
-            return
-        _rt_toggle_command(conn, _BOT_USERNAME, name)
-        _rt_answer_cq(query_id)
-        _go_list(0)
+    if data.startswith("gcmd:del:") or data.startswith("gcmd:tog:"):
+        _rt_answer_cq(query_id, "Откройте обновлённый список команд.", show_alert=True)
+        _go_main()
         return
 
     # ---- draft: request text ----
@@ -777,17 +782,39 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
         _rt_send(
             chat_id,
             f"{_E_TEXT} <b>Пришлите текст команды.</b>\n\n"
+            "<blockquote expandable=\"true\">"
+            "<b>Доступные переменные:</b>\n"
+            "[GROUP_NAME] — название группы\n"
+            "[USER_MENTION] — упоминание вызвавшего команду\n"
+            "[USER_ID] — ID вызвавшего команду\n"
+            "[USER_NAME] — имя вызвавшего команду\n"
+            "[REPLY_MENTION] — упоминание того, на кого ответили\n"
+            "[REPLY_ID] — ID того, на кого ответили\n"
+            "[REPLY_NAME] — имя того, на кого ответили\n"
+            "[NOLINK] — убрать предпросмотр ссылки\n"
+            "[LINK] — включить предпросмотр ссылки"
+            "</blockquote>\n\n"
             "<b>Поддерживается:</b>\n"
-            "• обычное форматирование Telegram (жирный, курсив, подчёркивание и т.д.)\n"
-            "• кастомный HTML:\n"
-            "<code>&lt;b&gt;жирный&lt;/b&gt;</code>, "
-            "<code>&lt;i&gt;курсив&lt;/i&gt;</code>, "
-            "<code>&lt;code&gt;код&lt;/code&gt;</code>, "
-            "<code>&lt;u&gt;подчёркнутый&lt;/u&gt;</code>, "
-            "<code>&lt;s&gt;зачёркнутый&lt;/s&gt;</code>, "
-            "<code>&lt;a href='...'&gt;ссылка&lt;/a&gt;</code> и другие теги.\n\n"
-            "Для отмены: <code>отмена</code>",
-            _rt_inline_kb([_rt_btn("❌ Отмена", "gcmd:draft_cancel")]),
+            "• обычное форматирование Telegram\n"
+            "• и/или наш кастомный HTML\n\n"
+            "<blockquote expandable=\"true\">"
+            "<b>Кастомный HTML:</b>\n"
+            "<code>&lt;b&gt;жирный&lt;/&gt;</code>\n"
+            "<code>&lt;i&gt;курсив&lt;/&gt;</code>\n"
+            "<code>&lt;u&gt;подчёркнутый&lt;/&gt;</code>\n"
+            "<code>&lt;s&gt;зачёркнутый&lt;/&gt;</code>\n"
+            "<code>&lt;code&gt;моноширинный&lt;/&gt;</code>\n"
+            "<code>&lt;pre&gt;код&lt;/&gt;</code>\n"
+            "<code>&lt;sp&gt;спойлер&lt;/&gt;</code>\n"
+            "<code>&lt;quote&gt;цитата&lt;/&gt;</code>\n"
+            "<code>&lt;quote exp&gt;свёрнутая цитата&lt;/&gt;</code>\n"
+            "<code>&lt;emoji id='123'&gt;😀&lt;/&gt;</code>\n"
+            "<code>&lt;a href='https://example.com'&gt;ссылка&lt;/&gt;</code>\n"
+            "<code>&lt;br&gt;</code> — перенос строки"
+            "</blockquote>\n\n"
+            "<i>Важно:</i> если Telegram-выделение захватит символы &lt; или &gt;, "
+            "то Telegram-форматирование может быть проигнорировано.",
+            _rt_inline_kb([_rt_btn("Отмена", "gcmd:draft_cancel")]),
         )
         _rt_answer_cq(query_id)
         return
@@ -950,6 +977,7 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
     """Handle a private message from an allowed user. Returns True if handled."""
     raw_text = str(msg.get("text") or "")
     text = raw_text.strip()
+    has_text_field = isinstance(msg.get("text"), str)
     chat_id = int((msg.get("chat") or {}).get("id") or 0)
 
     if not chat_id:
@@ -976,18 +1004,33 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
     step = state.get("step")
 
     if step == "await_name":
+        if not has_text_field:
+            _rt_send(
+                chat_id,
+                "Пришлите имя команды текстом.",
+                _rt_inline_kb([_rt_btn("Отмена", "gcmd:add_cancel")]),
+            )
+            return True
         if not text or " " in text:
             _rt_send(
                 chat_id,
-                f"{_E_OFF} <b>Некорректное имя</b>\n\nОдно слово без пробелов, до {_CMD_MAX_NAME_LEN_RT} символов.",
-                _rt_inline_kb([_rt_btn("❌ Отмена", "gcmd:add_cancel")]),
+                "Имя команды должно быть <b>одним словом</b> без пробелов.",
+                _rt_inline_kb([_rt_btn("Отмена", "gcmd:add_cancel")]),
             )
             return True
         if len(text) > _CMD_MAX_NAME_LEN_RT:
             _rt_send(
                 chat_id,
-                f"{_E_OFF} <b>Имя слишком длинное</b>\n\nМаксимум {_CMD_MAX_NAME_LEN_RT} символов.",
-                _rt_inline_kb([_rt_btn("❌ Отмена", "gcmd:add_cancel")]),
+                f"Имя команды не должно превышать {_CMD_MAX_NAME_LEN_RT} символов.",
+                _rt_inline_kb([_rt_btn("Отмена", "gcmd:add_cancel")]),
+            )
+            return True
+        cmds_existing = _rt_list_commands_for_bot(conn, _BOT_USERNAME)
+        if text.lower() in {str(cmd.get("name") or "").lower() for cmd in cmds_existing}:
+            _rt_send(
+                chat_id,
+                f"Команда <code>{_html.escape(text)}</code> уже существует.",
+                _rt_inline_kb([_rt_btn("Отмена", "gcmd:add_cancel")]),
             )
             return True
         state["name"] = text.strip().lower()
@@ -996,19 +1039,62 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
         _rt_send(chat_id, _rt_build_draft_text(state), _rt_build_draft_kb(state))
         return True
 
+    if step == "await_delete":
+        if not has_text_field:
+            _rt_send(
+                chat_id,
+                "Пришлите имя команды текстом.",
+                _rt_inline_kb([_rt_btn("Отмена", "gcmd:del_cancel")]),
+            )
+            return True
+        raw_del = text
+        cmds_del = _rt_list_commands_for_bot(conn, _BOT_USERNAME)
+        cmd_by_key = {str(cmd.get("name") or "").lower(): cmd for cmd in cmds_del}
+        cmd_key_del = raw_del.lower()
+        if cmd_key_del not in cmd_by_key:
+            _rt_send(
+                chat_id,
+                f"Команда <code>{_html.escape(raw_del)}</code> не найдена. Введите точное имя.",
+                _rt_inline_kb([_rt_btn("Отмена", "gcmd:del_cancel")]),
+            )
+            return True
+        cmd_name_display = str(cmd_by_key[cmd_key_del].get("name") or raw_del)
+        ok = _rt_delete_command(conn, _BOT_USERNAME, raw_del)
+        _RT_PENDING.pop(sender_id, None)
+        if ok:
+            _rt_send(
+                chat_id,
+                f"{_E_OK} <b>Команда <code>{_html.escape(cmd_name_display)}</code> удалена.</b>",
+                _rt_build_main_kb(),
+            )
+        else:
+            _rt_send(
+                chat_id,
+                "Не удалось удалить команду.",
+                _rt_inline_kb([_rt_btn("Отмена", "gcmd:del_cancel")]),
+            )
+        return True
+
     if step == "await_text":
+        if not has_text_field:
+            _rt_send(
+                chat_id,
+                f"{_E_OFF} <b>Это не текст.</b>\nПришлите текстовое сообщение.",
+                _rt_inline_kb([_rt_btn("Отмена", "gcmd:draft_cancel")]),
+            )
+            return True
         if not text:
             _rt_send(
                 chat_id,
-                f"{_E_OFF} Текст не должен быть пустым.",
-                _rt_inline_kb([_rt_btn("❌ Отмена", "gcmd:draft_cancel")]),
+                f"{_E_OFF} <b>Это не текст.</b>\nПришлите текстовое сообщение.",
+                _rt_inline_kb([_rt_btn("Отмена", "gcmd:draft_cancel")]),
             )
             return True
         if len(text) > _MAX_RESPONSE_LEN_RT:
             _rt_send(
                 chat_id,
                 f"{_E_OFF} <b>Текст слишком длинный</b>\n\nМаксимум {_MAX_RESPONSE_LEN_RT} символов.",
-                _rt_inline_kb([_rt_btn("❌ Отмена", "gcmd:draft_cancel")]),
+                _rt_inline_kb([_rt_btn("Отмена", "gcmd:draft_cancel")]),
             )
             return True
         # Convert Telegram entities to HTML if present; otherwise keep as-is (allows literal HTML input)
