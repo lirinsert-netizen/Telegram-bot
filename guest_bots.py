@@ -41,6 +41,7 @@ _MAX_COMMAND_RESPONSE_LEN = 3500
 _CMD_MAX_NAME_LEN = 30
 
 _PENDING_TOKEN_USERS: set[int] = set()
+_PENDING_TOKEN_PROMPTS: dict[int, tuple[int, int]] = {}
 
 _GUEST_PROCESSES: dict[int, _subprocess.Popen] = {}
 _GUEST_PROCESSES_LOCK = _threading.Lock()
@@ -197,18 +198,24 @@ def _guest_bots_menu_text(user: types.User) -> str:
         status_icon = _pe(_EMOJI_OK, "✅") if enabled else _pe(_EMOJI_CANCEL, "❌")
         status_text = "активен" if enabled else "отключён"
         lines.append(
-            f"{i}. {status_icon} <b>@{uname}</b>\n"
-            f"   <b>ID:</b> <code>{guest_id}</code> · <i>{status_text}</i>"
+            f"{i}. {status_icon} <b>@{uname}</b> [<code>{guest_id}</code>] · <i>{status_text}</i>"
         )
     return "\n".join(lines)
 
 
-def _guest_bots_menu_kb(user: types.User) -> types.InlineKeyboardMarkup:
+def _guest_bots_menu_kb(user: types.User, selected_guest_id: int = 0) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=1)
     for item in list_guest_bots(owner_user_id=int(user.id)):
         guest_id = int(item.get("id") or 0)
         uname = (item.get("bot_username") or str(guest_id)).strip().lstrip("@")
-        kb.add(_btn(f"@{uname}", callback_data=f"guestbot:manage:{guest_id}"))
+        kb.add(_btn(f"@{uname}", callback_data=f"guestbot:select:{guest_id}"))
+        if selected_guest_id and guest_id == int(selected_guest_id):
+            btn_unbind = _btn("Отвязать", callback_data=f"guestbot:unbind_ask:{guest_id}", icon_id=_EMOJI_CANCEL)
+            try:
+                btn_unbind.style = "danger"
+            except Exception:
+                pass
+            kb.add(btn_unbind)
     kb.add(_btn("Подключить гостевого бота", callback_data="guestbot:create", icon_id=_EMOJI_CONNECT))
     kb.add(_btn("Назад", callback_data="start:home", icon_id=_EMOJI_BACK))
     return kb
@@ -245,33 +252,66 @@ def _show_guest_bots_menu(chat_id: int, user: types.User) -> None:
         _guest_bots_menu_text(user),
         parse_mode="HTML",
         disable_web_page_preview=True,
-        reply_markup=_guest_bots_menu_kb(user),
+        reply_markup=_guest_bots_menu_kb(user, selected_guest_id=0),
     )
 
 
-def _begin_guest_creation(chat_id: int, user: types.User) -> None:
-    _PENDING_TOKEN_USERS.add(int(user.id))
+def _try_delete_message(chat_id: int, msg_id: int | None) -> None:
+    if not msg_id:
+        return
+    try:
+        bot.delete_message(chat_id, int(msg_id))
+    except Exception:
+        pass
+
+
+def _clear_guest_creation_state(user_id: int, chat_id: int | None = None) -> None:
+    uid = int(user_id)
+    _PENDING_TOKEN_USERS.discard(uid)
+    prompt = _PENDING_TOKEN_PROMPTS.pop(uid, None)
+    if prompt and chat_id is not None:
+        try:
+            prompt_chat_id, prompt_msg_id = int(prompt[0]), int(prompt[1])
+            if prompt_chat_id == int(chat_id):
+                _try_delete_message(prompt_chat_id, prompt_msg_id)
+        except Exception:
+            pass
+
+
+def _send_guest_creation_prompt(chat_id: int, user_id: int, body: str) -> None:
+    uid = int(user_id)
+    prev = _PENDING_TOKEN_PROMPTS.get(uid)
+    if prev:
+        try:
+            prev_chat_id, prev_msg_id = int(prev[0]), int(prev[1])
+        except Exception:
+            prev_chat_id, prev_msg_id = 0, 0
+        if prev_chat_id == int(chat_id):
+            _try_delete_message(prev_chat_id, prev_msg_id)
     kb = types.InlineKeyboardMarkup()
     kb.add(_btn("Открыть BotFather", url="https://t.me/BotFather", icon_id=_EMOJI_PM))
-    bot.send_message(
+    kb.add(_btn("Отмена", callback_data="guestbot:create_cancel", icon_id=_EMOJI_CANCEL))
+    sent = bot.send_message(
         chat_id,
+        body,
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+    _PENDING_TOKEN_PROMPTS[uid] = (int(chat_id), int(sent.message_id))
+
+
+def _begin_guest_creation(chat_id: int, user: types.User, source_msg_id: int | None = None) -> None:
+    uid = int(user.id)
+    _PENDING_TOKEN_USERS.add(uid)
+    _try_delete_message(chat_id, source_msg_id)
+    body = (
         f'{_pe(_EMOJI_PM, "⚙️")} <b>Подключение гостевого бота</b>\n\n'
         "1) Создайте отдельного бота в @BotFather\n"
         "2) Отправьте токен следующим сообщением\n"
         "3) После регистрации guest-бот запустится как отдельный процесс\n\n"
-        "Для отмены: <code>/cancel</code> или <code>отмена</code>",
-        parse_mode="HTML",
-        reply_markup=kb,
+        "Нажмите «Отмена» для завершения."
     )
-
-
-@bot.message_handler(commands=["guestbots"])
-def cmd_guestbots(m: types.Message):
-    if should_ignore_text_triggers(m):
-        return
-    if m.chat.type != "private" or not _is_owner(m.from_user):
-        return
-    _show_guest_bots_menu(m.chat.id, m.from_user)
+    _send_guest_creation_prompt(chat_id, uid, body)
 
 
 @bot.callback_query_handler(func=lambda c: bool(c.data) and c.data.startswith("guestbot:"))
@@ -285,7 +325,7 @@ def guest_bots_callback(call: types.CallbackQuery):
     msg_id = call.message.message_id
     uid = int(call.from_user.id)
 
-    def _edit_menu():
+    def _edit_menu(selected_guest_id: int = 0):
         try:
             bot.edit_message_text(
                 _guest_bots_menu_text(call.from_user),
@@ -293,15 +333,22 @@ def guest_bots_callback(call: types.CallbackQuery):
                 msg_id,
                 parse_mode="HTML",
                 disable_web_page_preview=True,
-                reply_markup=_guest_bots_menu_kb(call.from_user),
+                reply_markup=_guest_bots_menu_kb(call.from_user, selected_guest_id=selected_guest_id),
             )
         except Exception:
             _show_guest_bots_menu(chat_id, call.from_user)
 
     # ---- create ----
     if data == "guestbot:create":
-        _begin_guest_creation(chat_id, call.from_user)
+        _begin_guest_creation(chat_id, call.from_user, source_msg_id=msg_id)
         bot.answer_callback_query(call.id, "Ожидаю токен гостевого бота.", show_alert=False)
+        return
+
+    if data == "guestbot:create_cancel":
+        _clear_guest_creation_state(uid, chat_id=chat_id)
+        _try_delete_message(chat_id, msg_id)
+        bot.answer_callback_query(call.id, "Подключение отменено.", show_alert=False)
+        _show_guest_bots_menu(chat_id, call.from_user)
         return
 
     # ---- list ----
@@ -364,7 +411,7 @@ def guest_bots_callback(call: types.CallbackQuery):
         return
 
     # ---- manage (per-bot command management page) ----
-    if data.startswith("guestbot:manage:"):
+    if data.startswith("guestbot:select:") or data.startswith("guestbot:manage:"):
         parts = data.split(":", 2)
         if len(parts) < 3:
             bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
@@ -374,21 +421,7 @@ def guest_bots_callback(call: types.CallbackQuery):
         if not entry or int(entry.get("owner_user_id") or 0) != uid:
             bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
             return
-        try:
-            bot.edit_message_text(
-                _manage_bot_text(entry),
-                chat_id,
-                msg_id,
-                parse_mode="HTML",
-                reply_markup=_manage_bot_kb(entry),
-            )
-        except Exception:
-            bot.send_message(
-                chat_id,
-                _manage_bot_text(entry),
-                parse_mode="HTML",
-                reply_markup=_manage_bot_kb(entry),
-            )
+        _edit_menu(selected_guest_id=guest_id)
         bot.answer_callback_query(call.id)
         return
 
@@ -423,20 +456,26 @@ def on_guest_pending_input(m: types.Message):
     text = (m.text or "").strip()
     uid = int(m.from_user.id)
     lower_text = text.lower()
+    _try_delete_message(m.chat.id, m.message_id)
 
     if lower_text in {"/cancel", "отмена", "cancel"}:
-        _PENDING_TOKEN_USERS.discard(uid)
-        bot.reply_to(m, "Операция отменена.")
+        _clear_guest_creation_state(uid, chat_id=m.chat.id)
+        bot.send_message(
+            m.chat.id,
+            f'{_pe(_EMOJI_OK, "✅")} Операция отменена.',
+            parse_mode="HTML",
+        )
+        _show_guest_bots_menu(m.chat.id, m.from_user)
         return
 
     # ---- token input ----
     if uid in _PENDING_TOKEN_USERS:
         token_match = _TOKEN_RE.search(text)
         if not token_match:
-            bot.reply_to(
-                m,
+            _send_guest_creation_prompt(
+                m.chat.id,
+                uid,
                 f'{_pe(PREMIUM_PREFIX_EMOJI_ID, "⚠️")} Не удалось распознать токен. Пришлите токен целиком.',
-                parse_mode="HTML",
             )
             return
 
@@ -445,11 +484,11 @@ def on_guest_pending_input(m: types.Message):
             test_bot = _tb.TeleBot(token)
             me = test_bot.get_me()
         except Exception as e:
-            bot.reply_to(
-                m,
+            _send_guest_creation_prompt(
+                m.chat.id,
+                uid,
                 f'{_pe(PREMIUM_PREFIX_EMOJI_ID, "❌")} <b>Невалидный токен</b>\n\n'
                 f"<code>{_html.escape(str(e))}</code>",
-                parse_mode="HTML",
             )
             return
 
@@ -463,23 +502,23 @@ def on_guest_pending_input(m: types.Message):
         )
         if not created:
             err_text = _html.escape(str(err or "Ошибка"))
-            bot.reply_to(
-                m,
+            _send_guest_creation_prompt(
+                m.chat.id,
+                uid,
                 f'{_pe(PREMIUM_PREFIX_EMOJI_ID, "❌")} <b>Не удалось подключить бота</b>\n\n'
                 f"<code>{err_text}</code>",
-                parse_mode="HTML",
             )
             return
 
-        _PENDING_TOKEN_USERS.discard(uid)
+        _clear_guest_creation_state(uid, chat_id=m.chat.id)
         _launch_guest_runtime(entry or {})
         final = entry or {}
         uname = _html.escape(final.get("bot_username") or "")
-        bot.reply_to(
-            m,
+        bot.send_message(
+            m.chat.id,
             f'{_pe(_EMOJI_OK, "✅")} <b>Гостевой бот @{uname} подключён</b>\n\n'
             f"Управляйте командами прямо в боте — отправьте ему /start.\n"
-            f"В группах вызов: <code>@{uname} имя_команды</code>.",
+            f"В группах вызов: <code>@{uname} имя команды</code>.",
             parse_mode="HTML",
         )
         _show_guest_bots_menu(m.chat.id, m.from_user)

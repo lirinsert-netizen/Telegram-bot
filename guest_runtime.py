@@ -93,19 +93,21 @@ def _extract_command_key(text: str, bot_username: str) -> str | None:
         return None
 
     first = tokens[0]
-    second = tokens[1] if len(tokens) > 1 else ""
     mention = ""
     cmd = ""
 
     if first.startswith("@"):
         mention = first[1:].strip().lower()
-        cmd = second.lstrip("/")
+        cmd = " ".join(tokens[1:]).lstrip("/").strip()
     elif first.startswith("/") and "@" in first:
         cmd_part, sep, mention_part = first[1:].partition("@")
         if not sep:
             return None
         mention = mention_part.strip().lower()
+        tail = " ".join(tokens[1:]).strip()
         cmd = cmd_part.strip()
+        if tail:
+            cmd = f"{cmd} {tail}".strip()
     else:
         return None
 
@@ -142,12 +144,16 @@ def _extract_guest_command_key(text: str, bot_username: str) -> str | None:
             if not sep or mention_part.strip().lower() != bot_username.lower():
                 return None
             cmd = cmd_part
-        key = _normalize_key(cmd)
+        tail = " ".join(raw.split()[1:]).strip()
+        cmd_full = cmd.strip()
+        if tail:
+            cmd_full = f"{cmd_full} {tail}".strip()
+        key = _normalize_key(cmd_full)
         if not key or len(key) > _CMD_MAX_NAME_LEN:
             return None
         return key
 
-    key = _normalize_key(first)
+    key = _normalize_key(raw)
     if not key or len(key) > _CMD_MAX_NAME_LEN:
         return None
     return key
@@ -424,6 +430,44 @@ def _rt_send(chat_id: int, text: str, reply_markup: dict | None = None) -> int |
     return None
 
 
+def _rt_delete_message(chat_id: int, message_id: int | None) -> bool:
+    if not chat_id or not message_id:
+        return False
+    result = _rt_api("deleteMessage", {"chat_id": int(chat_id), "message_id": int(message_id)})
+    return isinstance(result, dict) and bool(result.get("ok"))
+
+
+def _rt_replace_pending_ui(chat_id: int, state: dict, text: str, reply_markup: dict | None = None, also_delete_msg_id: int | None = None) -> int | None:
+    if not isinstance(state, dict):
+        state = {}
+    old_ui_id = state.get("_ui_msg_id")
+    try:
+        old_ui_id_int = int(old_ui_id) if old_ui_id else 0
+    except Exception:
+        old_ui_id_int = 0
+    if old_ui_id_int:
+        _rt_delete_message(chat_id, old_ui_id_int)
+    if also_delete_msg_id:
+        _rt_delete_message(chat_id, also_delete_msg_id)
+    sent_id = _rt_send(chat_id, text, reply_markup)
+    if sent_id:
+        state["_ui_msg_id"] = int(sent_id)
+    return sent_id
+
+
+def _rt_clear_pending_ui(chat_id: int, state: dict | None = None, also_delete_msg_id: int | None = None) -> None:
+    if isinstance(state, dict):
+        old_ui_id = state.pop("_ui_msg_id", None)
+        try:
+            old_ui_id_int = int(old_ui_id) if old_ui_id else 0
+        except Exception:
+            old_ui_id_int = 0
+        if old_ui_id_int:
+            _rt_delete_message(chat_id, old_ui_id_int)
+    if also_delete_msg_id:
+        _rt_delete_message(chat_id, also_delete_msg_id)
+
+
 def _rt_edit(chat_id: int, message_id: int, text: str, reply_markup: dict | None = None) -> bool:
     """Edit a message text. Returns True on success."""
     payload: dict = {
@@ -452,15 +496,19 @@ def _rt_inline_kb(*rows: list[dict]) -> dict:
     return {"inline_keyboard": list(rows)}
 
 
-def _rt_btn(text: str, callback_data: str, style: str | None = None) -> dict:
+def _rt_btn(text: str, callback_data: str, style: str | None = None, icon_custom_emoji_id: str | None = None) -> dict:
     """Build an inline keyboard button dict.
 
     The 'style' field is a non-standard Telegram Bot API extension supported
     by this server for button colouring. Valid values: 'primary', 'danger', 'success'.
     """
     btn: dict = {"text": text, "callback_data": callback_data}
-    if text == "Назад":
+    if icon_custom_emoji_id:
+        btn["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
+    elif text == "Назад":
         btn["icon_custom_emoji_id"] = "5963223853231509569"
+    elif text == "Отмена":
+        btn["icon_custom_emoji_id"] = "5465665476971471368"
     if style:
         btn["style"] = style
     return btn
@@ -529,16 +577,16 @@ def _rt_build_main_text(cmds: list[dict]) -> str:
     return (
         f"{_E_LIST} <b>Команды</b>\n\n"
         f"Создайте пользовательские команды для бота @{_html.escape(_BOT_USERNAME)}. "
-        f"Для вызова команды напишите /имя_команды или @{_html.escape(_BOT_USERNAME)} имя_команды.\n\n"
+        f"Для вызова команды напишите /имя команды или @{_html.escape(_BOT_USERNAME)} имя команды.\n\n"
         f"<b>Количество команд:</b> <code>{count}</code>"
     )
 
 
 def _rt_build_main_kb() -> dict:
     return _rt_inline_kb(
-        [_rt_btn("📋 Список команд", "gcmd:list:0")],
-        [_rt_btn("➕ Добавить команду", "gcmd:add")],
-        [_rt_btn("Удалить команду", "gcmd:del_list")],
+        [_rt_btn("Список команд", "gcmd:list:0", icon_custom_emoji_id="5334882760735598374")],
+        [_rt_btn("Добавить команду", "gcmd:add", icon_custom_emoji_id="5226945370684140473")],
+        [_rt_btn("Удалить команду", "gcmd:del_list", icon_custom_emoji_id="5229113891081956317")],
     )
 
 
@@ -594,7 +642,7 @@ def _rt_build_draft_text(draft: dict) -> str:
 
 def _rt_build_draft_kb(draft: dict) -> dict:
     owner_only = bool(draft.get("owner_only"))
-    btn_text = _rt_btn("📝 Текст", "gcmd:draft_text")
+    btn_text = _rt_btn("Текст", "gcmd:draft_text", icon_custom_emoji_id="5334882760735598374")
     if owner_only:
         btn_owner = _rt_btn("»Для владельца«", "gcmd:draft_owner", style="primary")
         btn_all = _rt_btn("Все пользователи", "gcmd:draft_all")
@@ -727,14 +775,16 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
 
     # ---- add command ----
     if data == "gcmd:add":
-        _RT_PENDING[sender_id] = {"step": "await_name", "name": "", "text": "", "owner_only": False}
-        _rt_send(
+        state = {"step": "await_name", "name": "", "text": "", "owner_only": False}
+        _RT_PENDING[sender_id] = state
+        _rt_replace_pending_ui(
             chat_id,
+            state,
             f"{_E_ADD} <b>Создание команды</b>\n\n"
             f"Пришлите <b>имя</b> новой команды.\n"
-            f"<i>Одно слово, до {_CMD_MAX_NAME_LEN_RT} символов. "
-            + "Команда срабатывает, когда пользователь напишет только это слово в группе.</i>",
+            f"<i>До {_CMD_MAX_NAME_LEN_RT} символов. Можно использовать несколько слов.</i>",
             _rt_inline_kb([_rt_btn("Отмена", "gcmd:add_cancel")]),
+            also_delete_msg_id=message_id,
         )
         _rt_answer_cq(query_id)
         return
@@ -745,23 +795,30 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
             _go_main()
             _rt_answer_cq(query_id)
             return
-        _RT_PENDING[sender_id] = {"step": "await_delete"}
-        _rt_send(
+        state = {"step": "await_delete"}
+        _RT_PENDING[sender_id] = state
+        _rt_replace_pending_ui(
             chat_id,
+            state,
             _rt_build_delete_prompt(cmds),
             _rt_inline_kb([_rt_btn("Отмена", "gcmd:del_cancel")]),
+            also_delete_msg_id=message_id,
         )
         _rt_answer_cq(query_id)
         return
 
     if data == "gcmd:del_cancel":
-        _RT_PENDING.pop(sender_id, None)
+        state = _RT_PENDING.pop(sender_id, None)
+        if isinstance(state, dict):
+            state.pop("_ui_msg_id", None)
         _rt_answer_cq(query_id, "Отменено.")
         _go_main()
         return
 
     if data == "gcmd:add_cancel":
-        _RT_PENDING.pop(sender_id, None)
+        state = _RT_PENDING.pop(sender_id, None)
+        if isinstance(state, dict):
+            state.pop("_ui_msg_id", None)
         _rt_answer_cq(query_id, "Отменено.")
         _go_main()
         return
@@ -779,8 +836,9 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
             return
         draft["step"] = "await_text"
         _RT_PENDING[sender_id] = draft
-        _rt_send(
+        _rt_replace_pending_ui(
             chat_id,
+            draft,
             f"{_E_TEXT} <b>Пришлите текст команды.</b>\n\n"
             "<blockquote expandable=\"true\">"
             "<b>Доступные переменные:</b>\n"
@@ -815,6 +873,7 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
             "<i>Важно:</i> если Telegram-выделение захватит символы &lt; или &gt;, "
             "то Telegram-форматирование может быть проигнорировано.",
             _rt_inline_kb([_rt_btn("Отмена", "gcmd:draft_cancel")]),
+            also_delete_msg_id=message_id,
         )
         _rt_answer_cq(query_id)
         return
@@ -846,7 +905,9 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
 
     # ---- draft: cancel ----
     if data == "gcmd:draft_cancel":
-        _RT_PENDING.pop(sender_id, None)
+        state = _RT_PENDING.pop(sender_id, None)
+        if isinstance(state, dict):
+            state.pop("_ui_msg_id", None)
         _rt_answer_cq(query_id, "Создание команды отменено.")
         _go_main()
         return
@@ -867,7 +928,9 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
             _rt_answer_cq(query_id, "Текст команды не задан.", show_alert=True)
             return
         ok = _rt_upsert_command(conn, _BOT_USERNAME, name, text_val, owner_only)
-        _RT_PENDING.pop(sender_id, None)
+        state = _RT_PENDING.pop(sender_id, None)
+        if isinstance(state, dict):
+            state.pop("_ui_msg_id", None)
         if ok:
             _rt_answer_cq(query_id, f"Команда «{name}» сохранена.")
         else:
@@ -979,20 +1042,23 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
     text = raw_text.strip()
     has_text_field = isinstance(msg.get("text"), str)
     chat_id = int((msg.get("chat") or {}).get("id") or 0)
+    message_id = int(msg.get("message_id") or 0)
 
     if not chat_id:
         return False
 
     # /start or /help → show main commands page
     if text in ("/start", "/help", f"/start@{_BOT_USERNAME}", f"/help@{_BOT_USERNAME}"):
-        _RT_PENDING.pop(sender_id, None)
+        state = _RT_PENDING.pop(sender_id, None)
+        _rt_clear_pending_ui(chat_id, state, also_delete_msg_id=message_id)
         _rt_show_main(chat_id, conn)
         return True
 
     # Cancel
     if text.lower() in {"отмена", "cancel", "/cancel"}:
         if sender_id in _RT_PENDING:
-            _RT_PENDING.pop(sender_id, None)
+            state = _RT_PENDING.pop(sender_id, None)
+            _rt_clear_pending_ui(chat_id, state, also_delete_msg_id=message_id)
             _rt_send(chat_id, f"{_E_OK} Операция отменена.")
             return True
 
@@ -1005,46 +1071,57 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
 
     if step == "await_name":
         if not has_text_field:
-            _rt_send(
+            _rt_replace_pending_ui(
                 chat_id,
+                state,
                 "Пришлите имя команды текстом.",
                 _rt_inline_kb([_rt_btn("Отмена", "gcmd:add_cancel")]),
+                also_delete_msg_id=message_id,
             )
             return True
-        if not text or " " in text:
-            _rt_send(
+        if not text:
+            _rt_replace_pending_ui(
                 chat_id,
-                "Имя команды должно быть <b>одним словом</b> без пробелов.",
+                state,
+                "Имя команды не может быть пустым.",
                 _rt_inline_kb([_rt_btn("Отмена", "gcmd:add_cancel")]),
+                also_delete_msg_id=message_id,
             )
             return True
         if len(text) > _CMD_MAX_NAME_LEN_RT:
-            _rt_send(
+            _rt_replace_pending_ui(
                 chat_id,
+                state,
                 f"Имя команды не должно превышать {_CMD_MAX_NAME_LEN_RT} символов.",
                 _rt_inline_kb([_rt_btn("Отмена", "gcmd:add_cancel")]),
+                also_delete_msg_id=message_id,
             )
             return True
         cmds_existing = _rt_list_commands_for_bot(conn, _BOT_USERNAME)
         if text.lower() in {str(cmd.get("name") or "").lower() for cmd in cmds_existing}:
-            _rt_send(
+            _rt_replace_pending_ui(
                 chat_id,
+                state,
                 f"Команда <code>{_html.escape(text)}</code> уже существует.",
                 _rt_inline_kb([_rt_btn("Отмена", "gcmd:add_cancel")]),
+                also_delete_msg_id=message_id,
             )
             return True
         state["name"] = text.strip().lower()
         state["step"] = "draft"
         _RT_PENDING[sender_id] = state
+        _rt_clear_pending_ui(chat_id, state, also_delete_msg_id=message_id)
         _rt_send(chat_id, _rt_build_draft_text(state), _rt_build_draft_kb(state))
         return True
 
     if step == "await_delete":
         if not has_text_field:
-            _rt_send(
+            _rt_replace_pending_ui(
                 chat_id,
+                state,
                 "Пришлите имя команды текстом.",
                 _rt_inline_kb([_rt_btn("Отмена", "gcmd:del_cancel")]),
+                also_delete_msg_id=message_id,
             )
             return True
         raw_del = text
@@ -1052,15 +1129,18 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
         cmd_by_key = {str(cmd.get("name") or "").lower(): cmd for cmd in cmds_del}
         cmd_key_del = raw_del.lower()
         if cmd_key_del not in cmd_by_key:
-            _rt_send(
+            _rt_replace_pending_ui(
                 chat_id,
+                state,
                 f"Команда <code>{_html.escape(raw_del)}</code> не найдена. Введите точное имя.",
                 _rt_inline_kb([_rt_btn("Отмена", "gcmd:del_cancel")]),
+                also_delete_msg_id=message_id,
             )
             return True
         cmd_name_display = str(cmd_by_key[cmd_key_del].get("name") or raw_del)
         ok = _rt_delete_command(conn, _BOT_USERNAME, raw_del)
-        _RT_PENDING.pop(sender_id, None)
+        old_state = _RT_PENDING.pop(sender_id, None)
+        _rt_clear_pending_ui(chat_id, old_state, also_delete_msg_id=message_id)
         if ok:
             _rt_send(
                 chat_id,
@@ -1068,33 +1148,41 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
                 _rt_build_main_kb(),
             )
         else:
-            _rt_send(
+            _rt_replace_pending_ui(
                 chat_id,
+                state,
                 "Не удалось удалить команду.",
                 _rt_inline_kb([_rt_btn("Отмена", "gcmd:del_cancel")]),
+                also_delete_msg_id=message_id,
             )
         return True
 
     if step == "await_text":
         if not has_text_field:
-            _rt_send(
+            _rt_replace_pending_ui(
                 chat_id,
+                state,
                 f"{_E_OFF} <b>Это не текст.</b>\nПришлите текстовое сообщение.",
                 _rt_inline_kb([_rt_btn("Отмена", "gcmd:draft_cancel")]),
+                also_delete_msg_id=message_id,
             )
             return True
         if not text:
-            _rt_send(
+            _rt_replace_pending_ui(
                 chat_id,
+                state,
                 f"{_E_OFF} <b>Это не текст.</b>\nПришлите текстовое сообщение.",
                 _rt_inline_kb([_rt_btn("Отмена", "gcmd:draft_cancel")]),
+                also_delete_msg_id=message_id,
             )
             return True
         if len(text) > _MAX_RESPONSE_LEN_RT:
-            _rt_send(
+            _rt_replace_pending_ui(
                 chat_id,
+                state,
                 f"{_E_OFF} <b>Текст слишком длинный</b>\n\nМаксимум {_MAX_RESPONSE_LEN_RT} символов.",
                 _rt_inline_kb([_rt_btn("Отмена", "gcmd:draft_cancel")]),
+                also_delete_msg_id=message_id,
             )
             return True
         # Convert Telegram entities to HTML if present; otherwise keep as-is (allows literal HTML input)
@@ -1106,6 +1194,7 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
         state["text"] = stored_text
         state["step"] = "draft"
         _RT_PENDING[sender_id] = state
+        _rt_clear_pending_ui(chat_id, state, also_delete_msg_id=message_id)
         _rt_send(chat_id, _rt_build_draft_text(state), _rt_build_draft_kb(state))
         return True
 
