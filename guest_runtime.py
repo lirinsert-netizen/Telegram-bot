@@ -37,6 +37,8 @@ _OWNER_DEBUG_MAX_LEN = 400
 # answerGuestQuery returns a message-like text payload. We keep a 96-char reserve
 # below Telegram's 4096-char ceiling to stay safe after cleanup and future tweaks.
 _GUEST_QUERY_TEXT_MAX_LEN = 4000
+# InlineQueryResultArticle.title shown in the inline picker; keep it brief.
+_INLINE_ARTICLE_TITLE_MAX_LEN = 64
 
 
 class _GuestQueryHTMLStripper(HTMLParser):
@@ -453,6 +455,25 @@ def _extract_message_text(
     return ""
 
 
+def _build_inline_article_result(text: str, parse_mode: str | None = None) -> str:
+    """Return a JSON-serialised InlineQueryResultArticle for answerGuestQuery.
+
+    answerGuestQuery requires *result* to be an InlineQueryResult object
+    (not a plain text field).  We use the article type so the text is sent
+    as a chat message via InputTextMessageContent.
+    """
+    input_content: dict = {"message_text": text}
+    if parse_mode:
+        input_content["parse_mode"] = parse_mode
+    result_obj = {
+        "type": "article",
+        "id": f"{abs(hash(text)) % 0xFFFFFF:06x}",
+        "title": (text[:_INLINE_ARTICLE_TITLE_MAX_LEN].strip() or "Response"),
+        "input_message_content": input_content,
+    }
+    return json.dumps(result_obj, ensure_ascii=False)
+
+
 def _answer_guest_query(guest_query_id: str, response_text: str) -> bool:
     if not guest_query_id or not response_text:
         return False
@@ -462,23 +483,20 @@ def _answer_guest_query(guest_query_id: str, response_text: str) -> bool:
         logger.warning("[GUEST RUNTIME] answerGuestQuery skipped: empty text after cleanup")
         return False
 
-    # answerGuestQuery accepts plain text, so we avoid sendMessage-only fields.
-    payloads = [
-        {
-            "guest_query_id": guest_query_id,
-            "text": clean_response_text,
-        },
-        {
-            "guest_query_id": guest_query_id,
-            "message_text": clean_response_text,
-        },
-        {
-            "guest_query_id": guest_query_id,
-            "response_text": clean_response_text,
-        },
+    # answerGuestQuery requires `result` to be an InlineQueryResult object.
+    # We try HTML formatting first, then fall back to plain (stripped) text.
+    attempts: list[tuple[str, str | None]] = [
+        (str(response_text or "").strip()[:_GUEST_QUERY_TEXT_MAX_LEN], "HTML"),
+        (clean_response_text, None),
     ]
     last_error = ""
-    for payload in payloads:
+    for text, parse_mode in attempts:
+        if not text:
+            continue
+        payload = {
+            "guest_query_id": guest_query_id,
+            "result": _build_inline_article_result(text, parse_mode),
+        }
         result = _api_request("answerGuestQuery", params=payload, timeout=(10.0, 30.0))
         if isinstance(result, dict) and result.get("ok"):
             return True
