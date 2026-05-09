@@ -296,12 +296,21 @@ def _answer_guest_query(guest_query_id: str, response_text: str) -> bool:
     ]
     last_error = ""
     for payload in payloads:
-        for candidate in (payload, {k: v for k, v in payload.items() if k != "parse_mode"}):
-            result = _api_request("answerGuestQuery", params=candidate, timeout=(10.0, 30.0))
-            if isinstance(result, dict) and result.get("ok"):
-                return True
-            if isinstance(result, dict):
-                last_error = str(result.get("description") or "")
+        result = _api_request("answerGuestQuery", params=payload, timeout=(10.0, 30.0))
+        if isinstance(result, dict) and result.get("ok"):
+            return True
+        description = str((result or {}).get("description") or "") if isinstance(result, dict) else ""
+        if description:
+            last_error = description
+        if "ENTITY_TEXT_INVALID" not in description:
+            continue
+        payload_without_parse_mode = {k: v for k, v in payload.items() if k != "parse_mode"}
+        fallback_result = _api_request("answerGuestQuery", params=payload_without_parse_mode, timeout=(10.0, 30.0))
+        if isinstance(fallback_result, dict) and fallback_result.get("ok"):
+            return True
+        fallback_description = str((fallback_result or {}).get("description") or "") if isinstance(fallback_result, dict) else ""
+        if fallback_description:
+            last_error = fallback_description
     if last_error:
         logger.warning("[GUEST RUNTIME] answerGuestQuery failed: %s", last_error)
     return False
