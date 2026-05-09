@@ -474,11 +474,13 @@ def _handle_guest_update(update_obj: dict) -> None:
     try:
         conn = _db_connect()
         if not _bot_is_enabled(conn, _BOT_USERNAME):
-            _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "bot disabled", text)
+            if not _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "bot disabled", text):
+                logger.warning("[GUEST RUNTIME] failed to notify owner about disabled bot for cmd=%s", cmd_key)
             return
         response = _resolve_guest_response(conn, _BOT_USERNAME, cmd_key)
         if not response:
-            _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "command not found or module disabled", text)
+            if not _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "command not found or module disabled", text):
+                logger.warning("[GUEST RUNTIME] failed to notify owner about unresolved cmd=%s", cmd_key)
             return
         sent = False
         if guest_query_id:
@@ -493,7 +495,8 @@ def _handle_guest_update(update_obj: dict) -> None:
                 message_thread_id=message_thread_id,
             )
         if not sent:
-            _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "failed to deliver response", text)
+            if not _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "failed to deliver response", text):
+                logger.warning("[GUEST RUNTIME] failed to notify owner about delivery failure cmd=%s", cmd_key)
     except Exception as e:
         logger.warning("[GUEST RUNTIME] command handling failed: %s", e)
     finally:
