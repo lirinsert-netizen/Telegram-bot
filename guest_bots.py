@@ -11,7 +11,6 @@ from typing import Optional
 import telebot as _tb
 
 from config import (
-    OWNER_USERNAME,
     DATA_DIR,
     bot,
     types,
@@ -24,7 +23,7 @@ from config import (
     EMOJI_SENT_OK_ID,
     PREMIUM_PREFIX_EMOJI_ID,
 )
-from helpers import should_ignore_text_triggers
+from helpers import should_ignore_text_triggers, is_owner as _global_is_owner
 from persistence import (
     create_guest_bot,
     delete_guest_command,
@@ -73,9 +72,7 @@ def _btn(
 
 
 def _is_owner(user: types.User | None) -> bool:
-    if not user:
-        return False
-    return (user.username or "").lower() == (OWNER_USERNAME or "").lower()
+    return bool(_global_is_owner(user))
 
 
 def _normalize_command_name(name: str) -> str:

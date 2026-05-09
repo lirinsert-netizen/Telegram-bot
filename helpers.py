@@ -1813,12 +1813,25 @@ def stats_link_for_user(chat_id: int, user_id: int) -> str:
 
 def is_owner(user: types.User | None) -> bool:
     """
-    Владелец бота — это пользователь с username = OWNER_USERNAME.
+    Владелец бота определяется по OWNER_USERNAME и/или сохранённому owner_user_id.
     """
     if not user:
         return False
     uname = (user.username or "").lower()
-    return uname == (OWNER_USERNAME or "").lower()
+    if uname == (OWNER_USERNAME or "").lower():
+        return True
+
+    try:
+        user_id = int(getattr(user, "id", 0) or 0)
+    except Exception:
+        user_id = 0
+    if user_id <= 0:
+        return False
+
+    owner_id = int(DEV_CONTACT_META.get("owner_user_id") or 0)
+    if owner_id <= 0:
+        owner_id = int(_resolve_owner_user_id() or 0)
+    return owner_id > 0 and user_id == owner_id
 
 def is_dev(user) -> bool:
     return is_owner(user) or (user.id in VERIFY_DEV)

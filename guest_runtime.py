@@ -182,7 +182,15 @@ def _get_bot_username() -> str:
 def _poll_guest_updates(offset: int | None) -> list[dict]:
     payload: dict[str, str | int] = {
         "timeout": 50,
-        "allowed_updates": json.dumps(["guest_message"], ensure_ascii=False),
+        "allowed_updates": json.dumps(
+            [
+                "guest_message",
+                "edited_guest_message",
+                "deleted_guest_messages",
+                "guest_query",
+            ],
+            ensure_ascii=False,
+        ),
     }
     if offset is not None:
         payload["offset"] = int(offset)
@@ -199,20 +207,50 @@ def _poll_guest_updates(offset: int | None) -> list[dict]:
     return [item for item in result if isinstance(item, dict)]
 
 
-def _extract_guest_query_id(message_obj: dict) -> str:
-    value = message_obj.get("guest_query_id")
+def _extract_guest_query_id(payload_obj: dict, update_obj: dict | None = None) -> str:
+    value = payload_obj.get("guest_query_id")
+    if value is None and isinstance(update_obj, dict):
+        guest_query = update_obj.get("guest_query")
+        if isinstance(guest_query, dict):
+            value = guest_query.get("guest_query_id")
+            if value is None:
+                value = guest_query.get("id")
+    if value is None:
+        nested_guest_query = payload_obj.get("guest_query")
+        if isinstance(nested_guest_query, dict):
+            value = nested_guest_query.get("guest_query_id")
+            if value is None:
+                value = nested_guest_query.get("id")
     if value is None:
         return ""
     return str(value).strip()
 
 
-def _extract_message_text(message_obj: dict) -> str:
-    text = message_obj.get("text")
+def _extract_message_text(payload_obj: dict, update_obj: dict | None = None) -> str:
+    text = payload_obj.get("text")
     if isinstance(text, str) and text.strip():
         return text.strip()
-    caption = message_obj.get("caption")
+    caption = payload_obj.get("caption")
     if isinstance(caption, str) and caption.strip():
         return caption.strip()
+
+    for key in ("message_text", "query", "data", "command"):
+        value = payload_obj.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    message = payload_obj.get("message")
+    if isinstance(message, dict):
+        nested_text = _extract_message_text(message, None)
+        if nested_text:
+            return nested_text
+
+    if isinstance(update_obj, dict):
+        guest_query = update_obj.get("guest_query")
+        if isinstance(guest_query, dict):
+            nested_text = _extract_message_text(guest_query, None)
+            if nested_text:
+                return nested_text
     return ""
 
 
@@ -256,15 +294,17 @@ def _answer_guest_query(guest_query_id: str, response_text: str) -> bool:
 
 
 def _handle_guest_update(update_obj: dict) -> None:
-    guest_message = update_obj.get("guest_message")
-    if not isinstance(guest_message, dict):
+    guest_payload = update_obj.get("guest_message")
+    if not isinstance(guest_payload, dict):
+        guest_payload = update_obj.get("guest_query")
+    if not isinstance(guest_payload, dict):
         return
 
-    guest_query_id = _extract_guest_query_id(guest_message)
+    guest_query_id = _extract_guest_query_id(guest_payload, update_obj)
     if not guest_query_id:
         return
 
-    text = _extract_message_text(guest_message)
+    text = _extract_message_text(guest_payload, update_obj)
     if not text:
         return
 
