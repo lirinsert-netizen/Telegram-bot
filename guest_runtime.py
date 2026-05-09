@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import html as _html
 import logging
 import os
 import re
@@ -31,6 +32,7 @@ _BOT_USERNAME = ""
 
 _CMD_MAX_NAME_LEN = 30
 _CMD_STRIP_CHARS = "`'\"«»()[]{}<>.,;:!?"
+_OWNER_DEBUG_MAX_LEN = 400
 
 
 def _db_connect() -> sqlite3.Connection:
@@ -188,6 +190,11 @@ def _poll_guest_updates(offset: int | None) -> list[dict]:
                 "edited_guest_message",
                 "deleted_guest_messages",
                 "guest_query",
+                "message",
+                "edited_message",
+                "channel_post",
+                "edited_channel_post",
+                "callback_query",
             ],
             ensure_ascii=False,
         ),
@@ -195,6 +202,13 @@ def _poll_guest_updates(offset: int | None) -> list[dict]:
     if offset is not None:
         payload["offset"] = int(offset)
     data = _api_request("getUpdates", params=payload, timeout=(10.0, 70.0))
+    if isinstance(data, dict) and not data.get("ok"):
+        desc = str(data.get("description") or "").lower()
+        if "allowed updates" in desc or "can't parse" in desc:
+            fallback_payload: dict[str, str | int] = {"timeout": 50}
+            if offset is not None:
+                fallback_payload["offset"] = int(offset)
+            data = _api_request("getUpdates", params=fallback_payload, timeout=(10.0, 70.0))
     if not isinstance(data, dict):
         return []
     if not data.get("ok"):
@@ -205,6 +219,126 @@ def _poll_guest_updates(offset: int | None) -> list[dict]:
     if not isinstance(result, list):
         return []
     return [item for item in result if isinstance(item, dict)]
+
+
+def _extract_chat_context(payload_obj: dict, update_obj: dict | None = None) -> tuple[int, int | None, int | None]:
+    chat_id = 0
+    message_thread_id: int | None = None
+    reply_to_message_id: int | None = None
+    chat = payload_obj.get("chat")
+    if isinstance(chat, dict):
+        try:
+            chat_id = int(chat.get("id") or 0)
+        except Exception:
+            chat_id = 0
+    if not chat_id:
+        try:
+            chat_id = int(payload_obj.get("chat_id") or 0)
+        except Exception:
+            chat_id = 0
+    try:
+        message_thread_id = int(payload_obj.get("message_thread_id"))
+    except Exception:
+        message_thread_id = None
+    try:
+        reply_to_message_id = int(payload_obj.get("message_id"))
+    except Exception:
+        reply_to_message_id = None
+
+    message = payload_obj.get("message")
+    if isinstance(message, dict):
+        nested_chat_id, nested_thread_id, nested_reply_to = _extract_chat_context(message, None)
+        if not chat_id:
+            chat_id = nested_chat_id
+        if message_thread_id is None:
+            message_thread_id = nested_thread_id
+        if reply_to_message_id is None:
+            reply_to_message_id = nested_reply_to
+
+    if not chat_id and isinstance(update_obj, dict):
+        for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
+            upd_payload = update_obj.get(key)
+            if isinstance(upd_payload, dict):
+                nested_chat_id, nested_thread_id, nested_reply_to = _extract_chat_context(upd_payload, None)
+                if nested_chat_id:
+                    chat_id = nested_chat_id
+                    if message_thread_id is None:
+                        message_thread_id = nested_thread_id
+                    if reply_to_message_id is None:
+                        reply_to_message_id = nested_reply_to
+                    break
+    return chat_id, message_thread_id, reply_to_message_id
+
+
+def _send_message_response(
+    chat_id: int,
+    response_text: str,
+    reply_to_message_id: int | None = None,
+    message_thread_id: int | None = None,
+) -> bool:
+    if not chat_id or not response_text:
+        return False
+    payload = {
+        "chat_id": int(chat_id),
+        "text": response_text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_to_message_id:
+        payload["reply_to_message_id"] = int(reply_to_message_id)
+    if message_thread_id:
+        payload["message_thread_id"] = int(message_thread_id)
+    result = _api_request("sendMessage", params=payload, timeout=(10.0, 30.0))
+    if isinstance(result, dict) and result.get("ok"):
+        return True
+    description = str(result.get("description") or "") if isinstance(result, dict) else ""
+    if "ENTITY_TEXT_INVALID" in description:
+        payload.pop("parse_mode", None)
+        fallback_result = _api_request("sendMessage", params=payload, timeout=(10.0, 30.0))
+        if isinstance(fallback_result, dict) and fallback_result.get("ok"):
+            return True
+    if description:
+        logger.warning("[GUEST RUNTIME] sendMessage failed: %s", description)
+    return False
+
+
+def _get_owner_user_id(conn: sqlite3.Connection, bot_username: str) -> int:
+    row = conn.execute(
+        """
+        SELECT owner_user_id
+        FROM guest_bots
+        WHERE lower(bot_username) = ?
+        LIMIT 1
+        """,
+        (bot_username.lower(),),
+    ).fetchone()
+    try:
+        return int(row[0] or 0) if row else 0
+    except Exception:
+        return 0
+
+
+def _send_owner_problem_report(
+    conn: sqlite3.Connection,
+    bot_username: str,
+    cmd_key: str,
+    reason: str,
+    raw_text: str = "",
+) -> bool:
+    owner_user_id = _get_owner_user_id(conn, bot_username)
+    if not owner_user_id:
+        return False
+    reason_safe = _html.escape((reason or "").strip()[:_OWNER_DEBUG_MAX_LEN])
+    cmd_safe = _html.escape((cmd_key or "").strip()[:_CMD_MAX_NAME_LEN])
+    raw_safe = _html.escape((raw_text or "").strip()[:_OWNER_DEBUG_MAX_LEN])
+    text = (
+        f"⚠️ <b>@{_html.escape(bot_username)} не смог обработать guest-команду</b>\n"
+        f"<b>Команда:</b> <code>{cmd_safe}</code>\n"
+        f"<b>Причина:</b> <code>{reason_safe or 'unknown'}</code>"
+    )
+    if raw_safe:
+        text += f"\n<b>Вход:</b> <code>{raw_safe}</code>"
+    return _send_message_response(owner_user_id, text)
 
 
 def _extract_guest_query_id(payload_obj: dict, update_obj: dict | None = None) -> str:
@@ -316,15 +450,19 @@ def _answer_guest_query(guest_query_id: str, response_text: str) -> bool:
 
 
 def _handle_guest_update(update_obj: dict) -> None:
-    guest_payload = update_obj.get("guest_message")
-    if not isinstance(guest_payload, dict):
-        guest_payload = update_obj.get("guest_query")
+    guest_payload = None
+    for key in ("guest_message", "guest_query", "message", "edited_message", "channel_post", "edited_channel_post"):
+        candidate = update_obj.get(key)
+        if isinstance(candidate, dict):
+            guest_payload = candidate
+            break
     if not isinstance(guest_payload, dict):
         return
 
     guest_query_id = _extract_guest_query_id(guest_payload, update_obj)
+    chat_id, message_thread_id, reply_to_message_id = _extract_chat_context(guest_payload, update_obj)
     if not guest_query_id:
-        return
+        logger.debug("[GUEST RUNTIME] no guest_query_id; using sendMessage fallback if needed")
 
     text = _extract_message_text(guest_payload, update_obj)
     if not text:
@@ -338,11 +476,24 @@ def _handle_guest_update(update_obj: dict) -> None:
     try:
         conn = _db_connect()
         if not _bot_is_enabled(conn, _BOT_USERNAME):
+            _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "bot disabled", text)
             return
         response = _resolve_guest_response(conn, _BOT_USERNAME, cmd_key)
         if not response:
+            _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "command not found or module disabled", text)
             return
-        _answer_guest_query(guest_query_id, response)
+        sent = False
+        if guest_query_id:
+            sent = _answer_guest_query(guest_query_id, response)
+        if not sent and chat_id:
+            sent = _send_message_response(
+                chat_id=chat_id,
+                response_text=response,
+                reply_to_message_id=reply_to_message_id,
+                message_thread_id=message_thread_id,
+            )
+        if not sent:
+            _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "failed to deliver response", text)
     except Exception as e:
         logger.warning("[GUEST RUNTIME] command handling failed: %s", e)
     finally:
