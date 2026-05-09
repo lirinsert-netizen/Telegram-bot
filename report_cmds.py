@@ -29,7 +29,11 @@ from helpers import (
 
 
 REPORTS_COOLDOWN_SECONDS = 30
-REPORT_MENTION_ALIASES = {"@admin", "@админ"}
+REPORT_MENTION_TRIGGERS = {"@admin", "@админ"}
+
+
+def _normalize_user_ids(values: list) -> list[int]:
+    return [int(x) for x in (values or []) if str(x).lstrip("-").isdigit()]
 
 
 def _get_reports_state(chat_id: int) -> dict:
@@ -81,7 +85,7 @@ def _is_report_mention_trigger(m: types.Message) -> bool:
     if not text:
         return False
     first = text.split(maxsplit=1)[0].lower()
-    return first in REPORT_MENTION_ALIASES
+    return first in REPORT_MENTION_TRIGGERS
 
 
 def _build_admin_mentions(chat_id: int) -> list[str]:
@@ -132,7 +136,7 @@ def _process_report(m: types.Message, reason_override: Optional[str] = None) -> 
             disable_web_page_preview=True,
         )
 
-    blocked = {int(x) for x in (state.get("blocked_users") or []) if str(x).lstrip("-").isdigit()}
+    blocked = set(_normalize_user_ids(state.get("blocked_users") or []))
     if int(m.from_user.id) in blocked:
         return bot.reply_to(
             m,
@@ -247,7 +251,7 @@ def cmd_reports(m: types.Message):
     state = _get_reports_state(m.chat.id)
     args = (m.text or "").split()
     action = (args[1].strip().lower() if len(args) > 1 else "")
-    blocked = [int(x) for x in (state.get("blocked_users") or []) if str(x).lstrip("-").isdigit()]
+    blocked = _normalize_user_ids(state.get("blocked_users") or [])
 
     if not action:
         status = "включены" if bool(state.get("enabled", True)) else "выключены"
