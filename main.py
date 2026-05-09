@@ -49,6 +49,7 @@ import pin          # noqa: F401
 import settings_ui  # noqa: F401
 import antispam     # noqa: F401
 import banned_words  # noqa: F401
+import report_cmds  # noqa: F401
 
 from config import bot, IS_CLONE, get_bot_me
 
@@ -123,4 +124,3 @@ if __name__ == "__main__":
 
     logger.info("[Polling] Запуск long polling…")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
-

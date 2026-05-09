@@ -380,6 +380,7 @@ def _build_start_commands_text(user: telebot.types.User) -> str:
         f"• /pin, /spin, /npin, /unpin ({legend_group_admin} | {legend_group_only})",
         f"• Пин/Закреп/Закрепить, Анпин/Откреп/Открепить ({legend_group_admin} | {legend_group_only})",
         f"• /mute, /ban, /warn, /del ({legend_group_admin} | {legend_group_only})",
+        f"• /report, /reports, @admin ({legend_group_admin} | {legend_group_only})",
         f"• /delmute, /delban, /delwarn ({legend_group_admin} | {legend_group_only})",
         f"• /warnlist, /mutelist, /banlist ({legend_group_admin} | {legend_group_only})",
         f"• /варнлист, /мутлист, /банлист, варнлист, мутлист, банлист ({legend_group_admin} | {legend_group_only})",
