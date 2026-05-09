@@ -9,6 +9,7 @@ import requests
 import sqlite3
 import threading
 import time
+from html.parser import HTMLParser
 
 
 logging.basicConfig(
@@ -33,6 +34,39 @@ _BOT_USERNAME = ""
 _CMD_MAX_NAME_LEN = 30
 _CMD_STRIP_CHARS = "`'\"«»()[]{}<>.,;:!?"
 _OWNER_DEBUG_MAX_LEN = 400
+# answerGuestQuery returns a message-like text payload. We keep a 96-char reserve
+# below Telegram's 4096-char ceiling to stay safe after cleanup and future tweaks.
+_GUEST_QUERY_TEXT_MAX_LEN = 4000
+
+
+class _GuestQueryHTMLStripper(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._chunks: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        if data:
+            self._chunks.append(data)
+
+    def get_text(self) -> str:
+        return "".join(self._chunks)
+
+
+def _prepare_guest_query_text(response_text: str) -> str:
+    raw_text = str(response_text or "").strip()
+    if not raw_text:
+        return ""
+    parser = _GuestQueryHTMLStripper()
+    try:
+        parser.feed(raw_text)
+        parser.close()
+        clean_text = parser.get_text().strip()
+    except Exception as e:
+        logger.warning("[GUEST RUNTIME] failed to strip HTML from guest response: %s", e)
+        clean_text = ""
+    if not clean_text:
+        clean_text = _html.unescape(raw_text).strip()
+    return clean_text[:_GUEST_QUERY_TEXT_MAX_LEN]
 
 
 def _db_connect() -> sqlite3.Connection:
@@ -346,22 +380,37 @@ def _extract_guest_query_id(payload_obj: dict, update_obj: dict | None = None) -
 
     Supports IDs in guest_message, guest_query, and nested guest_query payloads.
     """
-    value = payload_obj.get("guest_query_id")
-    if value is None and isinstance(update_obj, dict):
-        guest_query = update_obj.get("guest_query")
-        if isinstance(guest_query, dict):
-            value = guest_query.get("guest_query_id")
-            if value is None:
-                value = guest_query.get("id")
-    if value is None:
-        nested_guest_query = payload_obj.get("guest_query")
-        if isinstance(nested_guest_query, dict):
-            value = nested_guest_query.get("guest_query_id")
-            if value is None:
-                value = nested_guest_query.get("id")
-    if value is None:
-        return ""
-    return str(value).strip()
+    def _candidate_id(candidate: object, *, allow_fallback_id: bool = False) -> str:
+        if not isinstance(candidate, dict):
+            return ""
+        value = candidate.get("guest_query_id")
+        if value is None and allow_fallback_id:
+            value = candidate.get("id")
+        return str(value).strip() if value is not None else ""
+
+    direct_id = _candidate_id(payload_obj)
+    if direct_id:
+        return direct_id
+
+    for source in (payload_obj, update_obj):
+        if not isinstance(source, dict):
+            continue
+        nested_guest_query = source.get("guest_query")
+        nested_id = _candidate_id(nested_guest_query, allow_fallback_id=True)
+        if nested_id:
+            return nested_id
+
+        for nested_key in ("guest_message", "message"):
+            nested_payload = source.get(nested_key)
+            nested_id = _candidate_id(nested_payload)
+            if nested_id:
+                return nested_id
+            if isinstance(nested_payload, dict):
+                nested_guest_query = nested_payload.get("guest_query")
+                nested_id = _candidate_id(nested_guest_query, allow_fallback_id=True)
+                if nested_id:
+                    return nested_id
+    return ""
 
 
 def _extract_message_text(
@@ -387,18 +436,20 @@ def _extract_message_text(
         if isinstance(value, str) and value.strip():
             return value.strip()
 
-    message = payload_obj.get("message")
-    if isinstance(message, dict):
-        nested_text = _extract_message_text(message, None, _depth + 1)
-        if nested_text:
-            return nested_text
-
-    if isinstance(update_obj, dict):
-        guest_query = update_obj.get("guest_query")
-        if isinstance(guest_query, dict):
-            nested_text = _extract_message_text(guest_query, None, _depth + 1)
+    for nested_key in ("guest_message", "message", "guest_query"):
+        nested_payload = payload_obj.get(nested_key)
+        if isinstance(nested_payload, dict):
+            nested_text = _extract_message_text(nested_payload, None, _depth + 1)
             if nested_text:
                 return nested_text
+
+    if isinstance(update_obj, dict):
+        for nested_key in ("guest_query", "guest_message"):
+            nested_payload = update_obj.get(nested_key)
+            if isinstance(nested_payload, dict):
+                nested_text = _extract_message_text(nested_payload, None, _depth + 1)
+                if nested_text:
+                    return nested_text
     return ""
 
 
@@ -406,26 +457,24 @@ def _answer_guest_query(guest_query_id: str, response_text: str) -> bool:
     if not guest_query_id or not response_text:
         return False
 
-    # Bot API 10.0 supports answerGuestQuery, but some wrappers still expect
-    # alternative text field names, so we retry with compatible payload keys.
+    clean_response_text = _prepare_guest_query_text(response_text)
+    if not clean_response_text:
+        logger.warning("[GUEST RUNTIME] answerGuestQuery skipped: empty text after cleanup")
+        return False
+
+    # answerGuestQuery accepts plain text, so we avoid sendMessage-only fields.
     payloads = [
         {
             "guest_query_id": guest_query_id,
-            "text": response_text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
+            "text": clean_response_text,
         },
         {
             "guest_query_id": guest_query_id,
-            "message_text": response_text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
+            "message_text": clean_response_text,
         },
         {
             "guest_query_id": guest_query_id,
-            "response_text": response_text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
+            "response_text": clean_response_text,
         },
     ]
     last_error = ""
@@ -436,14 +485,6 @@ def _answer_guest_query(guest_query_id: str, response_text: str) -> bool:
         description = str(result.get("description") or "") if isinstance(result, dict) else ""
         if description:
             last_error = description
-        if "ENTITY_TEXT_INVALID" in description:
-            payload_without_parse_mode = {k: v for k, v in payload.items() if k != "parse_mode"}
-            fallback_result = _api_request("answerGuestQuery", params=payload_without_parse_mode, timeout=(10.0, 30.0))
-            if isinstance(fallback_result, dict) and fallback_result.get("ok"):
-                return True
-            fallback_description = str(fallback_result.get("description") or "") if isinstance(fallback_result, dict) else ""
-            if fallback_description:
-                last_error = fallback_description
     if last_error:
         logger.warning("[GUEST RUNTIME] answerGuestQuery failed: %s", last_error)
     return False
