@@ -294,15 +294,14 @@ def _answer_guest_query(guest_query_id: str, response_text: str) -> bool:
             "disable_web_page_preview": True,
         },
     ]
-    plain_payloads = [{k: v for k, v in payload.items() if k != "parse_mode"} for payload in payloads]
-
     last_error = ""
-    for payload in payloads + plain_payloads:
-        result = _api_request("answerGuestQuery", params=payload, timeout=(10.0, 30.0))
-        if isinstance(result, dict) and result.get("ok"):
-            return True
-        if isinstance(result, dict):
-            last_error = str(result.get("description") or "")
+    for payload in payloads:
+        for candidate in (payload, {k: v for k, v in payload.items() if k != "parse_mode"}):
+            result = _api_request("answerGuestQuery", params=candidate, timeout=(10.0, 30.0))
+            if isinstance(result, dict) and result.get("ok"):
+                return True
+            if isinstance(result, dict):
+                last_error = str(result.get("description") or "")
     if last_error:
         logger.warning("[GUEST RUNTIME] answerGuestQuery failed: %s", last_error)
     return False
