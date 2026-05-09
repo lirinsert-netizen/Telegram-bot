@@ -1823,7 +1823,7 @@ def is_owner(user: types.User | None) -> bool:
 
     try:
         user_id = int(getattr(user, "id", 0) or 0)
-    except Exception:
+    except (TypeError, ValueError, AttributeError):
         user_id = 0
     if user_id <= 0:
         return False

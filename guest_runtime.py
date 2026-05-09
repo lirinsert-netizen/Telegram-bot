@@ -208,6 +208,10 @@ def _poll_guest_updates(offset: int | None) -> list[dict]:
 
 
 def _extract_guest_query_id(payload_obj: dict, update_obj: dict | None = None) -> str:
+    """Return guest query ID from legacy/new update layouts.
+
+    Supports IDs in guest_message, guest_query, and nested guest_query payloads.
+    """
     value = payload_obj.get("guest_query_id")
     if value is None and isinstance(update_obj, dict):
         guest_query = update_obj.get("guest_query")
@@ -226,7 +230,17 @@ def _extract_guest_query_id(payload_obj: dict, update_obj: dict | None = None) -
     return str(value).strip()
 
 
-def _extract_message_text(payload_obj: dict, update_obj: dict | None = None) -> str:
+def _extract_message_text(
+    payload_obj: dict,
+    update_obj: dict | None = None,
+    _depth: int = 0,
+) -> str:
+    """Extract command text from guest payloads with bounded recursive fallback.
+
+    Handles both guest_message and guest_query shapes and nested message objects.
+    """
+    if _depth > 4:
+        return ""
     text = payload_obj.get("text")
     if isinstance(text, str) and text.strip():
         return text.strip()
@@ -241,14 +255,14 @@ def _extract_message_text(payload_obj: dict, update_obj: dict | None = None) -> 
 
     message = payload_obj.get("message")
     if isinstance(message, dict):
-        nested_text = _extract_message_text(message, None)
+        nested_text = _extract_message_text(message, None, _depth + 1)
         if nested_text:
             return nested_text
 
     if isinstance(update_obj, dict):
         guest_query = update_obj.get("guest_query")
         if isinstance(guest_query, dict):
-            nested_text = _extract_message_text(guest_query, None)
+            nested_text = _extract_message_text(guest_query, None, _depth + 1)
             if nested_text:
                 return nested_text
     return ""
