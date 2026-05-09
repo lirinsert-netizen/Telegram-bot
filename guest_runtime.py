@@ -332,7 +332,12 @@ def _send_message_response(
     if isinstance(result, dict) and result.get("ok"):
         return True
     description = str(result.get("description") or "") if isinstance(result, dict) else ""
-    if "ENTITY_TEXT_INVALID" in description:
+    _html_error = (
+        "ENTITY_TEXT_INVALID" in description
+        or "can't parse entities" in description.lower()
+        or "wrong html" in description.lower()
+    )
+    if _html_error:
         payload.pop("parse_mode", None)
         fallback_result = _api_request("sendMessage", params=payload, timeout=(10.0, 30.0))
         if isinstance(fallback_result, dict) and fallback_result.get("ok"):
@@ -447,8 +452,28 @@ def _rt_inline_kb(*rows: list[dict]) -> dict:
     return {"inline_keyboard": list(rows)}
 
 
-def _rt_btn(text: str, callback_data: str) -> dict:
-    return {"text": text, "callback_data": callback_data}
+def _rt_btn(text: str, callback_data: str, style: str | None = None) -> dict:
+    """Build an inline keyboard button dict.
+
+    The 'style' field is a non-standard Telegram Bot API extension supported
+    by this server for button colouring. Valid values: 'primary', 'danger', 'success'.
+    """
+    btn: dict = {"text": text, "callback_data": callback_data}
+    if style:
+        btn["style"] = style
+    return btn
+
+
+# ---- Emoji constants for UI ----
+_E_LIST     = '<tg-emoji emoji-id="5334882760735598374">📋</tg-emoji>'
+_E_ADD      = '<tg-emoji emoji-id="5226945370684140473">➕</tg-emoji>'
+_E_OK       = '<tg-emoji emoji-id="5427009714745517609">✅</tg-emoji>'
+_E_OFF      = '<tg-emoji emoji-id="5465665476971471368">❌</tg-emoji>'
+_E_BACK     = '<tg-emoji emoji-id="5963223853231509569">←</tg-emoji>'
+# Note: _E_TEXT uses the same custom emoji ID as _E_LIST; this mirrors the main bot config
+# where EMOJI_LIST_ID == EMOJI_WELCOME_TEXT_ID == "5334882760735598374".
+_E_TEXT     = _E_LIST
+_E_SETTINGS = '<tg-emoji emoji-id="5341715473882955310">⚙️</tg-emoji>'
 
 
 def _rt_list_commands_for_bot(conn: sqlite3.Connection, bot_username: str) -> list[dict]:
@@ -496,48 +521,79 @@ def _rt_get_guest_bot_id(conn: sqlite3.Connection, bot_username: str) -> int:
         return 0
 
 
-def _rt_build_commands_text(cmds: list[dict]) -> str:
-    e_ok = '<tg-emoji emoji-id="5427009714745517609">✅</tg-emoji>'
-    e_off = '<tg-emoji emoji-id="5465665476971471368">❌</tg-emoji>'
-    e_list = '<tg-emoji emoji-id="5334882760735598374">📋</tg-emoji>'
+# ---- Main commands page (shown on /start) ----
+
+def _rt_build_main_text(cmds: list[dict]) -> str:
+    count = len(cmds)
+    return (
+        f"{_E_LIST} <b>Команды</b>\n\n"
+        f"Создайте пользовательские команды для бота @{_html.escape(_BOT_USERNAME)}. "
+        f"Для вызова команды напишите /имя_команды или @{_html.escape(_BOT_USERNAME)} имя_команды.\n\n"
+        f"<b>Количество команд:</b> <code>{count}</code>"
+    )
+
+
+def _rt_build_main_kb() -> dict:
+    return _rt_inline_kb(
+        [_rt_btn("📋 Список команд", "gcmd:list:0")],
+        [_rt_btn("➕ Добавить команду", "gcmd:add")],
+    )
+
+
+# ---- List page (paginated) ----
+
+def _rt_build_list_text(cmds: list[dict], page: int = 0) -> str:
     if not cmds:
-        return (
-            f"{e_list} <b>Команды бота @{_html.escape(_BOT_USERNAME)}</b>\n\n"
-            "<i>Команд пока нет.</i>\n\n"
-            "Нажмите «Добавить команду», чтобы создать первую команду."
-        )
-    lines = [f"{e_list} <b>Команды бота @{_html.escape(_BOT_USERNAME)}</b>\n"]
-    for i, cmd in enumerate(cmds, 1):
-        mark = e_ok if cmd["enabled"] else e_off
+        return f"{_E_SETTINGS} <b>Список команд</b>\n\n<i>Нет созданных команд.</i>"
+    page_size = 10
+    total_pages = max(1, (len(cmds) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    chunk = cmds[start:start + page_size]
+    header = f"{_E_SETTINGS} <b>Список команд ({page + 1}/{total_pages})</b>\n"
+    lines = [header]
+    for i, cmd in enumerate(chunk, start=start + 1):
+        mark = _E_OK if cmd["enabled"] else _E_OFF
         access = " <i>(владелец)</i>" if cmd["owner_only"] else ""
         lines.append(f"{i}. {mark} <code>{_html.escape(cmd['name'])}</code>{access}")
     return "\n".join(lines)
 
 
-def _rt_build_commands_kb(cmds: list[dict]) -> dict:
-    rows = []
-    # Add command
-    rows.append([_rt_btn("➕ Добавить команду", "gcmd:add")])
-    # Per command: toggle + delete
-    for cmd in cmds[:20]:
+def _rt_build_list_kb(cmds: list[dict], page: int = 0) -> dict:
+    page_size = 10
+    total_pages = max(1, (len(cmds) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    chunk = cmds[start:start + page_size]
+    rows: list[list[dict]] = []
+    for cmd in chunk:
         name = cmd["name"]
         status = "✅" if cmd["enabled"] else "❌"
         rows.append([
             _rt_btn(f"{status} {name}", f"gcmd:tog:{name}"),
             _rt_btn("🗑", f"gcmd:del:{name}"),
         ])
+    nav: list[dict] = []
+    if page > 0:
+        nav.append(_rt_btn("◀", f"gcmd:list:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(_rt_btn("▶", f"gcmd:list:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([_rt_btn(f"{_E_BACK} Назад", "gcmd:main", style="primary")])
     return _rt_inline_kb(*rows)
 
 
+# ---- Draft (command creation) page ----
+
 def _rt_build_draft_text(draft: dict) -> str:
-    e_add = '<tg-emoji emoji-id="5226945370684140473">➕</tg-emoji>'
     name = _html.escape(draft.get("name") or "")
     has_text = "есть" if draft.get("text") else "нет"
     owner_only = bool(draft.get("owner_only"))
     access_label = "Для владельца" if owner_only else "Все пользователи"
     name_str = f"<code>{name}</code>" if name else "<i>не задано</i>"
     return (
-        f"{e_add} <b>Новая команда</b>\n\n"
+        f"{_E_ADD} <b>Новая команда</b>\n\n"
         f"<b>Имя:</b> {name_str}\n"
         f"<b>Текст:</b> <code>{has_text}</code>\n"
         f"<b>Доступ:</b> {access_label}"
@@ -548,23 +604,24 @@ def _rt_build_draft_kb(draft: dict) -> dict:
     owner_only = bool(draft.get("owner_only"))
     btn_text = _rt_btn("📝 Текст", "gcmd:draft_text")
     if owner_only:
-        btn_owner = _rt_btn("»Для владельца«", "gcmd:draft_owner")
+        btn_owner = _rt_btn("»Для владельца«", "gcmd:draft_owner", style="primary")
         btn_all = _rt_btn("Все пользователи", "gcmd:draft_all")
     else:
         btn_owner = _rt_btn("Для владельца", "gcmd:draft_owner")
-        btn_all = _rt_btn("»Все пользователи«", "gcmd:draft_all")
-    btn_save = _rt_btn("✅ Сохранить", "gcmd:draft_save")
-    btn_cancel = _rt_btn("❌ Отмена", "gcmd:draft_cancel")
+        btn_all = _rt_btn("»Все пользователи«", "gcmd:draft_all", style="primary")
+    btn_discard = _rt_btn("Удалить", "gcmd:draft_cancel", style="danger")
+    btn_save = _rt_btn("Сохранить", "gcmd:draft_save", style="success")
     return _rt_inline_kb(
         [btn_text],
         [btn_owner, btn_all],
-        [btn_cancel, btn_save],
+        [btn_discard, btn_save],
+        [_rt_btn(f"{_E_BACK} Назад", "gcmd:main", style="primary")],
     )
 
 
-def _rt_show_commands_list(chat_id: int, conn: sqlite3.Connection) -> None:
+def _rt_show_main(chat_id: int, conn: sqlite3.Connection) -> None:
     cmds = _rt_list_commands_for_bot(conn, _BOT_USERNAME)
-    _rt_send(chat_id, _rt_build_commands_text(cmds), _rt_build_commands_kb(cmds))
+    _rt_send(chat_id, _rt_build_main_text(cmds), _rt_build_main_kb())
 
 
 def _rt_upsert_command(conn: sqlite3.Connection, bot_username: str, name: str, text: str, owner_only: bool) -> bool:
@@ -640,16 +697,36 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
     chat_id = int((msg.get("chat") or {}).get("id") or 0)
     message_id = int(msg.get("message_id") or 0)
 
-    def _refresh_list() -> None:
+    def _go_main() -> None:
         cmds = _rt_list_commands_for_bot(conn, _BOT_USERNAME)
-        _rt_edit(chat_id, message_id, _rt_build_commands_text(cmds), _rt_build_commands_kb(cmds))
+        _rt_edit(chat_id, message_id, _rt_build_main_text(cmds), _rt_build_main_kb())
 
+    def _go_list(page: int = 0) -> None:
+        cmds = _rt_list_commands_for_bot(conn, _BOT_USERNAME)
+        _rt_edit(chat_id, message_id, _rt_build_list_text(cmds, page), _rt_build_list_kb(cmds, page))
+
+    # ---- main page ----
+    if data == "gcmd:main":
+        _go_main()
+        _rt_answer_cq(query_id)
+        return
+
+    # ---- list page ----
+    if data.startswith("gcmd:list:"):
+        try:
+            page = int(data.split(":", 2)[2])
+        except Exception:
+            page = 0
+        _go_list(page)
+        _rt_answer_cq(query_id)
+        return
+
+    # ---- add command ----
     if data == "gcmd:add":
         _RT_PENDING[sender_id] = {"step": "await_name", "name": "", "text": "", "owner_only": False}
-        e_add = '<tg-emoji emoji-id="5226945370684140473">➕</tg-emoji>'
         _rt_send(
             chat_id,
-            f"{e_add} <b>Создание команды</b>\n\n"
+            f"{_E_ADD} <b>Создание команды</b>\n\n"
             f"Пришлите <b>имя</b> новой команды.\n"
             f"<i>Одно слово, до {_CMD_MAX_NAME_LEN_RT} символов. Допустимы любые символы без пробелов.</i>\n\n"
             "Для отмены: <code>отмена</code>",
@@ -661,9 +738,10 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
     if data == "gcmd:add_cancel":
         _RT_PENDING.pop(sender_id, None)
         _rt_answer_cq(query_id, "Отменено.")
-        _refresh_list()
+        _go_main()
         return
 
+    # ---- delete command ----
     if data.startswith("gcmd:del:"):
         name = data[len("gcmd:del:"):]
         if not name:
@@ -674,9 +752,10 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
             _rt_answer_cq(query_id, f"Команда «{name}» удалена.")
         else:
             _rt_answer_cq(query_id, "Не удалось удалить.", show_alert=True)
-        _refresh_list()
+        _go_list(0)
         return
 
+    # ---- toggle command ----
     if data.startswith("gcmd:tog:"):
         name = data[len("gcmd:tog:"):]
         if not name:
@@ -684,9 +763,10 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
             return
         _rt_toggle_command(conn, _BOT_USERNAME, name)
         _rt_answer_cq(query_id)
-        _refresh_list()
+        _go_list(0)
         return
 
+    # ---- draft: request text ----
     if data == "gcmd:draft_text":
         draft = _RT_PENDING.get(sender_id, {})
         if not draft:
@@ -694,14 +774,17 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
             return
         draft["step"] = "await_text"
         _RT_PENDING[sender_id] = draft
-        e_txt = '<tg-emoji emoji-id="5334882760735598374">📝</tg-emoji>'
         _rt_send(
             chat_id,
-            f"{e_txt} <b>Пришлите текст команды.</b>\n\n"
-            "Поддерживается HTML-форматирование Telegram:\n"
+            f"{_E_TEXT} <b>Пришлите текст команды.</b>\n\n"
+            "<b>Поддерживается:</b>\n"
+            "• обычное форматирование Telegram (жирный, курсив, подчёркивание и т.д.)\n"
+            "• кастомный HTML:\n"
             "<code>&lt;b&gt;жирный&lt;/b&gt;</code>, "
             "<code>&lt;i&gt;курсив&lt;/i&gt;</code>, "
             "<code>&lt;code&gt;код&lt;/code&gt;</code>, "
+            "<code>&lt;u&gt;подчёркнутый&lt;/u&gt;</code>, "
+            "<code>&lt;s&gt;зачёркнутый&lt;/s&gt;</code>, "
             "<code>&lt;a href='...'&gt;ссылка&lt;/a&gt;</code> и другие теги.\n\n"
             "Для отмены: <code>отмена</code>",
             _rt_inline_kb([_rt_btn("❌ Отмена", "gcmd:draft_cancel")]),
@@ -709,6 +792,7 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
         _rt_answer_cq(query_id)
         return
 
+    # ---- draft: access toggle ----
     if data == "gcmd:draft_owner":
         draft = _RT_PENDING.get(sender_id, {})
         if not draft:
@@ -733,12 +817,14 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
         _rt_answer_cq(query_id)
         return
 
+    # ---- draft: cancel ----
     if data == "gcmd:draft_cancel":
         _RT_PENDING.pop(sender_id, None)
         _rt_answer_cq(query_id, "Создание команды отменено.")
-        _refresh_list()
+        _go_main()
         return
 
+    # ---- draft: save ----
     if data == "gcmd:draft_save":
         draft = _RT_PENDING.get(sender_id, {})
         if not draft:
@@ -759,35 +845,130 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
             _rt_answer_cq(query_id, f"Команда «{name}» сохранена.")
         else:
             _rt_answer_cq(query_id, "Не удалось сохранить.", show_alert=True)
-        _refresh_list()
+        _go_main()
         return
 
     _rt_answer_cq(query_id)
 
 
+def _rt_entities_to_html(text: str, entities: list[dict]) -> str:
+    """Convert a Telegram message text with formatting entities to HTML.
+
+    Uses UTF-16 code-unit offsets as specified by the Telegram Bot API.
+    Falls back to HTML-escaped plain text if conversion fails.
+    """
+    if not entities or not text:
+        return _html.escape(text)
+
+    try:
+        encoded = text.encode("utf-16-le")
+        unit_count = len(encoded) // 2
+
+        def _utf16_slice(start_u: int, end_u: int) -> str:
+            return encoded[start_u * 2:end_u * 2].decode("utf-16-le", errors="replace")
+
+        valid: list[tuple[int, int, dict]] = []
+        for e in entities:
+            off = int(e.get("offset") or 0)
+            ln = int(e.get("length") or 0)
+            if ln <= 0:
+                continue
+            end = min(off + ln, unit_count)
+            if off < 0 or off >= unit_count or end <= off:
+                continue
+            valid.append((off, end, e))
+
+        if not valid:
+            return _html.escape(text)
+
+        bounds = sorted({0, unit_count} | {off for off, end, _ in valid} | {end for _, end, _ in valid})
+
+        _ENTITY_PRIO = {
+            "blockquote": 0, "expandable_blockquote": 0,
+            "text_link": 1, "url": 1,
+            "bold": 2, "italic": 3, "underline": 4,
+            "strikethrough": 5, "spoiler": 6,
+            "code": 7, "pre": 7,
+        }
+
+        def _wrap(inner: str, entity: dict) -> str:
+            t = str(entity.get("type") or "")
+            if t == "bold":
+                return f"<b>{inner}</b>"
+            if t == "italic":
+                return f"<i>{inner}</i>"
+            if t == "underline":
+                return f"<u>{inner}</u>"
+            if t == "strikethrough":
+                return f"<s>{inner}</s>"
+            if t == "spoiler":
+                return f"<tg-spoiler>{inner}</tg-spoiler>"
+            if t == "code":
+                return f"<code>{inner}</code>"
+            if t == "pre":
+                lang = str(entity.get("language") or "")
+                if lang:
+                    return f'<pre><code class="language-{_html.escape(lang)}">{inner}</code></pre>'
+                return f"<pre>{inner}</pre>"
+            if t == "text_link":
+                url = _html.escape(str(entity.get("url") or ""), quote=True)
+                return f'<a href="{url}">{inner}</a>'
+            if t == "text_mention":
+                uid = int((entity.get("user") or {}).get("id") or 0)
+                return f'<a href="tg://user?id={uid}">{inner}</a>'
+            if t in ("blockquote", "expandable_blockquote"):
+                if t == "expandable_blockquote":
+                    return f'<blockquote expandable="true">{inner}</blockquote>'
+                return f"<blockquote>{inner}</blockquote>"
+            if t == "custom_emoji":
+                eid = str(entity.get("custom_emoji_id") or "")
+                return f'<tg-emoji emoji-id="{eid}">{inner}</tg-emoji>'
+            return inner
+
+        out: list[str] = []
+        for i in range(len(bounds) - 1):
+            seg_s = bounds[i]
+            seg_e = bounds[i + 1]
+            raw_seg = _utf16_slice(seg_s, seg_e)
+            esc_seg = _html.escape(raw_seg)
+            active = [e for off, end, e in valid if off <= seg_s and end >= seg_e]
+            if not active:
+                out.append(esc_seg)
+                continue
+            inner = esc_seg
+            for e in sorted(active, key=lambda x: _ENTITY_PRIO.get(str(x.get("type") or ""), 50), reverse=True):
+                inner = _wrap(inner, e)
+            out.append(inner)
+
+        return "".join(out)
+    except Exception as ex:
+        logger.warning("[GUEST RUNTIME] entities_to_html failed: %s", ex)
+        return _html.escape(text)
+
+
 def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> bool:
     """Handle a private message from an allowed user. Returns True if handled."""
-    text = str(msg.get("text") or "").strip()
+    raw_text = str(msg.get("text") or "")
+    text = raw_text.strip()
     chat_id = int((msg.get("chat") or {}).get("id") or 0)
 
     if not chat_id:
         return False
 
-    # /start or /help → show commands list
+    # /start or /help → show main commands page
     if text in ("/start", "/help", f"/start@{_BOT_USERNAME}", f"/help@{_BOT_USERNAME}"):
         _RT_PENDING.pop(sender_id, None)
-        _rt_show_commands_list(chat_id, conn)
+        _rt_show_main(chat_id, conn)
         return True
 
     # Cancel
     if text.lower() in {"отмена", "cancel", "/cancel"}:
         if sender_id in _RT_PENDING:
             _RT_PENDING.pop(sender_id, None)
-            e_ok = '<tg-emoji emoji-id="5427009714745517609">✅</tg-emoji>'
-            _rt_send(chat_id, f"{e_ok} Операция отменена.")
+            _rt_send(chat_id, f"{_E_OK} Операция отменена.")
             return True
 
-    # Draft: await_name
+    # Draft state machine
     state = _RT_PENDING.get(sender_id)
     if not state:
         return False
@@ -796,18 +977,16 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
 
     if step == "await_name":
         if not text or " " in text:
-            e_err = '<tg-emoji emoji-id="5465665476971471368">❌</tg-emoji>'
             _rt_send(
                 chat_id,
-                f"{e_err} <b>Некорректное имя</b>\n\nОдно слово без пробелов, до {_CMD_MAX_NAME_LEN_RT} символов.",
+                f"{_E_OFF} <b>Некорректное имя</b>\n\nОдно слово без пробелов, до {_CMD_MAX_NAME_LEN_RT} символов.",
                 _rt_inline_kb([_rt_btn("❌ Отмена", "gcmd:add_cancel")]),
             )
             return True
         if len(text) > _CMD_MAX_NAME_LEN_RT:
-            e_err = '<tg-emoji emoji-id="5465665476971471368">❌</tg-emoji>'
             _rt_send(
                 chat_id,
-                f"{e_err} <b>Имя слишком длинное</b>\n\nМаксимум {_CMD_MAX_NAME_LEN_RT} символов.",
+                f"{_E_OFF} <b>Имя слишком длинное</b>\n\nМаксимум {_CMD_MAX_NAME_LEN_RT} символов.",
                 _rt_inline_kb([_rt_btn("❌ Отмена", "gcmd:add_cancel")]),
             )
             return True
@@ -819,22 +998,26 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
 
     if step == "await_text":
         if not text:
-            e_err = '<tg-emoji emoji-id="5465665476971471368">❌</tg-emoji>'
             _rt_send(
                 chat_id,
-                f"{e_err} Текст не должен быть пустым.",
+                f"{_E_OFF} Текст не должен быть пустым.",
                 _rt_inline_kb([_rt_btn("❌ Отмена", "gcmd:draft_cancel")]),
             )
             return True
         if len(text) > _MAX_RESPONSE_LEN_RT:
-            e_err = '<tg-emoji emoji-id="5465665476971471368">❌</tg-emoji>'
             _rt_send(
                 chat_id,
-                f"{e_err} <b>Текст слишком длинный</b>\n\nМаксимум {_MAX_RESPONSE_LEN_RT} символов.",
+                f"{_E_OFF} <b>Текст слишком длинный</b>\n\nМаксимум {_MAX_RESPONSE_LEN_RT} символов.",
                 _rt_inline_kb([_rt_btn("❌ Отмена", "gcmd:draft_cancel")]),
             )
             return True
-        state["text"] = text
+        # Convert Telegram entities to HTML if present; otherwise keep as-is (allows literal HTML input)
+        entities = msg.get("entities") or []
+        if entities:
+            stored_text = _rt_entities_to_html(raw_text, entities).strip()
+        else:
+            stored_text = text
+        state["text"] = stored_text
         state["step"] = "draft"
         _RT_PENDING[sender_id] = state
         _rt_send(chat_id, _rt_build_draft_text(state), _rt_build_draft_kb(state))

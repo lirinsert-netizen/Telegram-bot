@@ -35,7 +35,6 @@ from persistence import (
     set_guest_bot_runtime_pid,
     set_guest_command_enabled,
     update_guest_bot_modules,
-    upsert_guest_command,
 )
 
 
@@ -46,8 +45,6 @@ _CMD_MAX_NAME_LEN = 30
 _MAX_COMMANDS_PER_PAGE = 20
 
 _PENDING_TOKEN_USERS: set[int] = set()
-# Step-by-step command creation draft: user_id -> draft dict
-_GUEST_CMD_DRAFTS: dict[int, dict] = {}
 
 _GUEST_PROCESSES: dict[int, _subprocess.Popen] = {}
 _GUEST_PROCESSES_LOCK = _threading.Lock()
@@ -231,20 +228,25 @@ def _manage_bot_text(entry: dict, cmds: list) -> str:
         f"<b>Статус:</b> {status_icon} {'активен' if enabled else 'отключён'}\n",
     ]
     if not cmds:
-        lines.append("<i>Команд пока нет.</i>\n\nНажмите «Добавить команду» для создания.")
+        lines.append(
+            "<i>Команд пока нет.</i>\n\n"
+            f"Для создания команд откройте бота @{uname} и нажмите /start."
+        )
     else:
         lines.append(f"<b>Команд:</b> <code>{len(cmds)}</code>\n")
         for i, cmd in enumerate(cmds, 1):
             mark = _pe(_EMOJI_OK, "✅") if cmd.get("enabled") else _pe(_EMOJI_CANCEL, "❌")
             access = " <i>(владелец)</i>" if cmd.get("owner_only") else ""
             lines.append(f"{i}. {mark} <code>{_html.escape(cmd['name'])}</code>{access}")
+        lines.append(f"\n<i>Для добавления команд откройте @{uname} и нажмите /start.</i>")
     return "\n".join(lines)
 
 
 def _manage_bot_kb(entry: dict, cmds: list) -> types.InlineKeyboardMarkup:
     guest_id = int(entry.get("id") or 0)
+    uname = (entry.get("bot_username") or str(guest_id)).strip().lstrip("@")
     kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(_btn("Добавить команду", callback_data=f"guestbot:cmd_add:{guest_id}", icon_id=_EMOJI_CONNECT))
+    kb.add(_btn(f"Открыть @{uname}", url=f"https://t.me/{uname}", icon_id=_EMOJI_PM))
     for cmd in cmds[:_MAX_COMMANDS_PER_PAGE]:
         name = cmd.get("name", "")
         mark = "✅" if cmd.get("enabled") else "❌"
@@ -256,78 +258,6 @@ def _manage_bot_kb(entry: dict, cmds: list) -> types.InlineKeyboardMarkup:
     kb.add(_btn("Назад", callback_data="guestbot:list", icon_id=_EMOJI_BACK))
     return kb
 
-
-# --------------- Draft-based command creation helpers ---------------
-
-def _draft_get(uid: int) -> dict:
-    return _GUEST_CMD_DRAFTS.get(uid, {})
-
-
-def _draft_set(uid: int, draft: dict) -> None:
-    _GUEST_CMD_DRAFTS[uid] = draft
-
-
-def _draft_clear(uid: int) -> None:
-    _GUEST_CMD_DRAFTS.pop(uid, None)
-
-
-def _render_cmd_draft_text(draft: dict) -> str:
-    emoji = _pe(_EMOJI_CONNECT, "➕")
-    name = _html.escape(draft.get("name") or "")
-    text_raw = draft.get("text") or ""
-    has_text = "есть" if text_raw else "нет"
-    owner_only = bool(draft.get("owner_only"))
-    access_label = "Для владельца" if owner_only else "Все пользователи"
-    name_str = f"<code>{name}</code>" if name else "<i>не задано</i>"
-    return (
-        f"{emoji} <b>Новая команда</b>\n\n"
-        f"<b>Имя:</b> {name_str}\n"
-        f"<b>Текст:</b> <code>{has_text}</code>\n"
-        f"<b>Доступ:</b> {access_label}"
-    )
-
-
-def _build_cmd_draft_kb(draft: dict) -> types.InlineKeyboardMarkup:
-    guest_id = int(draft.get("guest_bot_id") or 0)
-    owner_only = bool(draft.get("owner_only"))
-    kb = types.InlineKeyboardMarkup(row_width=2)
-
-    btn_text = _btn("Текст", callback_data=f"guestbot:draft_text:{guest_id}")
-    try:
-        btn_text.icon_custom_emoji_id = str(EMOJI_ROLE_SETTINGS_SENT_PM_ID)
-    except Exception:
-        pass
-
-    if owner_only:
-        btn_owner = _btn("»Для владельца«", callback_data=f"guestbot:draft_access:{guest_id}:owner")
-        try:
-            btn_owner.style = "primary"
-        except Exception:
-            pass
-        btn_all = _btn("Все пользователи", callback_data=f"guestbot:draft_access:{guest_id}:all")
-    else:
-        btn_owner = _btn("Для владельца", callback_data=f"guestbot:draft_access:{guest_id}:owner")
-        btn_all = _btn("»Все пользователи«", callback_data=f"guestbot:draft_access:{guest_id}:all")
-        try:
-            btn_all.style = "primary"
-        except Exception:
-            pass
-
-    kb.add(btn_text)
-    kb.add(btn_owner, btn_all)
-
-    btn_cancel = _btn("Отмена", callback_data=f"guestbot:draft_cancel:{guest_id}")
-    try:
-        btn_cancel.style = "danger"
-    except Exception:
-        pass
-    btn_save = _btn("Сохранить", callback_data=f"guestbot:draft_save:{guest_id}")
-    try:
-        btn_save.style = "success"
-    except Exception:
-        pass
-    kb.add(btn_cancel, btn_save)
-    return kb
 
 
 
@@ -486,18 +416,9 @@ def guest_bots_callback(call: types.CallbackQuery):
         return
 
     # ---- cmd_add (start command creation flow for a bot) ----
+    # ---- cmd_add (removed — command creation is only via /start in the guest bot) ----
     if data.startswith("guestbot:cmd_add:"):
-        parts = data.split(":", 2)
-        if len(parts) < 3:
-            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
-            return
-        guest_id = _safe_int(parts[2])
-        entry = get_guest_bot_by_id(guest_id)
-        if not entry or int(entry.get("owner_user_id") or 0) != uid:
-            bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
-            return
-        _start_cmd_add_for_bot(chat_id, uid, guest_id)
-        bot.answer_callback_query(call.id)
+        bot.answer_callback_query(call.id, "Для добавления команд откройте гостевого бота и напишите /start.", show_alert=True)
         return
 
     # ---- cmd_del (delete a command) ----
@@ -569,150 +490,6 @@ def guest_bots_callback(call: types.CallbackQuery):
             pass
         return
 
-    # ---- draft: text input trigger ----
-    if data.startswith("guestbot:draft_text:"):
-        parts = data.split(":", 2)
-        if len(parts) < 3:
-            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
-            return
-        guest_id = _safe_int(parts[2])
-        entry = get_guest_bot_by_id(guest_id)
-        if not entry or int(entry.get("owner_user_id") or 0) != uid:
-            bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
-            return
-        draft = _draft_get(uid)
-        if not draft or int(draft.get("guest_bot_id") or 0) != guest_id:
-            bot.answer_callback_query(call.id, "Черновик не найден.", show_alert=False)
-            return
-        draft["step"] = "await_text"
-        _draft_set(uid, draft)
-        kb = types.InlineKeyboardMarkup()
-        kb.add(_btn("Отмена", callback_data=f"guestbot:draft_cancel:{guest_id}", icon_id=_EMOJI_CANCEL))
-        bot.send_message(
-            chat_id,
-            f'{_pe(_EMOJI_PM, "📝")} <b>Пришлите текст команды.</b>\n\n'
-            "Поддерживается HTML-форматирование Telegram:\n"
-            "<code>&lt;b&gt;жирный&lt;/b&gt;</code>, "
-            "<code>&lt;i&gt;курсив&lt;/i&gt;</code>, "
-            "<code>&lt;code&gt;код&lt;/code&gt;</code>, "
-            "<code>&lt;a href='...'&gt;ссылка&lt;/a&gt;</code> и другие теги.",
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            reply_markup=kb,
-        )
-        bot.answer_callback_query(call.id, "Ожидаю текст.", show_alert=False)
-        return
-
-    # ---- draft: access toggle ----
-    if data.startswith("guestbot:draft_access:"):
-        parts = data.split(":", 3)
-        if len(parts) < 4:
-            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
-            return
-        guest_id = _safe_int(parts[2])
-        access_val = parts[3]
-        entry = get_guest_bot_by_id(guest_id)
-        if not entry or int(entry.get("owner_user_id") or 0) != uid:
-            bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
-            return
-        draft = _draft_get(uid)
-        if not draft or int(draft.get("guest_bot_id") or 0) != guest_id:
-            bot.answer_callback_query(call.id, "Черновик не найден.", show_alert=False)
-            return
-        draft["owner_only"] = (access_val == "owner")
-        _draft_set(uid, draft)
-        try:
-            bot.edit_message_text(
-                _render_cmd_draft_text(draft),
-                chat_id,
-                msg_id,
-                parse_mode="HTML",
-                reply_markup=_build_cmd_draft_kb(draft),
-            )
-        except Exception:
-            pass
-        bot.answer_callback_query(call.id)
-        return
-
-    # ---- draft: cancel ----
-    if data.startswith("guestbot:draft_cancel:"):
-        parts = data.split(":", 2)
-        if len(parts) < 3:
-            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
-            return
-        guest_id = _safe_int(parts[2])
-        _draft_clear(uid)
-        bot.answer_callback_query(call.id, "Создание команды отменено.", show_alert=False)
-        entry = get_guest_bot_by_id(guest_id)
-        if entry and int(entry.get("owner_user_id") or 0) == uid:
-            cmds = list_guest_commands(guest_id)
-            try:
-                bot.edit_message_text(
-                    _manage_bot_text(entry, cmds),
-                    chat_id,
-                    msg_id,
-                    parse_mode="HTML",
-                    reply_markup=_manage_bot_kb(entry, cmds),
-                )
-            except Exception:
-                bot.send_message(
-                    chat_id,
-                    _manage_bot_text(entry, cmds),
-                    parse_mode="HTML",
-                    reply_markup=_manage_bot_kb(entry, cmds),
-                )
-        else:
-            _edit_menu()
-        return
-
-    # ---- draft: save ----
-    if data.startswith("guestbot:draft_save:"):
-        parts = data.split(":", 2)
-        if len(parts) < 3:
-            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
-            return
-        guest_id = _safe_int(parts[2])
-        entry = get_guest_bot_by_id(guest_id)
-        if not entry or int(entry.get("owner_user_id") or 0) != uid:
-            bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
-            return
-        draft = _draft_get(uid)
-        if not draft or int(draft.get("guest_bot_id") or 0) != guest_id:
-            bot.answer_callback_query(call.id, "Черновик не найден.", show_alert=False)
-            return
-        cmd_name = _normalize_command_name(draft.get("name") or "")
-        response_text = (draft.get("text") or "").strip()
-        owner_only = bool(draft.get("owner_only"))
-        if not _is_command_name_valid(cmd_name):
-            bot.answer_callback_query(call.id, "Некорректное имя команды.", show_alert=True)
-            return
-        if not response_text:
-            bot.answer_callback_query(call.id, "Текст ответа не задан.", show_alert=True)
-            return
-        ok = upsert_guest_command(guest_id, cmd_name, response_text, enabled=True, owner_only=owner_only)
-        _draft_clear(uid)
-        if ok:
-            bot.answer_callback_query(call.id, f"Команда «{cmd_name}» сохранена.", show_alert=False)
-        else:
-            bot.answer_callback_query(call.id, "Не удалось сохранить команду.", show_alert=True)
-        cmds = list_guest_commands(guest_id)
-        try:
-            bot.edit_message_text(
-                _manage_bot_text(entry, cmds),
-                chat_id,
-                msg_id,
-                parse_mode="HTML",
-                reply_markup=_manage_bot_kb(entry, cmds),
-            )
-        except Exception:
-            bot.send_message(
-                chat_id,
-                _manage_bot_text(entry, cmds),
-                parse_mode="HTML",
-                reply_markup=_manage_bot_kb(entry, cmds),
-            )
-        return
-
     bot.answer_callback_query(call.id)
 
 
@@ -722,12 +499,7 @@ def _is_waiting_guest_input(m: types.Message) -> bool:
     if m.chat.type != "private" or not _is_owner(m.from_user) or not m.text:
         return False
     uid = int(m.from_user.id)
-    if uid in _PENDING_TOKEN_USERS:
-        return True
-    draft = _draft_get(uid)
-    if not draft:
-        return False
-    return draft.get("step") in ("await_name", "await_text")
+    return uid in _PENDING_TOKEN_USERS
 
 
 @bot.message_handler(func=_is_waiting_guest_input)
@@ -738,7 +510,6 @@ def on_guest_pending_input(m: types.Message):
 
     if lower_text in {"/cancel", "отмена", "cancel"}:
         _PENDING_TOKEN_USERS.discard(uid)
-        _draft_clear(uid)
         bot.reply_to(m, "Операция отменена.")
         return
 
@@ -796,99 +567,4 @@ def on_guest_pending_input(m: types.Message):
             parse_mode="HTML",
         )
         _show_guest_bots_menu(m.chat.id, m.from_user)
-        return
 
-    # ---- draft: await name ----
-    draft = _draft_get(uid)
-    if not draft:
-        return
-
-    guest_id = int(draft.get("guest_bot_id") or 0)
-    entry = get_guest_bot_by_id(guest_id)
-    if not entry or int(entry.get("owner_user_id") or 0) != uid:
-        _draft_clear(uid)
-        bot.reply_to(m, "Guest-бот не найден.")
-        return
-
-    step = draft.get("step")
-
-    if step == "await_name":
-        if not text or " " in text:
-            bot.reply_to(
-                m,
-                f'{_pe(PREMIUM_PREFIX_EMOJI_ID, "❌")} <b>Некорректное имя</b>\n\n'
-                "Имя команды — одно слово без пробелов, не более 30 символов.",
-                parse_mode="HTML",
-            )
-            return
-        if len(text) > _CMD_MAX_NAME_LEN:
-            bot.reply_to(
-                m,
-                f'{_pe(PREMIUM_PREFIX_EMOJI_ID, "❌")} <b>Слишком длинное имя</b>\n\n'
-                f"Максимум {_CMD_MAX_NAME_LEN} символов.",
-                parse_mode="HTML",
-            )
-            return
-        draft["name"] = _normalize_command_name(text)
-        draft["step"] = "draft"
-        _draft_set(uid, draft)
-        bot.send_message(
-            m.chat.id,
-            _render_cmd_draft_text(draft),
-            parse_mode="HTML",
-            reply_markup=_build_cmd_draft_kb(draft),
-        )
-        return
-
-    if step == "await_text":
-        response_text = text
-        if not response_text:
-            bot.reply_to(
-                m,
-                f'{_pe(PREMIUM_PREFIX_EMOJI_ID, "❌")} Текст ответа не должен быть пустым.',
-                parse_mode="HTML",
-            )
-            return
-        if len(response_text) > _MAX_COMMAND_RESPONSE_LEN:
-            bot.reply_to(
-                m,
-                f'{_pe(PREMIUM_PREFIX_EMOJI_ID, "❌")} <b>Текст слишком длинный</b>\n\n'
-                f"Максимум {_MAX_COMMAND_RESPONSE_LEN} символов.",
-                parse_mode="HTML",
-            )
-            return
-        draft["text"] = response_text
-        draft["step"] = "draft"
-        _draft_set(uid, draft)
-        bot.send_message(
-            m.chat.id,
-            _render_cmd_draft_text(draft),
-            parse_mode="HTML",
-            reply_markup=_build_cmd_draft_kb(draft),
-        )
-        return
-
-    _draft_clear(uid)
-
-
-# ---- Trigger for "add command" flow from any context ----
-def _start_cmd_add_for_bot(chat_id: int, uid: int, guest_id: int) -> None:
-    """Initiate the step-by-step command creation flow."""
-    _draft_set(uid, {
-        "guest_bot_id": guest_id,
-        "step": "await_name",
-        "name": "",
-        "text": "",
-        "owner_only": False,
-    })
-    kb = types.InlineKeyboardMarkup()
-    kb.add(_btn("Отмена", callback_data=f"guestbot:draft_cancel:{guest_id}", icon_id=_EMOJI_CANCEL))
-    bot.send_message(
-        chat_id,
-        f'{_pe(_EMOJI_CONNECT, "➕")} <b>Создание команды</b>\n\n'
-        f"Пришлите <b>имя</b> новой команды.\n"
-        f"<i>Одно слово, до {_CMD_MAX_NAME_LEN} символов. Допустимы любые символы без пробелов.</i>",
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-        reply_markup=kb,
-    )
