@@ -27,13 +27,10 @@ from helpers import should_ignore_text_triggers, is_owner as _global_is_owner
 from persistence import (
     create_guest_bot,
     delete_guest_bot,
-    delete_guest_command,
     get_guest_bot_by_id,
     list_guest_bots,
-    list_guest_commands,
     set_guest_bot_enabled,
     set_guest_bot_runtime_pid,
-    set_guest_command_enabled,
     update_guest_bot_modules,
 )
 
@@ -42,7 +39,6 @@ _TOKEN_RE = _re.compile(r"\b(\d{8,10}:[A-Za-z0-9_-]{35,})\b")
 _GUEST_RUNTIME_SCRIPT = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "guest_runtime.py")
 _MAX_COMMAND_RESPONSE_LEN = 3500
 _CMD_MAX_NAME_LEN = 30
-_MAX_COMMANDS_PER_PAGE = 20
 
 _PENDING_TOKEN_USERS: set[int] = set()
 
@@ -218,42 +214,24 @@ def _guest_bots_menu_kb(user: types.User) -> types.InlineKeyboardMarkup:
     return kb
 
 
-def _manage_bot_text(entry: dict, cmds: list) -> str:
+def _manage_bot_text(entry: dict) -> str:
     uname = _html.escape((entry.get("bot_username") or "").strip().lstrip("@"))
     enabled = bool(entry.get("enabled"))
     status_icon = _pe(_EMOJI_OK, "✅") if enabled else _pe(_EMOJI_CANCEL, "❌")
     hdr = _pe(_EMOJI_LIST, "📋")
-    lines = [
+    return "\n".join([
         f"{hdr} <b>Команды @{uname}</b>\n",
         f"<b>Статус:</b> {status_icon} {'активен' if enabled else 'отключён'}\n",
-    ]
-    if not cmds:
-        lines.append(
-            "<i>Команд пока нет.</i>\n\n"
-            f"Для создания команд откройте бота @{uname} и нажмите /start."
-        )
-    else:
-        lines.append(f"<b>Команд:</b> <code>{len(cmds)}</code>\n")
-        for i, cmd in enumerate(cmds, 1):
-            mark = _pe(_EMOJI_OK, "✅") if cmd.get("enabled") else _pe(_EMOJI_CANCEL, "❌")
-            access = " <i>(владелец)</i>" if cmd.get("owner_only") else ""
-            lines.append(f"{i}. {mark} <code>{_html.escape(cmd['name'])}</code>{access}")
-        lines.append(f"\n<i>Для добавления команд откройте @{uname} и нажмите /start.</i>")
-    return "\n".join(lines)
+        f"\nУправление командами перенесено в гостевого бота @{uname}.",
+        f"\n<i>Откройте @{uname} и нажмите /start.</i>",
+    ])
 
 
-def _manage_bot_kb(entry: dict, cmds: list) -> types.InlineKeyboardMarkup:
+def _manage_bot_kb(entry: dict) -> types.InlineKeyboardMarkup:
     guest_id = int(entry.get("id") or 0)
     uname = (entry.get("bot_username") or str(guest_id)).strip().lstrip("@")
-    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(_btn(f"Открыть @{uname}", url=f"https://t.me/{uname}", icon_id=_EMOJI_PM))
-    for cmd in cmds[:_MAX_COMMANDS_PER_PAGE]:
-        name = cmd.get("name", "")
-        mark = "✅" if cmd.get("enabled") else "❌"
-        kb.add(
-            _btn(f"{mark} {name}", callback_data=f"guestbot:cmd_tog:{guest_id}:{name}"),
-            _btn("🗑", callback_data=f"guestbot:cmd_del:{guest_id}:{name}"),
-        )
     kb.add(_btn("Отвязать бота", callback_data=f"guestbot:unbind_ask:{guest_id}", icon_id=_EMOJI_CANCEL))
     kb.add(_btn("Назад", callback_data="guestbot:list", icon_id=_EMOJI_BACK))
     return kb
@@ -396,21 +374,20 @@ def guest_bots_callback(call: types.CallbackQuery):
         if not entry or int(entry.get("owner_user_id") or 0) != uid:
             bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
             return
-        cmds = list_guest_commands(guest_id)
         try:
             bot.edit_message_text(
-                _manage_bot_text(entry, cmds),
+                _manage_bot_text(entry),
                 chat_id,
                 msg_id,
                 parse_mode="HTML",
-                reply_markup=_manage_bot_kb(entry, cmds),
+                reply_markup=_manage_bot_kb(entry),
             )
         except Exception:
             bot.send_message(
                 chat_id,
-                _manage_bot_text(entry, cmds),
+                _manage_bot_text(entry),
                 parse_mode="HTML",
-                reply_markup=_manage_bot_kb(entry, cmds),
+                reply_markup=_manage_bot_kb(entry),
             )
         bot.answer_callback_query(call.id)
         return
@@ -421,73 +398,12 @@ def guest_bots_callback(call: types.CallbackQuery):
         bot.answer_callback_query(call.id, "Для добавления команд откройте гостевого бота и напишите /start.", show_alert=True)
         return
 
-    # ---- cmd_del (delete a command) ----
-    if data.startswith("guestbot:cmd_del:"):
-        parts = data.split(":", 3)
-        if len(parts) < 4:
-            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
-            return
-        guest_id = _safe_int(parts[2])
-        cmd_name = parts[3].strip()
-        entry = get_guest_bot_by_id(guest_id)
-        if not entry or int(entry.get("owner_user_id") or 0) != uid:
-            bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
-            return
-        if not cmd_name:
-            bot.answer_callback_query(call.id, "Некорректное имя команды.", show_alert=True)
-            return
-        ok = delete_guest_command(guest_id, cmd_name)
-        if ok:
-            bot.answer_callback_query(call.id, f"Команда «{cmd_name}» удалена.", show_alert=False)
-        else:
-            bot.answer_callback_query(call.id, "Не удалось удалить команду.", show_alert=True)
-            return
-        cmds = list_guest_commands(guest_id)
-        try:
-            bot.edit_message_text(
-                _manage_bot_text(entry, cmds),
-                chat_id,
-                msg_id,
-                parse_mode="HTML",
-                reply_markup=_manage_bot_kb(entry, cmds),
-            )
-        except Exception:
-            pass
-        return
-
-    # ---- cmd_tog (toggle command enabled/disabled) ----
-    if data.startswith("guestbot:cmd_tog:"):
-        parts = data.split(":", 3)
-        if len(parts) < 4:
-            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
-            return
-        guest_id = _safe_int(parts[2])
-        cmd_name = parts[3].strip()
-        entry = get_guest_bot_by_id(guest_id)
-        if not entry or int(entry.get("owner_user_id") or 0) != uid:
-            bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
-            return
-        if not cmd_name:
-            bot.answer_callback_query(call.id, "Некорректное имя команды.", show_alert=True)
-            return
-        cmds = list_guest_commands(guest_id)
-        cmd = next((c for c in cmds if c["name"] == cmd_name), None)
-        if not cmd:
-            bot.answer_callback_query(call.id, "Команда не найдена.", show_alert=True)
-            return
-        set_guest_command_enabled(guest_id, cmd_name, not bool(cmd.get("enabled")))
-        bot.answer_callback_query(call.id)
-        cmds = list_guest_commands(guest_id)
-        try:
-            bot.edit_message_text(
-                _manage_bot_text(entry, cmds),
-                chat_id,
-                msg_id,
-                parse_mode="HTML",
-                reply_markup=_manage_bot_kb(entry, cmds),
-            )
-        except Exception:
-            pass
+    if data.startswith("guestbot:cmd_del:") or data.startswith("guestbot:cmd_tog:"):
+        bot.answer_callback_query(
+            call.id,
+            "Управляйте командами внутри гостевого бота через /start.",
+            show_alert=True,
+        )
         return
 
     bot.answer_callback_query(call.id)
@@ -567,4 +483,3 @@ def on_guest_pending_input(m: types.Message):
             parse_mode="HTML",
         )
         _show_guest_bots_menu(m.chat.id, m.from_user)
-
