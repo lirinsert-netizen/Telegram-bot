@@ -30,6 +30,7 @@ from helpers import (
 
 REPORTS_COOLDOWN_SECONDS = 30
 REPORT_MENTION_TRIGGERS = {"@admin", "@админ"}
+MAX_ADMIN_MENTIONS = 25
 
 
 def _normalize_user_ids(values: list) -> list[int]:
@@ -79,6 +80,9 @@ def _can_manage_reports(chat_id: int, user: types.User | None) -> bool:
 
 
 def _is_report_mention_trigger(m: types.Message) -> bool:
+    """Matches messages where the first token is a report trigger.
+    Examples: "@admin", "@admin flood", "@админ спам".
+    """
     if should_ignore_text_triggers(m):
         return False
     text = (m.text or "").strip()
@@ -201,7 +205,7 @@ def _process_report(m: types.Message, reason_override: Optional[str] = None) -> 
     reason_html = _html.escape(reason) if reason else "не указана"
     msg_link = _report_message_link(m.chat.id, int(m.reply_to_message.message_id))
     link_line = f'\n<b>Сообщение:</b> <a href="{msg_link}">перейти</a>' if msg_link else ""
-    mentions_block = " ".join(admin_mentions[:25])
+    mentions_block = " ".join(admin_mentions[:MAX_ADMIN_MENTIONS])
     text = (
         f"🚨 <b>Новый репорт</b>\n\n"
         f"<b>От:</b> {reporter_mention}\n"
