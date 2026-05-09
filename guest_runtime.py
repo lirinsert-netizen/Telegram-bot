@@ -294,9 +294,10 @@ def _answer_guest_query(guest_query_id: str, response_text: str) -> bool:
             "disable_web_page_preview": True,
         },
     ]
+    plain_payloads = [{k: v for k, v in payload.items() if k != "parse_mode"} for payload in payloads]
 
     last_error = ""
-    for payload in payloads:
+    for payload in payloads + plain_payloads:
         result = _api_request("answerGuestQuery", params=payload, timeout=(10.0, 30.0))
         if isinstance(result, dict) and result.get("ok"):
             return True
