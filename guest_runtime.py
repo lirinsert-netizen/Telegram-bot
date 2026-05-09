@@ -461,8 +461,6 @@ def _handle_guest_update(update_obj: dict) -> None:
 
     guest_query_id = _extract_guest_query_id(guest_payload, update_obj)
     chat_id, message_thread_id, reply_to_message_id = _extract_chat_context(guest_payload, update_obj)
-    if not guest_query_id:
-        logger.debug("[GUEST RUNTIME] no guest_query_id; using sendMessage fallback if needed")
 
     text = _extract_message_text(guest_payload, update_obj)
     if not text:
@@ -486,6 +484,8 @@ def _handle_guest_update(update_obj: dict) -> None:
         if guest_query_id:
             sent = _answer_guest_query(guest_query_id, response)
         if not sent and chat_id:
+            if not guest_query_id:
+                logger.debug("[GUEST RUNTIME] no guest_query_id; using sendMessage fallback")
             sent = _send_message_response(
                 chat_id=chat_id,
                 response_text=response,
