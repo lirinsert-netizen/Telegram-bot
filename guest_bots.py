@@ -26,6 +26,7 @@ from config import (
 from helpers import should_ignore_text_triggers, is_owner as _global_is_owner
 from persistence import (
     create_guest_bot,
+    delete_guest_bot,
     delete_guest_command,
     get_guest_bot_by_id,
     list_guest_bots,
@@ -39,23 +40,30 @@ from persistence import (
 
 
 _TOKEN_RE = _re.compile(r"\b(\d{8,10}:[A-Za-z0-9_-]{35,})\b")
-_COMMAND_NAME_RE = _re.compile(r"^[A-Za-zА-Яа-я0-9_]{1,30}$")
 _GUEST_RUNTIME_SCRIPT = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "guest_runtime.py")
 _MAX_COMMAND_RESPONSE_LEN = 3500
+_CMD_MAX_NAME_LEN = 30
 
 _PENDING_TOKEN_USERS: set[int] = set()
-_PENDING_COMMAND_INPUT: dict[int, dict] = {}
+# Step-by-step command creation draft: user_id -> draft dict
+_GUEST_CMD_DRAFTS: dict[int, dict] = {}
 
 _GUEST_PROCESSES: dict[int, _subprocess.Popen] = {}
 _GUEST_PROCESSES_LOCK = _threading.Lock()
 
-_AVAILABLE_MODULES: list[tuple[str, str]] = [
-    ("commands", "Команды"),
-]
+# Emoji IDs
+_EMOJI_CONNECT = "5226945370684140473"
+_EMOJI_OK = str(EMOJI_SENT_OK_ID)
+_EMOJI_CANCEL = str(EMOJI_ROLE_SETTINGS_CANCEL_ID)
+_EMOJI_BACK = str(EMOJI_ROLE_SETTINGS_BACK_PREMIUM_ID)
+_EMOJI_LIST = str(EMOJI_LIST_ID)
+_EMOJI_SAVE = str(EMOJI_ROLE_SETTINGS_SAVE_ID)
+_EMOJI_PM = str(EMOJI_ROLE_SETTINGS_SENT_PM_ID)
 
 
-def _premium_emoji(emoji_id: object, fallback: str = "•") -> str:
-    return fallback
+def _pe(emoji_id: object, fallback: str = "•") -> str:
+    """Return premium emoji HTML tag."""
+    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
 
 
 def _btn(
@@ -67,7 +75,10 @@ def _btn(
 ) -> types.InlineKeyboardButton:
     btn = types.InlineKeyboardButton(text, callback_data=callback_data, url=url)
     if icon_id is not None:
-        btn.icon_custom_emoji_id = str(icon_id)
+        try:
+            btn.icon_custom_emoji_id = str(icon_id)
+        except Exception:
+            pass
     return btn
 
 
@@ -79,16 +90,14 @@ def _normalize_command_name(name: str) -> str:
     return str(name or "").strip().lower()
 
 
+def _is_command_name_valid(name: str) -> bool:
+    """Accept all characters; require non-empty, no spaces, max length."""
+    stripped = _normalize_command_name(name)
+    return 0 < len(stripped) <= _CMD_MAX_NAME_LEN and " " not in stripped
+
+
 def _guest_bot_username(entry: dict) -> str:
     return _html.escape((entry.get("bot_username") or "").strip().lstrip("@"))
-
-
-def _guest_usage_examples(uname: str) -> tuple[str, str, str]:
-    return (
-        f"<code>@{uname} test</code>",
-        f"<code>/test@{uname}</code>",
-        "<code>test</code>",
-    )
 
 
 def _safe_int(value: object) -> int:
@@ -96,10 +105,6 @@ def _safe_int(value: object) -> int:
         return int(value)
     except Exception:
         return 0
-
-
-def _is_command_name_valid(name: str) -> bool:
-    return bool(_COMMAND_NAME_RE.fullmatch(_normalize_command_name(name)))
 
 
 def _is_runtime_alive(guest_bot_id: int) -> bool:
@@ -177,21 +182,30 @@ def autostart_guest_bots() -> None:
 
 def _guest_bots_menu_text(user: types.User) -> str:
     bots = list_guest_bots(owner_user_id=int(user.id))
-    hdr = _premium_emoji(EMOJI_LIST_ID)
+    hdr = _pe(_EMOJI_LIST, "📋")
     if not bots:
         return (
             f"{hdr} <b>Guest-боты</b>\n\n"
-            "У вас пока нет guest-ботов.\n"
-            "Нажмите «Подключить guest-бота» и отправьте токен BotFather."
+            "Подключите отдельного бота как гостевого — он будет отвечать на команды в ваших группах.\n\n"
+            "<i>Нет подключённых ботов.</i>\n"
+            "Нажмите «Подключить гостевого бота» и отправьте токен BotFather."
         )
 
-    lines = [f"{hdr} <b>Guest-боты</b>\n"]
-    for item in bots:
+    lines = [
+        f"{hdr} <b>Guest-боты</b>\n",
+        "Подключите отдельного бота как гостевого — он будет отвечать на команды в ваших группах.\n",
+        f"<b>Подключённых ботов:</b> <code>{len(bots)}</code>\n",
+    ]
+    for i, item in enumerate(bots, 1):
+        guest_id = int(item.get("id") or 0)
         uname = _html.escape(item.get("bot_username") or "unknown")
         enabled = bool(item.get("enabled"))
-        status_icon = _premium_emoji(EMOJI_SENT_OK_ID) if enabled else _premium_emoji(EMOJI_ROLE_SETTINGS_CANCEL_ID)
-        status = f"{status_icon} {'включён' if enabled else 'выключен'}"
-        lines.append(f"• <b>@{uname}</b> — {status}")
+        status_icon = _pe(_EMOJI_OK, "✅") if enabled else _pe(_EMOJI_CANCEL, "❌")
+        status_text = "активен" if enabled else "отключён"
+        lines.append(
+            f"{i}. {status_icon} <b>@{uname}</b>\n"
+            f"   <b>ID:</b> <code>{guest_id}</code> · <i>{status_text}</i>"
+        )
     return "\n".join(lines)
 
 
@@ -199,143 +213,85 @@ def _guest_bots_menu_kb(user: types.User) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=1)
     for item in list_guest_bots(owner_user_id=int(user.id)):
         guest_id = int(item.get("id") or 0)
-        uname = _html.escape(item.get("bot_username") or str(guest_id))
-        kb.add(_btn(f"Открыть @{uname}", callback_data=f"guestbot:open:{guest_id}", icon_id=EMOJI_ADMIN_RIGHTS_ID))
-    kb.add(_btn("Подключить guest-бота", callback_data="guestbot:create", icon_id=EMOJI_ROLE_SETTINGS_SAVE_ID))
-    kb.add(_btn("Назад", callback_data="start:home", icon_id=EMOJI_ROLE_SETTINGS_BACK_PREMIUM_ID))
+        uname = (item.get("bot_username") or str(guest_id)).strip().lstrip("@")
+        kb.add(_btn(f"@{uname}", callback_data=f"guestbot:unbind_ask:{guest_id}"))
+    kb.add(_btn("Подключить гостевого бота", callback_data="guestbot:create", icon_id=_EMOJI_CONNECT))
+    kb.add(_btn("Назад", callback_data="start:home", icon_id=_EMOJI_BACK))
     return kb
 
 
-def _guest_detail_text(entry: dict) -> str:
-    guest_id = int(entry.get("id") or 0)
-    uname = _html.escape(entry.get("bot_username") or "")
-    dname = _html.escape(entry.get("display_name") or uname)
-    status_icon = _premium_emoji(EMOJI_SENT_OK_ID) if bool(entry.get("enabled")) else _premium_emoji(EMOJI_ROLE_SETTINGS_CANCEL_ID)
-    status = f"{status_icon} {'активен' if bool(entry.get('enabled')) else 'отключён'}"
-    modules = ", ".join(str(v) for v in (entry.get("linked_modules") or [])) or "commands"
-    commands_count = len(list_guest_commands(guest_id))
+# --------------- Draft-based command creation helpers ---------------
+
+def _draft_get(uid: int) -> dict:
+    return _GUEST_CMD_DRAFTS.get(uid, {})
+
+
+def _draft_set(uid: int, draft: dict) -> None:
+    _GUEST_CMD_DRAFTS[uid] = draft
+
+
+def _draft_clear(uid: int) -> None:
+    _GUEST_CMD_DRAFTS.pop(uid, None)
+
+
+def _render_cmd_draft_text(draft: dict) -> str:
+    emoji = _pe(_EMOJI_CONNECT, "➕")
+    name = _html.escape(draft.get("name") or "")
+    text_raw = draft.get("text") or ""
+    has_text = "есть" if text_raw else "нет"
+    owner_only = bool(draft.get("owner_only"))
+    access_label = "Для владельца" if owner_only else "Все пользователи"
+    name_str = f"<code>{name}</code>" if name else "<i>не задано</i>"
     return (
-        f"{_premium_emoji(EMOJI_ADMIN_RIGHTS_ID)} <b>Guest-бот @{uname}</b>\n\n"
-        f"<b>ID:</b> <code>{guest_id}</code>\n"
-        f"<b>Название:</b> <code>{dname}</code>\n"
-        f"<b>Статус:</b> {status}\n"
-        f"<b>Модули:</b> <code>{_html.escape(modules)}</code>\n"
-        f"<b>Команд:</b> <code>{commands_count}</code>"
+        f"{emoji} <b>Новая команда</b>\n\n"
+        f"<b>Имя:</b> {name_str}\n"
+        f"<b>Текст:</b> <code>{has_text}</code>\n"
+        f"<b>Доступ:</b> {access_label}"
     )
 
 
-def _guest_detail_kb(entry: dict) -> types.InlineKeyboardMarkup:
-    guest_id = int(entry.get("id") or 0)
-    enabled = bool(entry.get("enabled"))
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(_btn("Модули", callback_data=f"guestbot:modules:{guest_id}", icon_id=EMOJI_ADMIN_RIGHTS_ID))
-    kb.add(_btn("Команды", callback_data=f"guestbot:commands:{guest_id}", icon_id=EMOJI_LIST_ID))
-    kb.add(
-        _btn(
-            "Выключить" if enabled else "Включить",
-            callback_data=f"guestbot:toggle:{guest_id}",
-            icon_id=EMOJI_ROLE_SETTINGS_CANCEL_ID if enabled else EMOJI_SENT_OK_ID,
-        )
-    )
-    kb.add(_btn("К списку", callback_data="guestbot:list", icon_id=EMOJI_ROLE_SETTINGS_BACK_PREMIUM_ID))
-    return kb
+def _build_cmd_draft_kb(draft: dict) -> types.InlineKeyboardMarkup:
+    guest_id = int(draft.get("guest_bot_id") or 0)
+    owner_only = bool(draft.get("owner_only"))
+    kb = types.InlineKeyboardMarkup(row_width=2)
 
+    btn_text = _btn("Текст", callback_data=f"guestbot:draft_text:{guest_id}")
+    try:
+        btn_text.icon_custom_emoji_id = str(EMOJI_ROLE_SETTINGS_SENT_PM_ID)
+    except Exception:
+        pass
 
-def _guest_modules_text(entry: dict) -> str:
-    enabled_modules = set(str(m) for m in (entry.get("linked_modules") or []))
-    lines = [f"{_premium_emoji(EMOJI_ADMIN_RIGHTS_ID)} <b>Модули guest-бота @{_html.escape(entry.get('bot_username') or '')}</b>\n"]
-    lines.append("Выберите, какие функции доступны этому guest-боту.")
-    for key, title in _AVAILABLE_MODULES:
-        mark = _premium_emoji(EMOJI_SENT_OK_ID) if key in enabled_modules else _premium_emoji(EMOJI_ROLE_SETTINGS_CANCEL_ID)
-        lines.append(f"{mark} <code>{_html.escape(title)}</code>")
-    return "\n".join(lines)
-
-
-def _guest_modules_kb(entry: dict) -> types.InlineKeyboardMarkup:
-    guest_id = int(entry.get("id") or 0)
-    enabled_modules = set(str(m) for m in (entry.get("linked_modules") or []))
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    for key, title in _AVAILABLE_MODULES:
-        icon_id = EMOJI_SENT_OK_ID if key in enabled_modules else EMOJI_ROLE_SETTINGS_CANCEL_ID
-        kb.add(_btn(title, callback_data=f"guestbot:modtog:{guest_id}:{key}", icon_id=icon_id))
-    kb.add(_btn("Назад", callback_data=f"guestbot:open:{guest_id}", icon_id=EMOJI_ROLE_SETTINGS_BACK_PREMIUM_ID))
-    return kb
-
-
-def _guest_commands_text(entry: dict) -> str:
-    guest_id = int(entry.get("id") or 0)
-    items = list_guest_commands(guest_id)
-    lines = [f"{_premium_emoji(EMOJI_LIST_ID)} <b>Команды guest-бота @{_html.escape(entry.get('bot_username') or '')}</b>\n"]
-    if not items:
-        lines.append("Команд пока нет.")
+    if owner_only:
+        btn_owner = _btn("»Для владельца«", callback_data=f"guestbot:draft_access:{guest_id}:owner")
+        try:
+            btn_owner.style = "primary"
+        except Exception:
+            pass
+        btn_all = _btn("Все пользователи", callback_data=f"guestbot:draft_access:{guest_id}:all")
     else:
-        for item in items[:20]:
-            mark = _premium_emoji(EMOJI_SENT_OK_ID) if item.get("enabled") else _premium_emoji(EMOJI_ROLE_SETTINGS_CANCEL_ID)
-            name = _html.escape(item.get("name") or "")
-            text_preview = _html.escape((item.get("response_text") or "")[:50])
-            lines.append(f"{mark} <code>{name}</code> — {text_preview}")
-        if len(items) > 20:
-            lines.append(f"... и ещё {len(items) - 20}")
-    lines.append("\nФормат добавления: <code>имя_команды | текст ответа</code>")
-    return "\n".join(lines)
+        btn_owner = _btn("Для владельца", callback_data=f"guestbot:draft_access:{guest_id}:owner")
+        btn_all = _btn("»Все пользователи«", callback_data=f"guestbot:draft_access:{guest_id}:all")
+        try:
+            btn_all.style = "primary"
+        except Exception:
+            pass
 
+    kb.add(btn_text)
+    kb.add(btn_owner, btn_all)
 
-def _guest_commands_usage_text(entry: dict) -> str:
-    uname = _guest_bot_username(entry)
-    ex_mention, ex_slash, ex_plain = _guest_usage_examples(uname)
-    return (
-        f"{_premium_emoji(EMOJI_LIST_ID)} <b>Инструкция guest-команд</b>\n\n"
-        "После включения guest-бота команды можно вызывать так:\n"
-        f"• {ex_mention}\n"
-        f"• {ex_slash}\n"
-        f"• {ex_plain}\n\n"
-        "Рекомендуемые тестовые команды:\n"
-        "• <code>test</code> — проверка ответа\n"
-        "• <code>ping</code> — быстрый пинг\n"
-        "• <code>guest_help</code> — подсказка по формату"
-    )
-
-
-def _guest_seed_test_commands(entry: dict) -> tuple[int, int]:
-    guest_id = int(entry.get("id") or 0)
-    if guest_id <= 0:
-        return 0, 0
-
-    uname = _guest_bot_username(entry)
-    ex_mention, ex_slash, ex_plain = _guest_usage_examples(uname)
-    test_payloads = [
-        ("test", f"✅ Guest-режим работает.\nПример: <code>@{uname} ping</code>"),
-        ("ping", "pong"),
-        (
-            "guest_help",
-            "Формат guest-команд:\n"
-            f"{ex_mention} | {ex_slash} | {ex_plain}",
-        ),
-    ]
-
-    success = 0
-    failed = 0
-    for cmd_name, response_text in test_payloads:
-        if upsert_guest_command(guest_id, cmd_name, response_text, enabled=True):
-            success += 1
-        else:
-            failed += 1
-    return success, failed
-
-
-def _guest_commands_kb(entry: dict) -> types.InlineKeyboardMarkup:
-    guest_id = int(entry.get("id") or 0)
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(_btn("Добавить / обновить", callback_data=f"guestbot:cmdadd:{guest_id}", icon_id=EMOJI_ROLE_SETTINGS_SAVE_ID))
-    kb.add(_btn("Удалить", callback_data=f"guestbot:cmddel:{guest_id}", icon_id=EMOJI_ROLE_SETTINGS_CANCEL_ID))
-    kb.add(_btn("Тест-команды", callback_data=f"guestbot:cmdseed:{guest_id}", icon_id=EMOJI_SENT_OK_ID))
-    kb.add(_btn("Инструкция", callback_data=f"guestbot:cmdhelp:{guest_id}", icon_id=EMOJI_LIST_ID))
-    for item in list_guest_commands(guest_id)[:10]:
-        name = _normalize_command_name(item.get("name") or "")
-        icon_id = EMOJI_SENT_OK_ID if item.get("enabled") else EMOJI_ROLE_SETTINGS_CANCEL_ID
-        kb.add(_btn(name, callback_data=f"guestbot:cmdtog:{guest_id}:{name}", icon_id=icon_id))
-    kb.add(_btn("Назад", callback_data=f"guestbot:open:{guest_id}", icon_id=EMOJI_ROLE_SETTINGS_BACK_PREMIUM_ID))
+    btn_cancel = _btn("Отмена", callback_data=f"guestbot:draft_cancel:{guest_id}")
+    try:
+        btn_cancel.style = "danger"
+    except Exception:
+        pass
+    btn_save = _btn("Сохранить", callback_data=f"guestbot:draft_save:{guest_id}")
+    try:
+        btn_save.style = "success"
+    except Exception:
+        pass
+    kb.add(btn_cancel, btn_save)
     return kb
+
 
 
 def _show_guest_bots_menu(chat_id: int, user: types.User) -> None:
@@ -351,10 +307,10 @@ def _show_guest_bots_menu(chat_id: int, user: types.User) -> None:
 def _begin_guest_creation(chat_id: int, user: types.User) -> None:
     _PENDING_TOKEN_USERS.add(int(user.id))
     kb = types.InlineKeyboardMarkup()
-    kb.add(_btn("Открыть BotFather", url="https://t.me/BotFather", icon_id=EMOJI_ROLE_SETTINGS_SENT_PM_ID))
+    kb.add(_btn("Открыть BotFather", url="https://t.me/BotFather", icon_id=_EMOJI_PM))
     bot.send_message(
         chat_id,
-        f"{_premium_emoji(EMOJI_ROLE_SETTINGS_SENT_PM_ID)} <b>Подключение guest-бота</b>\n\n"
+        f'{_pe(_EMOJI_PM, "⚙️")} <b>Подключение гостевого бота</b>\n\n'
         "1) Создайте отдельного бота в @BotFather\n"
         "2) Отправьте токен следующим сообщением\n"
         "3) После регистрации guest-бот запустится как отдельный процесс\n\n"
@@ -382,257 +338,194 @@ def guest_bots_callback(call: types.CallbackQuery):
     data = call.data or ""
     chat_id = call.message.chat.id
     msg_id = call.message.message_id
+    uid = int(call.from_user.id)
 
-    if data == "guestbot:create":
-        _begin_guest_creation(chat_id, call.from_user)
-        bot.answer_callback_query(call.id, "Ожидаю токен guest-бота.", show_alert=False)
-        return
-
-    if data == "guestbot:list":
+    def _edit_menu():
         try:
             bot.edit_message_text(
                 _guest_bots_menu_text(call.from_user),
                 chat_id,
                 msg_id,
                 parse_mode="HTML",
-                reply_markup=_guest_bots_menu_kb(call.from_user),
                 disable_web_page_preview=True,
+                reply_markup=_guest_bots_menu_kb(call.from_user),
             )
         except Exception:
             _show_guest_bots_menu(chat_id, call.from_user)
+
+    # ---- create ----
+    if data == "guestbot:create":
+        _begin_guest_creation(chat_id, call.from_user)
+        bot.answer_callback_query(call.id, "Ожидаю токен гостевого бота.", show_alert=False)
+        return
+
+    # ---- list ----
+    if data == "guestbot:list":
+        _edit_menu()
         bot.answer_callback_query(call.id)
         return
 
-    if data.startswith("guestbot:open:"):
+    # ---- unbind ask ----
+    if data.startswith("guestbot:unbind_ask:"):
         parts = data.split(":", 2)
         if len(parts) < 3:
             bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
             return
         guest_id = _safe_int(parts[2])
         entry = get_guest_bot_by_id(guest_id)
-        if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
+        if not entry or int(entry.get("owner_user_id") or 0) != uid:
             bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
             return
+        uname = _html.escape(entry.get("bot_username") or str(guest_id))
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        btn_yes = _btn("Да, отвязать", callback_data=f"guestbot:unbind_do:{guest_id}")
         try:
-            bot.edit_message_text(
-                _guest_detail_text(entry),
-                chat_id,
-                msg_id,
-                parse_mode="HTML",
-                reply_markup=_guest_detail_kb(entry),
-            )
+            btn_yes.style = "danger"
         except Exception:
-            bot.send_message(chat_id, _guest_detail_text(entry), parse_mode="HTML", reply_markup=_guest_detail_kb(entry))
-        bot.answer_callback_query(call.id)
-        return
-
-    if data.startswith("guestbot:toggle:"):
-        parts = data.split(":", 2)
-        if len(parts) < 3:
-            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
-            return
-        guest_id = _safe_int(parts[2])
-        entry = get_guest_bot_by_id(guest_id)
-        if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
-            bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
-            return
-        enabled_now = bool(entry.get("enabled"))
-        set_guest_bot_enabled(guest_id, not enabled_now)
-        refreshed = get_guest_bot_by_id(guest_id) or entry
-        if bool(refreshed.get("enabled")):
-            _launch_guest_runtime(refreshed)
-            bot.answer_callback_query(call.id, "Guest-бот включён.", show_alert=False)
-        else:
-            _stop_guest_runtime(guest_id)
-            bot.answer_callback_query(call.id, "Guest-бот выключен.", show_alert=False)
+            pass
+        btn_no = _btn("Нет, отмена", callback_data="guestbot:list")
+        kb.add(btn_yes, btn_no)
         try:
             bot.edit_message_text(
-                _guest_detail_text(refreshed),
+                f'{_pe(_EMOJI_CANCEL, "❌")} <b>Отвязать гостевого бота?</b>\n\n'
+                f"Бот <b>@{uname}</b> будет удалён из системы.\n"
+                "Вы сможете подключить его заново через токен BotFather.",
                 chat_id,
                 msg_id,
                 parse_mode="HTML",
-                reply_markup=_guest_detail_kb(refreshed),
+                reply_markup=kb,
             )
         except Exception:
             pass
-        return
-
-    if data.startswith("guestbot:modules:"):
-        parts = data.split(":", 2)
-        if len(parts) < 3:
-            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
-            return
-        guest_id = _safe_int(parts[2])
-        entry = get_guest_bot_by_id(guest_id)
-        if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
-            bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
-            return
-        bot.edit_message_text(
-            _guest_modules_text(entry),
-            chat_id,
-            msg_id,
-            parse_mode="HTML",
-            reply_markup=_guest_modules_kb(entry),
-        )
         bot.answer_callback_query(call.id)
         return
 
-    if data.startswith("guestbot:modtog:"):
-        parts = data.split(":", 3)
-        if len(parts) < 4:
-            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
-            return
-        _, _, guest_id_str, module_key = parts
-        guest_id = _safe_int(guest_id_str)
-        entry = get_guest_bot_by_id(guest_id)
-        if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
-            bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
-            return
-        modules = [str(m) for m in (entry.get("linked_modules") or [])]
-        if module_key in modules:
-            modules = [m for m in modules if m != module_key]
-        else:
-            modules.append(module_key)
-        update_guest_bot_modules(guest_id, modules)
-        refreshed = get_guest_bot_by_id(guest_id) or entry
-        bot.edit_message_text(
-            _guest_modules_text(refreshed),
-            chat_id,
-            msg_id,
-            parse_mode="HTML",
-            reply_markup=_guest_modules_kb(refreshed),
-        )
-        bot.answer_callback_query(call.id, "Сохранено.", show_alert=False)
-        return
-
-    if data.startswith("guestbot:commands:"):
+    # ---- unbind do ----
+    if data.startswith("guestbot:unbind_do:"):
         parts = data.split(":", 2)
         if len(parts) < 3:
             bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
             return
         guest_id = _safe_int(parts[2])
         entry = get_guest_bot_by_id(guest_id)
-        if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
+        if not entry or int(entry.get("owner_user_id") or 0) != uid:
             bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
             return
-        bot.edit_message_text(
-            _guest_commands_text(entry),
-            chat_id,
-            msg_id,
-            parse_mode="HTML",
-            reply_markup=_guest_commands_kb(entry),
-        )
-        bot.answer_callback_query(call.id)
+        _stop_guest_runtime(guest_id)
+        uname = _html.escape(entry.get("bot_username") or str(guest_id))
+        delete_guest_bot(guest_id)
+        bot.answer_callback_query(call.id, f"@{uname} отвязан.", show_alert=False)
+        _edit_menu()
         return
 
-    if data.startswith("guestbot:cmdadd:"):
+    # ---- draft: text input trigger ----
+    if data.startswith("guestbot:draft_text:"):
         parts = data.split(":", 2)
         if len(parts) < 3:
             bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
             return
         guest_id = _safe_int(parts[2])
         entry = get_guest_bot_by_id(guest_id)
-        if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
+        if not entry or int(entry.get("owner_user_id") or 0) != uid:
             bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
             return
-        _PENDING_COMMAND_INPUT[int(call.from_user.id)] = {"mode": "add", "guest_bot_id": guest_id}
+        draft = _draft_get(uid)
+        if not draft or int(draft.get("guest_bot_id") or 0) != guest_id:
+            bot.answer_callback_query(call.id, "Черновик не найден.", show_alert=False)
+            return
+        draft["step"] = "await_text"
+        _draft_set(uid, draft)
+        kb = types.InlineKeyboardMarkup()
+        kb.add(_btn("Отмена", callback_data=f"guestbot:draft_cancel:{guest_id}", icon_id=_EMOJI_CANCEL))
         bot.send_message(
             chat_id,
-            "Отправьте: <code>имя_команды | текст ответа</code>",
-            parse_mode="HTML",
-        )
-        bot.answer_callback_query(call.id, "Ожидаю данные команды.", show_alert=False)
-        return
-
-    if data.startswith("guestbot:cmddel:"):
-        parts = data.split(":", 2)
-        if len(parts) < 3:
-            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
-            return
-        guest_id = _safe_int(parts[2])
-        entry = get_guest_bot_by_id(guest_id)
-        if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
-            bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
-            return
-        _PENDING_COMMAND_INPUT[int(call.from_user.id)] = {"mode": "del", "guest_bot_id": guest_id}
-        bot.send_message(chat_id, "Отправьте имя команды для удаления.", parse_mode="HTML")
-        bot.answer_callback_query(call.id, "Ожидаю имя команды.", show_alert=False)
-        return
-
-    if data.startswith("guestbot:cmdseed:"):
-        parts = data.split(":", 2)
-        if len(parts) < 3:
-            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
-            return
-        guest_id = _safe_int(parts[2])
-        entry = get_guest_bot_by_id(guest_id)
-        if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
-            bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
-            return
-        success, failed = _guest_seed_test_commands(entry)
-        refreshed = get_guest_bot_by_id(guest_id) or entry
-        try:
-            bot.edit_message_text(
-                _guest_commands_text(refreshed),
-                chat_id,
-                msg_id,
-                parse_mode="HTML",
-                reply_markup=_guest_commands_kb(refreshed),
-            )
-        except Exception:
-            pass
-        if failed:
-            bot.answer_callback_query(call.id, f"Создано {success}, ошибок {failed}.", show_alert=False)
-        else:
-            bot.answer_callback_query(call.id, f"Готово: {success} тест-команды.", show_alert=False)
-        return
-
-    if data.startswith("guestbot:cmdhelp:"):
-        parts = data.split(":", 2)
-        if len(parts) < 3:
-            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
-            return
-        guest_id = _safe_int(parts[2])
-        entry = get_guest_bot_by_id(guest_id)
-        if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
-            bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
-            return
-        bot.send_message(
-            chat_id,
-            _guest_commands_usage_text(entry),
+            f'{_pe(_EMOJI_PM, "📝")} <b>Пришлите текст команды.</b>\n\n'
+            "Поддерживается HTML-форматирование Telegram:\n"
+            "<code>&lt;b&gt;жирный&lt;/b&gt;</code>, "
+            "<code>&lt;i&gt;курсив&lt;/i&gt;</code>, "
+            "<code>&lt;code&gt;код&lt;/code&gt;</code>, "
+            "<code>&lt;a href='...'&gt;ссылка&lt;/a&gt;</code> и другие теги.",
             parse_mode="HTML",
             disable_web_page_preview=True,
+            reply_markup=kb,
         )
-        bot.answer_callback_query(call.id, "Инструкция отправлена.", show_alert=False)
+        bot.answer_callback_query(call.id, "Ожидаю текст.", show_alert=False)
         return
 
-    if data.startswith("guestbot:cmdtog:"):
+    # ---- draft: access toggle ----
+    if data.startswith("guestbot:draft_access:"):
         parts = data.split(":", 3)
         if len(parts) < 4:
             bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
             return
-        _, _, guest_id_str, cmd_name = parts
-        guest_id = _safe_int(guest_id_str)
+        guest_id = _safe_int(parts[2])
+        access_val = parts[3]
         entry = get_guest_bot_by_id(guest_id)
-        if not entry or int(entry.get("owner_user_id") or 0) != int(call.from_user.id):
+        if not entry or int(entry.get("owner_user_id") or 0) != uid:
             bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
             return
-        cmd_name = _normalize_command_name(cmd_name)
-        commands = {c["name"]: c for c in list_guest_commands(guest_id)}
-        current = commands.get(cmd_name)
-        if not current:
-            bot.answer_callback_query(call.id, "Команда не найдена.", show_alert=False)
+        draft = _draft_get(uid)
+        if not draft or int(draft.get("guest_bot_id") or 0) != guest_id:
+            bot.answer_callback_query(call.id, "Черновик не найден.", show_alert=False)
             return
-        set_guest_command_enabled(guest_id, cmd_name, not bool(current.get("enabled")))
-        refreshed = get_guest_bot_by_id(guest_id) or entry
-        bot.edit_message_text(
-            _guest_commands_text(refreshed),
-            chat_id,
-            msg_id,
-            parse_mode="HTML",
-            reply_markup=_guest_commands_kb(refreshed),
-        )
-        bot.answer_callback_query(call.id, "Состояние команды изменено.", show_alert=False)
+        draft["owner_only"] = (access_val == "owner")
+        _draft_set(uid, draft)
+        try:
+            bot.edit_message_text(
+                _render_cmd_draft_text(draft),
+                chat_id,
+                msg_id,
+                parse_mode="HTML",
+                reply_markup=_build_cmd_draft_kb(draft),
+            )
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
+        return
+
+    # ---- draft: cancel ----
+    if data.startswith("guestbot:draft_cancel:"):
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
+            return
+        guest_id = _safe_int(parts[2])
+        _draft_clear(uid)
+        bot.answer_callback_query(call.id, "Создание команды отменено.", show_alert=False)
+        _edit_menu()
+        return
+
+    # ---- draft: save ----
+    if data.startswith("guestbot:draft_save:"):
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            bot.answer_callback_query(call.id, "Некорректные данные.", show_alert=False)
+            return
+        guest_id = _safe_int(parts[2])
+        entry = get_guest_bot_by_id(guest_id)
+        if not entry or int(entry.get("owner_user_id") or 0) != uid:
+            bot.answer_callback_query(call.id, "Guest-бот не найден.", show_alert=False)
+            return
+        draft = _draft_get(uid)
+        if not draft or int(draft.get("guest_bot_id") or 0) != guest_id:
+            bot.answer_callback_query(call.id, "Черновик не найден.", show_alert=False)
+            return
+        cmd_name = _normalize_command_name(draft.get("name") or "")
+        response_text = (draft.get("text") or "").strip()
+        owner_only = bool(draft.get("owner_only"))
+        if not _is_command_name_valid(cmd_name):
+            bot.answer_callback_query(call.id, "Некорректное имя команды.", show_alert=True)
+            return
+        if not response_text:
+            bot.answer_callback_query(call.id, "Текст ответа не задан.", show_alert=True)
+            return
+        ok = upsert_guest_command(guest_id, cmd_name, response_text, enabled=True, owner_only=owner_only)
+        _draft_clear(uid)
+        if ok:
+            bot.answer_callback_query(call.id, f"Команда «{cmd_name}» сохранена.", show_alert=False)
+        else:
+            bot.answer_callback_query(call.id, "Не удалось сохранить команду.", show_alert=True)
+        _edit_menu()
         return
 
     bot.answer_callback_query(call.id)
@@ -644,7 +537,12 @@ def _is_waiting_guest_input(m: types.Message) -> bool:
     if m.chat.type != "private" or not _is_owner(m.from_user) or not m.text:
         return False
     uid = int(m.from_user.id)
-    return uid in _PENDING_TOKEN_USERS or uid in _PENDING_COMMAND_INPUT
+    if uid in _PENDING_TOKEN_USERS:
+        return True
+    draft = _draft_get(uid)
+    if not draft:
+        return False
+    return draft.get("step") in ("await_name", "await_text")
 
 
 @bot.message_handler(func=_is_waiting_guest_input)
@@ -652,16 +550,22 @@ def on_guest_pending_input(m: types.Message):
     text = (m.text or "").strip()
     uid = int(m.from_user.id)
     lower_text = text.lower()
+
     if lower_text in {"/cancel", "отмена", "cancel"}:
         _PENDING_TOKEN_USERS.discard(uid)
-        _PENDING_COMMAND_INPUT.pop(uid, None)
+        _draft_clear(uid)
         bot.reply_to(m, "Операция отменена.")
         return
 
+    # ---- token input ----
     if uid in _PENDING_TOKEN_USERS:
         token_match = _TOKEN_RE.search(text)
         if not token_match:
-            bot.reply_to(m, "Не удалось распознать токен. Пришлите токен целиком.")
+            bot.reply_to(
+                m,
+                f'{_pe(PREMIUM_PREFIX_EMOJI_ID, "⚠️")} Не удалось распознать токен. Пришлите токен целиком.',
+                parse_mode="HTML",
+            )
             return
 
         token = token_match.group(1)
@@ -671,7 +575,8 @@ def on_guest_pending_input(m: types.Message):
         except Exception as e:
             bot.reply_to(
                 m,
-                f"{_premium_emoji(PREMIUM_PREFIX_EMOJI_ID)} Невалидный токен: <code>{_html.escape(str(e))}</code>",
+                f'{_pe(PREMIUM_PREFIX_EMOJI_ID, "❌")} <b>Невалидный токен</b>\n\n'
+                f"<code>{_html.escape(str(e))}</code>",
                 parse_mode="HTML",
             )
             return
@@ -686,7 +591,12 @@ def on_guest_pending_input(m: types.Message):
         )
         if not created:
             err_text = _html.escape(str(err or "Ошибка"))
-            bot.reply_to(m, f"{_premium_emoji(PREMIUM_PREFIX_EMOJI_ID)} <code>{err_text}</code>", parse_mode="HTML")
+            bot.reply_to(
+                m,
+                f'{_pe(PREMIUM_PREFIX_EMOJI_ID, "❌")} <b>Не удалось подключить бота</b>\n\n'
+                f"<code>{err_text}</code>",
+                parse_mode="HTML",
+            )
             return
 
         _PENDING_TOKEN_USERS.discard(uid)
@@ -695,72 +605,105 @@ def on_guest_pending_input(m: types.Message):
         uname = _html.escape(final.get("bot_username") or "")
         bot.reply_to(
             m,
-            (
-                f"{_premium_emoji(EMOJI_SENT_OK_ID)} Guest-бот <b>@{uname}</b> подключён.\n"
-                "Создайте guest-команды в меню управления.\n"
-                "В группах вызов: <code>@username_бота команда</code>."
-            ),
+            f'{_pe(_EMOJI_OK, "✅")} <b>Гостевой бот @{uname} подключён</b>\n\n'
+            f"Управляйте командами прямо в боте — отправьте ему /start.\n"
+            f"В группах вызов: <code>@{uname} имя_команды</code>.",
             parse_mode="HTML",
         )
         _show_guest_bots_menu(m.chat.id, m.from_user)
         return
 
-    state = _PENDING_COMMAND_INPUT.get(uid)
-    if not state:
+    # ---- draft: await name ----
+    draft = _draft_get(uid)
+    if not draft:
         return
 
-    guest_bot_id = int(state.get("guest_bot_id") or 0)
-    entry = get_guest_bot_by_id(guest_bot_id)
+    guest_id = int(draft.get("guest_bot_id") or 0)
+    entry = get_guest_bot_by_id(guest_id)
     if not entry or int(entry.get("owner_user_id") or 0) != uid:
-        _PENDING_COMMAND_INPUT.pop(uid, None)
+        _draft_clear(uid)
         bot.reply_to(m, "Guest-бот не найден.")
         return
 
-    if state.get("mode") == "add":
-        if "|" not in text:
-            bot.reply_to(m, "Формат: <code>имя_команды | текст ответа</code>", parse_mode="HTML")
-            return
-        raw_name, raw_response = text.split("|", 1)
-        cmd_name = _normalize_command_name(raw_name)
-        response_text = raw_response.strip()
-        if not _is_command_name_valid(cmd_name):
-            bot.reply_to(m, "Имя команды: только буквы/цифры/_ и до 30 символов.")
-            return
-        if not response_text:
-            bot.reply_to(m, "Текст ответа не должен быть пустым.")
-            return
-        if len(response_text) > _MAX_COMMAND_RESPONSE_LEN:
-            bot.reply_to(m, f"Текст ответа слишком длинный (макс. {_MAX_COMMAND_RESPONSE_LEN} символов).")
-            return
-        ok = upsert_guest_command(guest_bot_id, cmd_name, response_text, enabled=True)
-        if not ok:
-            bot.reply_to(m, "Не удалось сохранить команду.")
-            return
-        _PENDING_COMMAND_INPUT.pop(uid, None)
-        bot.reply_to(
-            m,
-            f"{_premium_emoji(EMOJI_SENT_OK_ID)} Команда <code>{_html.escape(cmd_name)}</code> сохранена.",
-            parse_mode="HTML",
-        )
-        _show_guest_bots_menu(m.chat.id, m.from_user)
-        return
+    step = draft.get("step")
 
-    if state.get("mode") == "del":
-        cmd_name = _normalize_command_name(text)
-        if not _is_command_name_valid(cmd_name):
-            bot.reply_to(m, "Некорректное имя команды.")
-            return
-        ok = delete_guest_command(guest_bot_id, cmd_name)
-        _PENDING_COMMAND_INPUT.pop(uid, None)
-        if ok:
+    if step == "await_name":
+        if not text or " " in text:
             bot.reply_to(
                 m,
-                f"{_premium_emoji(EMOJI_SENT_OK_ID)} Команда <code>{_html.escape(cmd_name)}</code> удалена.",
+                f'{_pe(PREMIUM_PREFIX_EMOJI_ID, "❌")} <b>Некорректное имя</b>\n\n'
+                "Имя команды — одно слово без пробелов, не более 30 символов.",
                 parse_mode="HTML",
             )
-        else:
-            bot.reply_to(m, "Не удалось удалить команду.")
-        _show_guest_bots_menu(m.chat.id, m.from_user)
+            return
+        if len(text) > _CMD_MAX_NAME_LEN:
+            bot.reply_to(
+                m,
+                f'{_pe(PREMIUM_PREFIX_EMOJI_ID, "❌")} <b>Слишком длинное имя</b>\n\n'
+                f"Максимум {_CMD_MAX_NAME_LEN} символов.",
+                parse_mode="HTML",
+            )
+            return
+        draft["name"] = _normalize_command_name(text)
+        draft["step"] = "draft"
+        _draft_set(uid, draft)
+        bot.send_message(
+            m.chat.id,
+            _render_cmd_draft_text(draft),
+            parse_mode="HTML",
+            reply_markup=_build_cmd_draft_kb(draft),
+        )
         return
 
-    _PENDING_COMMAND_INPUT.pop(uid, None)
+    if step == "await_text":
+        response_text = text
+        if not response_text:
+            bot.reply_to(
+                m,
+                f'{_pe(PREMIUM_PREFIX_EMOJI_ID, "❌")} Текст ответа не должен быть пустым.',
+                parse_mode="HTML",
+            )
+            return
+        if len(response_text) > _MAX_COMMAND_RESPONSE_LEN:
+            bot.reply_to(
+                m,
+                f'{_pe(PREMIUM_PREFIX_EMOJI_ID, "❌")} <b>Текст слишком длинный</b>\n\n'
+                f"Максимум {_MAX_COMMAND_RESPONSE_LEN} символов.",
+                parse_mode="HTML",
+            )
+            return
+        draft["text"] = response_text
+        draft["step"] = "draft"
+        _draft_set(uid, draft)
+        bot.send_message(
+            m.chat.id,
+            _render_cmd_draft_text(draft),
+            parse_mode="HTML",
+            reply_markup=_build_cmd_draft_kb(draft),
+        )
+        return
+
+    _draft_clear(uid)
+
+
+# ---- Trigger for "add command" flow from any context ----
+def _start_cmd_add_for_bot(chat_id: int, uid: int, guest_id: int) -> None:
+    """Initiate the step-by-step command creation flow."""
+    _draft_set(uid, {
+        "guest_bot_id": guest_id,
+        "step": "await_name",
+        "name": "",
+        "text": "",
+        "owner_only": False,
+    })
+    kb = types.InlineKeyboardMarkup()
+    kb.add(_btn("Отмена", callback_data=f"guestbot:draft_cancel:{guest_id}", icon_id=_EMOJI_CANCEL))
+    bot.send_message(
+        chat_id,
+        f'{_pe(_EMOJI_CONNECT, "➕")} <b>Создание команды</b>\n\n'
+        f"Пришлите <b>имя</b> новой команды.\n"
+        f"<i>Одно слово, до {_CMD_MAX_NAME_LEN} символов. Допустимы любые символы без пробелов.</i>",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=kb,
+    )
