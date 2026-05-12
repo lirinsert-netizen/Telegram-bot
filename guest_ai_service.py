@@ -56,6 +56,10 @@ _NO_SOURCES_PROMPT_APPEND = (
     "Если достоверные внешние источники не переданы, можешь использовать собственные "
     "общие знания, но обязательно помечай неопределённость и не выдавай догадки за факт."
 )
+_NO_SOURCES_USER_PROMPT = (
+    "Внешние источники не были получены. Ответь аккуратно, кратко и честно, "
+    "без вымышленных деталей."
+)
 
 _ALLOWED_TAGS = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "code", "pre", "a"}
 _BLOCK_TAG_RE = re.compile(r"</?(?:p|div|br|li|ul|ol|section|article|h[1-6]|tr)\b[^>]*>", flags=re.IGNORECASE)
@@ -590,8 +594,7 @@ class GuestAIService:
             if has_sources
             else (
                 f"Вопрос пользователя: {question}\n\n"
-                "Внешние источники не были получены. Ответь аккуратно, кратко и честно, "
-                "без вымышленных деталей."
+                f"{_NO_SOURCES_USER_PROMPT}"
             )
         )
 
@@ -635,5 +638,5 @@ class GuestAIService:
         if not cleaned:
             return None
         if not has_sources:
-            return cleaned[:_MAX_AI_REPLY_LEN] or None
+            return cleaned[:_MAX_AI_REPLY_LEN]
         return _append_sources_footer(cleaned, sources) or None
