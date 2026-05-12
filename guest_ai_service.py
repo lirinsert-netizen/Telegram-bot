@@ -187,7 +187,7 @@ def sanitize_ai_response_html(text: str) -> str:
 # -- Prompt / context builders -------------------------------------------------
 def _is_simple_question(text: str) -> bool:
     question = _normalize_space(text)
-    words = [w for w in question.split(" ") if w]
+    words = question.split()
     return len(words) <= 8 and question.endswith("?")
 
 
