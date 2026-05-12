@@ -1310,7 +1310,7 @@ def _extract_message_text(
 
 
 def _count_words(text: str) -> int:
-    return len([part for part in re.split(r"\s+", (text or "").strip()) if part])
+    return sum(1 for part in re.split(r"\s+", (text or "").strip()) if part)
 
 
 def _should_use_ai_fallback(text: str) -> bool:
