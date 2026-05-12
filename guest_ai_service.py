@@ -42,6 +42,8 @@ _BASE_SYSTEM_PROMPT = (
     "додумывай детали. Используй только простой HTML, поддерживаемый Telegram. "
     "Никогда не используй Markdown. Выделяй ключевые мысли тегом <b>. "
     "Не перечисляй источники самостоятельно: список ссылок будет добавлен отдельно. "
+    "В сообщении пользователя тебе передаются и сам вопрос, и досье по найденным "
+    "материалам; считай это единственным допустимым контекстом для ответа. "
     "Длина ответа должна соответствовать вопросу: на простой вопрос отвечай кратко, "
     "на сложный — подробнее."
 )
@@ -422,7 +424,7 @@ def _search_wikipedia(
         if not title:
             continue
         snippet = _truncate(_html_to_text(str(item.get("snippet") or "")), _MAX_SOURCE_SNIPPET_LEN)
-        url = _WIKIPEDIA_PAGE_URL_TEMPLATE.format(title=quote(title.replace(" ", "_"), safe=":_()-"))
+        url = _WIKIPEDIA_PAGE_URL_TEMPLATE.format(title=quote(title.replace(" ", "_"), safe="_()"))
         results.append(
             GroundingSource(
                 title=title,
@@ -471,7 +473,7 @@ def _fetch_source_context(
 
 def _build_grounding_context(question: str, sources: list[GroundingSource]) -> str:
     detail_hint = (
-        "Ответ должен быть коротким и точным."
+        "Ответ должен быть кратким и точным."
         if _is_simple_question(question)
         else "Ответ должен быть развёрнутым, но без воды."
     )
@@ -518,7 +520,7 @@ def _append_sources_footer(answer_html: str, sources: list[GroundingSource]) -> 
     if available <= 0:
         return footer[:_MAX_AI_REPLY_LEN]
     trimmed_body = body[:available].rstrip()
-    if body and len(body) > len(trimmed_body) and len(trimmed_body) > 1:
+    if body and len(body) > len(trimmed_body) and len(trimmed_body) > 0:
         trimmed_body = trimmed_body[:-1].rstrip() + "…"
     result = f"{trimmed_body}{footer}" if trimmed_body else footer.lstrip()
     return sanitize_ai_response_html(result)[:_MAX_AI_REPLY_LEN]
@@ -562,8 +564,8 @@ class GuestAIService:
             enriched.append(_fetch_source_context(source, self._session, _SOURCE_FETCH_TIMEOUT))
 
         leftover = merged[_MAX_FETCHED_SOURCES:]
-        final_sources = _merge_sources(enriched, leftover)
-        return [s for s in final_sources if s.snippet or s.content or s.title][: _MAX_GROUNDING_SOURCES]
+        final_sources = enriched + leftover
+        return [s for s in final_sources if s.snippet or s.content][: _MAX_GROUNDING_SOURCES]
 
     def generate_reply(self, user_text: str, *, is_owner_sender: bool) -> str | None:
         if not self.available():
