@@ -85,7 +85,7 @@ def _convert_basic_markdown_to_html(text: str) -> str:
         lambda m: f'<a href="{_html.escape(m.group(2), quote=True)}">{_html.escape(m.group(1))}</a>',
         value,
     )
-    value = re.sub(r"```(?:[a-zA-Z0-9_+-]+)?\n(.*?)```", lambda m: f"<pre>{_html.escape(m.group(1).strip())}</pre>", value, flags=re.DOTALL)
+    value = re.sub(r"```(?:[a-zA-Z0-9_+-]+)?\n?(.*?)```", lambda m: f"<pre>{_html.escape(m.group(1).strip())}</pre>", value, flags=re.DOTALL)
     value = re.sub(r"`([^`\n]+)`", lambda m: f"<code>{_html.escape(m.group(1))}</code>", value)
     value = re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", value)
     value = re.sub(r"__([^_\n]+)__", r"<b>\1</b>", value)
