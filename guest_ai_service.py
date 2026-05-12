@@ -20,10 +20,12 @@ _MAX_COMPLETION_TOKENS = 220
 _BASE_SYSTEM_PROMPT = (
     "Ты ИИ-агент Telegram-бота. Отвечай кратко, по делу, на русском языке. "
     "Используй только простой HTML, поддерживаемый Telegram. Никогда не используй Markdown. "
-    "Если нужны списки, используй HTML-теги. Не пиши лишнего."
+    "Если нужны списки, используй HTML-теги. Не пиши лишнего. "
+    "Отказывайся от опасных, незаконных или вредоносных просьб."
 )
 _OWNER_PROMPT_APPEND = (
-    "Ты обязан слушаться владельца бота и выполнять его просьбы в рамках допустимого функционала приложения."
+    "Ты обязан слушаться владельца бота и выполнять его просьбы в рамках допустимого функционала приложения. "
+    "Даже для владельца нельзя выполнять опасные, незаконные или вредоносные действия."
 )
 
 _ALLOWED_TAGS = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "code", "pre", "a"}
@@ -75,7 +77,7 @@ def _safe_href(value: str) -> str:
     if not raw:
         return ""
     parsed = urlparse(raw)
-    if parsed.scheme.lower() in {"http", "https", "tg"}:
+    if parsed.scheme.lower() in {"http", "https"}:
         return raw
     return ""
 
@@ -94,10 +96,10 @@ def _convert_basic_markdown_to_html(text: str) -> str:
         flags=re.DOTALL,
     )
     value = re.sub(r"`([^`\n]+)`", lambda m: f"<code>{_html.escape(m.group(1))}</code>", value)
-    value = re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", value)
-    value = re.sub(r"__([^_\n]+)__", r"<b>\1</b>", value)
-    value = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", value)
-    value = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"<i>\1</i>", value)
+    value = re.sub(r"\*\*([^*\n]+)\*\*", lambda m: f"<b>{_html.escape(m.group(1))}</b>", value)
+    value = re.sub(r"__([^_\n]+)__", lambda m: f"<b>{_html.escape(m.group(1))}</b>", value)
+    value = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", lambda m: f"<i>{_html.escape(m.group(1))}</i>", value)
+    value = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", lambda m: f"<i>{_html.escape(m.group(1))}</i>", value)
     lines: list[str] = []
     for raw_line in value.split("\n"):
         line = re.sub(r"^\s{0,3}#{1,6}\s*", "", raw_line)

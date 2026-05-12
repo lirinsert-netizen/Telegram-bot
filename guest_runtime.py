@@ -41,7 +41,7 @@ _OWNER_DEBUG_MAX_LEN = 400
 _GUEST_QUERY_TEXT_MAX_LEN = 4000
 # InlineQueryResultArticle.title shown in the inline picker; keep it brief.
 _INLINE_ARTICLE_TITLE_MAX_LEN = 64
-_MIN_AI_WORDS = 5
+_AI_MIN_WORD_COUNT = 5
 _AI_FALLBACK_TEXT = "⚠️ <b>ИИ временно недоступен.</b>\nПопробуйте чуть позже."
 _GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 _GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip() or "llama-3.1-8b-instant"
@@ -1314,7 +1314,7 @@ def _count_words(text: str) -> int:
 
 
 def _should_use_ai_fallback(text: str) -> bool:
-    return _count_words(text) >= _MIN_AI_WORDS
+    return _count_words(text) >= _AI_MIN_WORD_COUNT
 
 
 def _build_inline_article_result(text: str, parse_mode: str | None = None) -> str:
