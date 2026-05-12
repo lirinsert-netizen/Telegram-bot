@@ -556,7 +556,7 @@ class GuestAIService:
     def available(self) -> bool:
         return bool(self._api_key)
 
-    def build_system_prompt(self, is_owner_sender: bool, *, has_sources: bool) -> str:
+    def build_system_prompt(self, is_owner_sender: bool, *, has_sources: bool = True) -> str:
         prompt = _BASE_SYSTEM_PROMPT
         if is_owner_sender:
             prompt = f"{prompt} {_OWNER_PROMPT_APPEND}"
