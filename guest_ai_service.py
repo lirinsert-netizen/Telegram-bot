@@ -592,7 +592,7 @@ class GuestAIService:
         sources = self._collect_sources(question)
         has_sources = bool(sources)
         if not has_sources:
-            logger.warning("[GUEST AI] no grounding sources found for query=%r, using model-only fallback", question)
+            logger.info("[GUEST AI] no grounding sources found for query=%r, using model-only fallback", question)
         user_content = (
             _build_grounding_context(question, sources)
             if has_sources
@@ -640,4 +640,5 @@ class GuestAIService:
             return None
         if not has_sources:
             return cleaned[:_MAX_AI_REPLY_LEN]
-        return _append_sources_footer(cleaned, sources) or None
+        with_sources = _append_sources_footer(cleaned, sources)
+        return with_sources[:_MAX_AI_REPLY_LEN] or None
