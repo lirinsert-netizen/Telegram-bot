@@ -504,6 +504,10 @@ def _build_grounding_context(question: str, sources: list[GroundingSource]) -> s
     return "\n\n".join(blocks).strip()
 
 
+def _build_no_sources_context(question: str) -> str:
+    return f"Вопрос пользователя: {question}\n\n{_NO_SOURCES_USER_PROMPT}".strip()
+
+
 def _build_sources_footer(sources: list[GroundingSource]) -> str:
     lines = ["", "<b>Источники:</b>"]
     count = 0
@@ -552,7 +556,7 @@ class GuestAIService:
     def available(self) -> bool:
         return bool(self._api_key)
 
-    def build_system_prompt(self, is_owner_sender: bool, *, has_sources: bool = True) -> str:
+    def build_system_prompt(self, is_owner_sender: bool, *, has_sources: bool) -> str:
         prompt = _BASE_SYSTEM_PROMPT
         if is_owner_sender:
             prompt = f"{prompt} {_OWNER_PROMPT_APPEND}"
@@ -592,10 +596,7 @@ class GuestAIService:
         user_content = (
             _build_grounding_context(question, sources)
             if has_sources
-            else (
-                f"Вопрос пользователя: {question}\n\n"
-                f"{_NO_SOURCES_USER_PROMPT}"
-            )
+            else _build_no_sources_context(question)
         )
 
         payload = {
