@@ -26,9 +26,12 @@ _SEARCH_TIMEOUT = (8.0, 20.0)
 _SOURCE_FETCH_TIMEOUT = (8.0, 20.0)
 _MAX_SEARCH_RESULTS = 8
 _MAX_SOURCE_FOOTER_ITEMS = 5
+_MAX_GROUNDING_SOURCES = 5
 _MAX_FETCHED_SOURCES = 4
 _MAX_SOURCE_SNIPPET_LEN = 420
 _MAX_SOURCE_CONTENT_LEN = 1400
+_MAX_RAW_HTML_LEN = 250000
+_MAX_HTML_SEARCH_TAIL_LEN = 1400
 _HTTP_USER_AGENT = (
     "Mozilla/5.0 (compatible; TelegramBotGuestAI/1.0; +https://telegram.org)"
 )
@@ -220,7 +223,8 @@ def _unwrap_search_url(url: str) -> str:
     if not raw:
         return ""
     parsed = urlparse(raw)
-    if parsed.netloc.lower().endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+    host = parsed.netloc.lower().removeprefix("www.")
+    if host in {"duckduckgo.com", "html.duckduckgo.com"} and parsed.path.startswith("/l/"):
         query = parse_qs(parsed.query)
         for key in ("uddg", "rut"):
             values = query.get(key) or []
@@ -365,7 +369,7 @@ def _search_duckduckgo_html(
         title = _truncate(_html_to_text(match.group(2)), 180)
         if not url or not title:
             continue
-        tail = html_text[match.end() : match.end() + 1400]
+        tail = html_text[match.end() : match.end() + _MAX_HTML_SEARCH_TAIL_LEN]
         snippet_match = re.search(
             r'(?:result__snippet|result-snippet)[^>]*>(.*?)</',
             tail,
@@ -418,7 +422,7 @@ def _search_wikipedia(
         if not title:
             continue
         snippet = _truncate(_html_to_text(str(item.get("snippet") or "")), _MAX_SOURCE_SNIPPET_LEN)
-        url = _WIKIPEDIA_PAGE_URL_TEMPLATE.format(title=quote(title.replace(" ", "_"), safe=":_()/-"))
+        url = _WIKIPEDIA_PAGE_URL_TEMPLATE.format(title=quote(title.replace(" ", "_"), safe=":_()-"))
         results.append(
             GroundingSource(
                 title=title,
@@ -449,7 +453,7 @@ def _fetch_source_context(
     content_type = str(response.headers.get("content-type") or "").lower()
     body_text = ""
     if "html" in content_type or "xml" in content_type or not content_type:
-        html_text = response.text[:250000]
+        html_text = response.text[:_MAX_RAW_HTML_LEN]
         fetched_title = _extract_title_from_html(html_text)
         fetched_snippet = _extract_meta_description(html_text)
         body_text = _truncate(_html_to_text(html_text), _MAX_SOURCE_CONTENT_LEN)
@@ -559,7 +563,7 @@ class GuestAIService:
 
         leftover = merged[_MAX_FETCHED_SOURCES:]
         final_sources = _merge_sources(enriched, leftover)
-        return [s for s in final_sources if s.snippet or s.content or s.title][: _MAX_SOURCE_FOOTER_ITEMS]
+        return [s for s in final_sources if s.snippet or s.content or s.title][: _MAX_GROUNDING_SOURCES]
 
     def generate_reply(self, user_text: str, *, is_owner_sender: bool) -> str | None:
         if not self.available():
