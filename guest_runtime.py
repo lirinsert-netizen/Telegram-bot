@@ -11,6 +11,8 @@ import threading
 import time
 from html.parser import HTMLParser
 
+from guest_ai_service import GuestAIService
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,6 +41,11 @@ _OWNER_DEBUG_MAX_LEN = 400
 _GUEST_QUERY_TEXT_MAX_LEN = 4000
 # InlineQueryResultArticle.title shown in the inline picker; keep it brief.
 _INLINE_ARTICLE_TITLE_MAX_LEN = 64
+_AI_MIN_WORD_COUNT = 5
+_AI_FALLBACK_TEXT = "⚠️ <b>ИИ временно недоступен.</b>\nПопробуйте чуть позже."
+_GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+_GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip() or "llama-3.1-8b-instant"
+_AI_SERVICE = GuestAIService(api_key=_GROQ_API_KEY, model=_GROQ_MODEL)
 
 
 class _GuestQueryHTMLStripper(HTMLParser):
@@ -1302,6 +1309,14 @@ def _extract_message_text(
     return ""
 
 
+def _count_words(text: str) -> int:
+    return sum(1 for part in re.split(r"\s+", (text or "").strip()) if part)
+
+
+def _should_use_ai_fallback(text: str) -> bool:
+    return _count_words(text) >= _AI_MIN_WORD_COUNT
+
+
 def _build_inline_article_result(text: str, parse_mode: str | None = None) -> str:
     """Return a JSON-serialised InlineQueryResultArticle for answerGuestQuery.
 
@@ -1426,36 +1441,56 @@ def _handle_guest_update(update_obj: dict) -> None:
         return
 
     cmd_key = _extract_guest_command_key(text, _BOT_USERNAME)
-    if not cmd_key:
-        return
 
     conn = None
     try:
         conn = _db_connect()
         if not _bot_is_enabled(conn, _BOT_USERNAME):
-            if not _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "bot disabled", text):
+            if cmd_key and not _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "bot disabled", text):
                 logger.warning("[GUEST RUNTIME] failed to notify owner about disabled bot for cmd=%s", cmd_key)
             return
-        response = _resolve_guest_response(conn, _BOT_USERNAME, cmd_key, sender_id)
-        if not response:
+        response = None
+        if cmd_key:
+            response = _resolve_guest_response(conn, _BOT_USERNAME, cmd_key, sender_id)
+        sent = False
+        if response:
+            if guest_query_id:
+                sent = _answer_guest_query(guest_query_id, response)
+            if not sent and chat_id:
+                if not guest_query_id:
+                    logger.debug("[GUEST RUNTIME] no guest_query_id; using sendMessage fallback")
+                sent = _send_message_response(
+                    chat_id=chat_id,
+                    response_text=response,
+                    reply_to_message_id=reply_to_message_id,
+                    message_thread_id=message_thread_id,
+                )
+            if not sent and cmd_key:
+                if not _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "failed to deliver response", text):
+                    logger.warning("[GUEST RUNTIME] failed to notify owner about delivery failure cmd=%s", cmd_key)
+            return
+        if _should_use_ai_fallback(text):
+            owner_user_id = _get_owner_user_id(conn, _BOT_USERNAME)
+            ai_response = _AI_SERVICE.generate_reply(
+                text,
+                is_owner_sender=bool(owner_user_id and sender_id == owner_user_id),
+            )
+            ai_text = ai_response or _AI_FALLBACK_TEXT
+            if guest_query_id:
+                sent = _answer_guest_query(guest_query_id, ai_text)
+            if not sent and chat_id:
+                sent = _send_message_response(
+                    chat_id=chat_id,
+                    response_text=ai_text,
+                    reply_to_message_id=reply_to_message_id,
+                    message_thread_id=message_thread_id,
+                )
+            if sent:
+                return
+        if cmd_key:
             if not _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "command not found or module disabled", text):
                 logger.warning("[GUEST RUNTIME] failed to notify owner about unresolved cmd=%s", cmd_key)
             return
-        sent = False
-        if guest_query_id:
-            sent = _answer_guest_query(guest_query_id, response)
-        if not sent and chat_id:
-            if not guest_query_id:
-                logger.debug("[GUEST RUNTIME] no guest_query_id; using sendMessage fallback")
-            sent = _send_message_response(
-                chat_id=chat_id,
-                response_text=response,
-                reply_to_message_id=reply_to_message_id,
-                message_thread_id=message_thread_id,
-            )
-        if not sent:
-            if not _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "failed to deliver response", text):
-                logger.warning("[GUEST RUNTIME] failed to notify owner about delivery failure cmd=%s", cmd_key)
     except Exception as e:
         logger.warning("[GUEST RUNTIME] command handling failed: %s", e)
     finally:

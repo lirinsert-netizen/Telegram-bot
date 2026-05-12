@@ -50,6 +50,8 @@ def _get_required_env(name: str) -> str:
 
 TOKEN = _get_required_env("BOT_TOKEN")
 OWNER_USERNAME = os.getenv("OWNER_USERNAME", "Insertq").strip().lstrip("@") or "Insertq"  # без @
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip() or "llama-3.1-8b-instant"
 
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 
