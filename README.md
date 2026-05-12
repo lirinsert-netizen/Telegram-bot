@@ -20,6 +20,10 @@ API_HASH=abcdef1234567890abcdef1234567890
 # Данные владельца
 OWNER_USERNAME=your_telegram_username   # без @
 
+# ИИ-агент guest-ботов (опционально)
+GROQ_API_KEY=gsk_xxx
+GROQ_MODEL=llama-3.1-8b-instant
+
 # Директория данных (JSON/SQLite)
 DATA_DIR=/data
 
