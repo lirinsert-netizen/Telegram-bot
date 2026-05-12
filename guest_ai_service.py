@@ -52,6 +52,14 @@ _OWNER_PROMPT_APPEND = (
     "функционала приложения. Даже для владельца нельзя выполнять опасные, незаконные "
     "или вредоносные действия."
 )
+_NO_SOURCES_PROMPT_APPEND = (
+    "Если достоверные внешние источники не переданы, можешь использовать собственные "
+    "общие знания, но обязательно помечай неопределённость и не выдавай догадки за факт."
+)
+_NO_SOURCES_USER_PROMPT = (
+    "Внешние источники не были получены. Ответь аккуратно, кратко и честно, "
+    "без вымышленных деталей."
+)
 
 _ALLOWED_TAGS = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "code", "pre", "a"}
 _BLOCK_TAG_RE = re.compile(r"</?(?:p|div|br|li|ul|ol|section|article|h[1-6]|tr)\b[^>]*>", flags=re.IGNORECASE)
@@ -496,6 +504,10 @@ def _build_grounding_context(question: str, sources: list[GroundingSource]) -> s
     return "\n\n".join(blocks).strip()
 
 
+def _build_no_sources_context(question: str) -> str:
+    return f"Вопрос пользователя: {question}\n\n{_NO_SOURCES_USER_PROMPT}".strip()
+
+
 def _build_sources_footer(sources: list[GroundingSource]) -> str:
     lines = ["", "<b>Источники:</b>"]
     count = 0
@@ -544,10 +556,12 @@ class GuestAIService:
     def available(self) -> bool:
         return bool(self._api_key)
 
-    def build_system_prompt(self, is_owner_sender: bool) -> str:
+    def build_system_prompt(self, is_owner_sender: bool, *, has_sources: bool = True) -> str:
         prompt = _BASE_SYSTEM_PROMPT
         if is_owner_sender:
             prompt = f"{prompt} {_OWNER_PROMPT_APPEND}"
+        if not has_sources:
+            prompt = f"{prompt} {_NO_SOURCES_PROMPT_APPEND}"
         return prompt
 
     def _collect_sources(self, query: str) -> list[GroundingSource]:
@@ -576,17 +590,22 @@ class GuestAIService:
             return None
 
         sources = self._collect_sources(question)
-        if not sources:
-            logger.warning("[GUEST AI] no grounding sources found for query=%r", question)
-            return None
+        has_sources = bool(sources)
+        if not has_sources:
+            logger.info("[GUEST AI] no grounding sources found for query=%r, using model-only fallback", question)
+        user_content = (
+            _build_grounding_context(question, sources)
+            if has_sources
+            else _build_no_sources_context(question)
+        )
 
         payload = {
             "model": self._model,
             "temperature": _COMPLETION_TEMPERATURE,
             "max_tokens": _MAX_COMPLETION_TOKENS,
             "messages": [
-                {"role": "system", "content": self.build_system_prompt(is_owner_sender)},
-                {"role": "user", "content": _build_grounding_context(question, sources)},
+                {"role": "system", "content": self.build_system_prompt(is_owner_sender, has_sources=has_sources)},
+                {"role": "user", "content": user_content},
             ],
         }
         headers = {
@@ -619,4 +638,7 @@ class GuestAIService:
         cleaned = sanitize_ai_response_html(content)
         if not cleaned:
             return None
-        return _append_sources_footer(cleaned, sources) or None
+        if not has_sources:
+            return cleaned[:_MAX_AI_REPLY_LEN]
+        with_sources = _append_sources_footer(cleaned, sources)
+        return with_sources[:_MAX_AI_REPLY_LEN] or None
