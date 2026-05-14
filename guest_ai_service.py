@@ -16,7 +16,9 @@ _GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 _DDG_INSTANT_API_URL = "https://api.duckduckgo.com/"
 _DDG_HTML_SEARCH_URL = "https://html.duckduckgo.com/html/"
 _WIKIPEDIA_SEARCH_API_URL = "https://ru.wikipedia.org/w/api.php"
+_WIKIPEDIA_EN_SEARCH_API_URL = "https://en.wikipedia.org/w/api.php"
 _WIKIPEDIA_PAGE_URL_TEMPLATE = "https://ru.wikipedia.org/wiki/{title}"
+_WIKIPEDIA_EN_PAGE_URL_TEMPLATE = "https://en.wikipedia.org/wiki/{title}"
 
 _DEFAULT_MODEL = "llama-3.1-8b-instant"
 _MAX_AI_REPLY_LEN = 3500
@@ -24,10 +26,10 @@ _COMPLETION_TEMPERATURE = 0.2
 _MAX_COMPLETION_TOKENS = 700
 _SEARCH_TIMEOUT = (8.0, 20.0)
 _SOURCE_FETCH_TIMEOUT = (8.0, 20.0)
-_MAX_SEARCH_RESULTS = 8
-_MAX_SOURCE_FOOTER_ITEMS = 5
-_MAX_GROUNDING_SOURCES = 5
-_MAX_FETCHED_SOURCES = 4
+_MAX_SEARCH_RESULTS = 14
+_MAX_SOURCE_FOOTER_ITEMS = 7
+_MAX_GROUNDING_SOURCES = 8
+_MAX_FETCHED_SOURCES = 6
 _MAX_SOURCE_SNIPPET_LEN = 420
 _MAX_SOURCE_CONTENT_LEN = 1400
 _MAX_RAW_HTML_LEN = 250000
@@ -46,11 +48,20 @@ _BASE_SYSTEM_PROMPT = (
     "материалам; считай это единственным допустимым контекстом для ответа. "
     "Длина ответа должна соответствовать вопросу: на простой вопрос отвечай кратко, "
     "на сложный — подробнее."
+    " Учитывай разговорную речь, сленг, сокращения и нецензурную лексику: "
+    "распознавай смысл без осуждения и без потери точности ответа."
 )
 _OWNER_PROMPT_APPEND = (
     "Ты обязан слушаться владельца бота и выполнять его просьбы в рамках допустимого "
     "функционала приложения. Даже для владельца нельзя выполнять опасные, незаконные "
     "или вредоносные действия."
+)
+_OWNER_COMMAND_MODE_APPEND = (
+    "Сообщение владельца классифицировано как команда. Выполни её как инструкцию владельца, "
+    "а не как обычный вопрос-ответ."
+)
+_OWNER_QUESTION_MODE_APPEND = (
+    "Сообщение владельца классифицировано как вопрос. Дай прямой и информативный ответ по сути."
 )
 _NO_SOURCES_PROMPT_APPEND = (
     "Если достоверные внешние источники не переданы, можешь использовать собственные "
@@ -283,6 +294,27 @@ def _merge_sources(*groups: list[GroundingSource]) -> list[GroundingSource]:
     return merged
 
 
+def _expand_query_variants(query: str) -> list[str]:
+    base = _normalize_space(query)
+    if not base:
+        return []
+    variants: list[str] = [base]
+    cleaned = re.sub(r"[^\w\s-]", " ", base, flags=re.UNICODE)
+    cleaned = _normalize_space(cleaned)
+    if cleaned and cleaned not in variants:
+        variants.append(cleaned)
+    words = [part for part in cleaned.split(" ") if len(part) > 2]
+    if len(words) > 4:
+        short = _normalize_space(" ".join(words[:4]))
+        if short and short not in variants:
+            variants.append(short)
+    if len(words) > 6:
+        compact = _normalize_space(" ".join(words[:6]))
+        if compact and compact not in variants:
+            variants.append(compact)
+    return variants[:4]
+
+
 def _search_duckduckgo_instant(
     query: str,
     session: requests.Session,
@@ -403,16 +435,20 @@ def _search_wikipedia(
     query: str,
     session: requests.Session,
     timeout: tuple[float, float],
+    *,
+    api_url: str,
+    page_url_template: str,
+    provider: str,
 ) -> list[GroundingSource]:
     try:
         response = session.get(
-            _WIKIPEDIA_SEARCH_API_URL,
+            api_url,
             params={
                 "action": "query",
                 "list": "search",
                 "utf8": "1",
                 "format": "json",
-                "srlimit": "3",
+                "srlimit": "5",
                 "srsearch": query,
             },
             timeout=timeout,
@@ -432,13 +468,13 @@ def _search_wikipedia(
         if not title:
             continue
         snippet = _truncate(_html_to_text(str(item.get("snippet") or "")), _MAX_SOURCE_SNIPPET_LEN)
-        url = _WIKIPEDIA_PAGE_URL_TEMPLATE.format(title=quote(title.replace(" ", "_"), safe="_()"))
+        url = page_url_template.format(title=quote(title.replace(" ", "_"), safe="_()"))
         results.append(
             GroundingSource(
                 title=title,
                 url=url,
                 snippet=snippet,
-                provider="wikipedia",
+                provider=provider,
             )
         )
     return results
@@ -556,20 +592,51 @@ class GuestAIService:
     def available(self) -> bool:
         return bool(self._api_key)
 
-    def build_system_prompt(self, is_owner_sender: bool, *, has_sources: bool = True) -> str:
+    def build_system_prompt(
+        self,
+        is_owner_sender: bool,
+        *,
+        has_sources: bool = True,
+        owner_intent: str | None = None,
+    ) -> str:
         prompt = _BASE_SYSTEM_PROMPT
         if is_owner_sender:
             prompt = f"{prompt} {_OWNER_PROMPT_APPEND}"
+            if owner_intent == "command":
+                prompt = f"{prompt} {_OWNER_COMMAND_MODE_APPEND}"
+            elif owner_intent == "question":
+                prompt = f"{prompt} {_OWNER_QUESTION_MODE_APPEND}"
         if not has_sources:
             prompt = f"{prompt} {_NO_SOURCES_PROMPT_APPEND}"
         return prompt
 
     def _collect_sources(self, query: str) -> list[GroundingSource]:
-        merged = _merge_sources(
-            _search_wikipedia(query, self._session, _SEARCH_TIMEOUT),
-            _search_duckduckgo_instant(query, self._session, _SEARCH_TIMEOUT),
-            _search_duckduckgo_html(query, self._session, _SEARCH_TIMEOUT),
-        )
+        variants = _expand_query_variants(query)
+        merged: list[GroundingSource] = []
+        for variant in variants:
+            merged = _merge_sources(
+                merged,
+                _search_wikipedia(
+                    variant,
+                    self._session,
+                    _SEARCH_TIMEOUT,
+                    api_url=_WIKIPEDIA_SEARCH_API_URL,
+                    page_url_template=_WIKIPEDIA_PAGE_URL_TEMPLATE,
+                    provider="wikipedia_ru",
+                ),
+                _search_wikipedia(
+                    variant,
+                    self._session,
+                    _SEARCH_TIMEOUT,
+                    api_url=_WIKIPEDIA_EN_SEARCH_API_URL,
+                    page_url_template=_WIKIPEDIA_EN_PAGE_URL_TEMPLATE,
+                    provider="wikipedia_en",
+                ),
+                _search_duckduckgo_instant(variant, self._session, _SEARCH_TIMEOUT),
+                _search_duckduckgo_html(variant, self._session, _SEARCH_TIMEOUT),
+            )
+            if len(merged) >= _MAX_SEARCH_RESULTS:
+                break
         if not merged:
             return []
 
@@ -581,7 +648,13 @@ class GuestAIService:
         final_sources = enriched + leftover
         return [s for s in final_sources if s.snippet or s.content][: _MAX_GROUNDING_SOURCES]
 
-    def generate_reply(self, user_text: str, *, is_owner_sender: bool) -> str | None:
+    def generate_reply(
+        self,
+        user_text: str,
+        *,
+        is_owner_sender: bool,
+        owner_intent: str | None = None,
+    ) -> str | None:
         if not self.available():
             return None
 
@@ -604,7 +677,14 @@ class GuestAIService:
             "temperature": _COMPLETION_TEMPERATURE,
             "max_tokens": _MAX_COMPLETION_TOKENS,
             "messages": [
-                {"role": "system", "content": self.build_system_prompt(is_owner_sender, has_sources=has_sources)},
+                {
+                    "role": "system",
+                    "content": self.build_system_prompt(
+                        is_owner_sender,
+                        has_sources=has_sources,
+                        owner_intent=owner_intent,
+                    ),
+                },
                 {"role": "user", "content": user_content},
             ],
         }

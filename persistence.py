@@ -121,6 +121,7 @@ def _db_connect() -> sqlite3.Connection:
                 status             TEXT    NOT NULL DEFAULT 'active',
                 enabled            INTEGER NOT NULL DEFAULT 1,
                 linked_modules_json TEXT   NOT NULL DEFAULT '[]',
+                ai_access_mode     TEXT    NOT NULL DEFAULT 'all',
                 runtime_pid        INTEGER,
                 created_at         INTEGER NOT NULL,
                 updated_at         INTEGER NOT NULL
@@ -146,6 +147,12 @@ def _db_connect() -> sqlite3.Connection:
         # Migration: add owner_only column to existing tables
         try:
             conn.execute("ALTER TABLE guest_commands ADD COLUMN owner_only INTEGER NOT NULL DEFAULT 0")
+            conn.commit()
+        except Exception:
+            pass  # Column already exists
+        # Migration: add ai_access_mode for guest AI access policy
+        try:
+            conn.execute("ALTER TABLE guest_bots ADD COLUMN ai_access_mode TEXT NOT NULL DEFAULT 'all'")
             conn.commit()
         except Exception:
             pass  # Column already exists
@@ -988,6 +995,11 @@ def _guest_modules_to_json(modules: list[str] | None) -> str:
     return json.dumps(norm, ensure_ascii=False)
 
 
+def _normalize_ai_access_mode(value: str | None) -> str:
+    mode = str(value or "").strip().lower()
+    return "owner" if mode == "owner" else "all"
+
+
 def _guest_bot_row_to_dict(row: sqlite3.Row | tuple | None) -> dict | None:
     if not row:
         return None
@@ -1001,6 +1013,7 @@ def _guest_bot_row_to_dict(row: sqlite3.Row | tuple | None) -> dict | None:
         status,
         enabled,
         runtime_pid,
+        ai_access_mode,
         created_at,
         updated_at,
         linked_modules_json,
@@ -1015,6 +1028,7 @@ def _guest_bot_row_to_dict(row: sqlite3.Row | tuple | None) -> dict | None:
         "status": str(status or "active"),
         "enabled": bool(int(enabled or 0)),
         "runtime_pid": int(runtime_pid or 0),
+        "ai_access_mode": _normalize_ai_access_mode(ai_access_mode),
         "created_at": int(created_at or 0),
         "updated_at": int(updated_at or 0),
     }
@@ -1035,7 +1049,7 @@ def list_guest_bots(owner_user_id: int | None = None) -> list[dict]:
                 rows = conn.execute(
                     """
                     SELECT id, owner_user_id, bot_id, bot_username, bot_token, display_name,
-                           status, enabled, runtime_pid, created_at, updated_at, linked_modules_json
+                           status, enabled, runtime_pid, ai_access_mode, created_at, updated_at, linked_modules_json
                     FROM guest_bots
                     ORDER BY created_at DESC
                     """
@@ -1044,7 +1058,7 @@ def list_guest_bots(owner_user_id: int | None = None) -> list[dict]:
                 rows = conn.execute(
                     """
                     SELECT id, owner_user_id, bot_id, bot_username, bot_token, display_name,
-                           status, enabled, runtime_pid, created_at, updated_at, linked_modules_json
+                           status, enabled, runtime_pid, ai_access_mode, created_at, updated_at, linked_modules_json
                     FROM guest_bots
                     WHERE owner_user_id = ?
                     ORDER BY created_at DESC
@@ -1064,7 +1078,7 @@ def get_guest_bot_by_id(guest_bot_id: int) -> dict | None:
             row = conn.execute(
                 """
                 SELECT id, owner_user_id, bot_id, bot_username, bot_token, display_name,
-                       status, enabled, runtime_pid, created_at, updated_at, linked_modules_json
+                       status, enabled, runtime_pid, ai_access_mode, created_at, updated_at, linked_modules_json
                 FROM guest_bots
                 WHERE id = ?
                 """,
@@ -1086,7 +1100,7 @@ def get_guest_bot_by_username(bot_username: str) -> dict | None:
             row = conn.execute(
                 """
                 SELECT id, owner_user_id, bot_id, bot_username, bot_token, display_name,
-                       status, enabled, runtime_pid, created_at, updated_at, linked_modules_json
+                       status, enabled, runtime_pid, ai_access_mode, created_at, updated_at, linked_modules_json
                 FROM guest_bots
                 WHERE lower(bot_username) = ?
                 """,
@@ -1119,7 +1133,7 @@ def create_guest_bot(
             conflict = conn.execute(
                 """
                 SELECT id, owner_user_id, bot_id, bot_username, bot_token, display_name,
-                       status, enabled, runtime_pid, created_at, updated_at, linked_modules_json
+                       status, enabled, runtime_pid, ai_access_mode, created_at, updated_at, linked_modules_json
                 FROM guest_bots
                 WHERE bot_id = ? OR lower(bot_username) = ? OR bot_token = ?
                 LIMIT 1
@@ -1134,8 +1148,8 @@ def create_guest_bot(
                 """
                 INSERT INTO guest_bots(
                     owner_user_id, bot_id, bot_username, bot_token, display_name,
-                    status, enabled, linked_modules_json, runtime_pid, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'active', 1, ?, 0, ?, ?)
+                    status, enabled, linked_modules_json, ai_access_mode, runtime_pid, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'active', 1, ?, 'all', 0, ?, ?)
                 """,
                 (
                     int(owner_user_id),
