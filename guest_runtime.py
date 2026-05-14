@@ -660,8 +660,8 @@ def _rt_build_main_text(cmds: list[dict], ai_access_mode: str) -> str:
         f"Для вызова команды напишите /имя команды или @{_html.escape(_BOT_USERNAME)} имя команды.\n\n"
         f"<b>Количество команд:</b> <code>{count}</code>\n"
         f"<b>Режим ИИ:</b> <code>{_html.escape(ai_label)}</code>\n"
-        f"<b>Порог ИИ:</b> <code>{_AI_MIN_WORD_COUNT_DEFAULT}+</code> слов (обычные), "
-        f"<code>{_AI_MIN_WORD_COUNT_OWNER_DEV}+</code> слова (владелец/dev)"
+        f"<b>Порог ИИ:</b> <code>{_AI_MIN_WORD_COUNT_DEFAULT}+</code> слов (обычные пользователи), "
+        f"<code>{_AI_MIN_WORD_COUNT_OWNER_DEV}+</code> слова (владелец/разработчик)"
     )
 
 

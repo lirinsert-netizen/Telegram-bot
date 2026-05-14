@@ -451,6 +451,7 @@ def _search_wikipedia(
                 "list": "search",
                 "utf8": "1",
                 "format": "json",
+                # Per-provider cap; overall cap is enforced later across merged providers.
                 "srlimit": "5",
                 "srsearch": query,
             },
