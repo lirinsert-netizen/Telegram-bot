@@ -34,6 +34,9 @@ _MAX_SOURCE_SNIPPET_LEN = 420
 _MAX_SOURCE_CONTENT_LEN = 1400
 _MAX_RAW_HTML_LEN = 250000
 _MAX_HTML_SEARCH_TAIL_LEN = 1400
+_QUERY_MIN_MEANINGFUL_WORD_LEN = 3
+_SHORT_QUERY_WORD_LIMIT = 4
+_COMPACT_QUERY_WORD_LIMIT = 6
 _HTTP_USER_AGENT = (
     "Mozilla/5.0 (compatible; TelegramBotGuestAI/1.0; +https://telegram.org)"
 )
@@ -303,13 +306,13 @@ def _expand_query_variants(query: str) -> list[str]:
     cleaned = _normalize_space(cleaned)
     if cleaned and cleaned not in variants:
         variants.append(cleaned)
-    words = [part for part in cleaned.split(" ") if len(part) > 2]
-    if len(words) > 4:
-        short = _normalize_space(" ".join(words[:4]))
+    words = [part for part in cleaned.split(" ") if len(part) >= _QUERY_MIN_MEANINGFUL_WORD_LEN]
+    if len(words) > _SHORT_QUERY_WORD_LIMIT:
+        short = _normalize_space(" ".join(words[:_SHORT_QUERY_WORD_LIMIT]))
         if short and short not in variants:
             variants.append(short)
-    if len(words) > 6:
-        compact = _normalize_space(" ".join(words[:6]))
+    if len(words) > _COMPACT_QUERY_WORD_LIMIT:
+        compact = _normalize_space(" ".join(words[:_COMPACT_QUERY_WORD_LIMIT]))
         if compact and compact not in variants:
             variants.append(compact)
     return variants[:4]

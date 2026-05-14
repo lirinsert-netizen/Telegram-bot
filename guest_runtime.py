@@ -653,7 +653,7 @@ def _rt_get_guest_bot_id(conn: sqlite3.Connection, bot_username: str) -> int:
 
 def _rt_build_main_text(cmds: list[dict], ai_access_mode: str) -> str:
     count = len(cmds)
-    ai_label = "ИИ для владельца" if _normalize_ai_access_mode(ai_access_mode) == _AI_ACCESS_OWNER else "ИИ для всех"
+    ai_label = "ИИ для владельца" if ai_access_mode == _AI_ACCESS_OWNER else "ИИ для всех"
     return (
         f"{_E_LIST} <b>Команды</b>\n\n"
         f"Создайте пользовательские команды для бота @{_html.escape(_BOT_USERNAME)}. "
