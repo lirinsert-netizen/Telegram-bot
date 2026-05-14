@@ -660,7 +660,7 @@ def _rt_build_main_text(cmds: list[dict], ai_access_mode: str) -> str:
         f"Для вызова команды напишите /имя команды или @{_html.escape(_BOT_USERNAME)} имя команды.\n\n"
         f"<b>Количество команд:</b> <code>{count}</code>\n"
         f"<b>Режим ИИ:</b> <code>{_html.escape(ai_label)}</code>\n"
-        f"<b>Порог ИИ:</b> <code>{_AI_MIN_WORD_COUNT_DEFAULT}+</code> слов (обычные пользователи), "
+        f"<b>Порог ИИ:</b> <code>{_AI_MIN_WORD_COUNT_DEFAULT}+</code> слова (обычные пользователи), "
         f"<code>{_AI_MIN_WORD_COUNT_OWNER_DEV}+</code> слова (владелец/разработчик)"
     )
 
@@ -1578,10 +1578,11 @@ def _handle_guest_update(update_obj: dict) -> None:
         )
         if not _should_use_ai_fallback(text, min_words):
             return
-        owner_intent = _detect_owner_intent(text) if owner_user_id and sender_id == owner_user_id else None
+        is_owner_sender = bool(owner_user_id and sender_id == owner_user_id)
+        owner_intent = _detect_owner_intent(text) if is_owner_sender else None
         ai_response = _AI_SERVICE.generate_reply(
             text,
-            is_owner_sender=bool(owner_user_id and sender_id == owner_user_id),
+            is_owner_sender=is_owner_sender,
             owner_intent=owner_intent,
         )
         ai_text = ai_response or _AI_FALLBACK_TEXT
