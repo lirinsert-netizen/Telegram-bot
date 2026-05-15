@@ -41,8 +41,11 @@ _OWNER_DEBUG_MAX_LEN = 400
 _GUEST_QUERY_TEXT_MAX_LEN = 4000
 # InlineQueryResultArticle.title shown in the inline picker; keep it brief.
 _INLINE_ARTICLE_TITLE_MAX_LEN = 64
-_AI_MIN_WORD_COUNT = 5
+_AI_MIN_WORD_COUNT_DEFAULT = 4
+_AI_MIN_WORD_COUNT_OWNER_DEV = 2
 _AI_FALLBACK_TEXT = "⚠️ <b>ИИ временно недоступен.</b>\nПопробуйте чуть позже."
+_AI_ACCESS_ALL = "all"
+_AI_ACCESS_OWNER = "owner"
 _GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 _GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip() or "llama-3.1-8b-instant"
 _AI_SERVICE = GuestAIService(api_key=_GROQ_API_KEY, model=_GROQ_MODEL)
@@ -408,6 +411,75 @@ def _is_allowed_pm_user(user_id: int, conn: sqlite3.Connection) -> bool:
     return _is_dev_user(user_id)
 
 
+def _normalize_ai_access_mode(value: str) -> str:
+    mode = str(value or "").strip().lower()
+    return _AI_ACCESS_OWNER if mode == _AI_ACCESS_OWNER else _AI_ACCESS_ALL
+
+
+def _get_ai_access_mode(conn: sqlite3.Connection, bot_username: str) -> str:
+    row = conn.execute(
+        """
+        SELECT ai_access_mode
+        FROM guest_bots
+        WHERE lower(bot_username) = ?
+        LIMIT 1
+        """,
+        (bot_username.lower(),),
+    ).fetchone()
+    raw = row[0] if row else _AI_ACCESS_ALL
+    return _normalize_ai_access_mode(str(raw or ""))
+
+
+def _set_ai_access_mode(conn: sqlite3.Connection, bot_username: str, mode: str) -> bool:
+    ts = int(time.time())
+    norm_mode = _normalize_ai_access_mode(mode)
+    try:
+        conn.execute(
+            """
+            UPDATE guest_bots
+            SET ai_access_mode = ?, updated_at = ?
+            WHERE lower(bot_username) = ?
+            """,
+            (norm_mode, ts, bot_username.lower()),
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.warning("[GUEST RUNTIME] set ai_access_mode error: %s", e)
+        return False
+
+
+def _is_owner_or_dev_sender(sender_id: int, owner_user_id: int) -> bool:
+    if not sender_id:
+        return False
+    if owner_user_id and sender_id == owner_user_id:
+        return True
+    return _is_dev_user(sender_id)
+
+
+def _is_sender_allowed_for_ai(sender_id: int, owner_user_id: int, ai_access_mode: str) -> bool:
+    mode = _normalize_ai_access_mode(ai_access_mode)
+    if mode == _AI_ACCESS_ALL:
+        return True
+    return _is_owner_or_dev_sender(sender_id, owner_user_id)
+
+
+def _detect_owner_intent(text: str) -> str:
+    normalized = _normalize_space(text)
+    if not normalized:
+        return "question"
+    lowered = normalized.lower()
+    if "?" in normalized:
+        return "question"
+    question_starts = (
+        "кто", "что", "где", "когда", "почему", "зачем", "как", "какой", "какая", "какие",
+        "чей", "чья", "чьи", "можно", "нужно ли", "правда ли", "ли ",
+    )
+    if lowered.startswith(question_starts):
+        return "question"
+    return "command"
+
+
 # -------- PM command management state machine --------
 
 _RT_PENDING: dict[int, dict] = {}  # user_id -> state dict
@@ -579,21 +651,33 @@ def _rt_get_guest_bot_id(conn: sqlite3.Connection, bot_username: str) -> int:
 
 # ---- Main commands page (shown on /start) ----
 
-def _rt_build_main_text(cmds: list[dict]) -> str:
+def _rt_build_main_text(cmds: list[dict], ai_access_mode: str) -> str:
     count = len(cmds)
+    ai_label = "ИИ для владельца" if ai_access_mode == _AI_ACCESS_OWNER else "ИИ для всех"
     return (
         f"{_E_LIST} <b>Команды</b>\n\n"
         f"Создайте пользовательские команды для бота @{_html.escape(_BOT_USERNAME)}. "
         f"Для вызова команды напишите /имя команды или @{_html.escape(_BOT_USERNAME)} имя команды.\n\n"
-        f"<b>Количество команд:</b> <code>{count}</code>"
+        f"<b>Количество команд:</b> <code>{count}</code>\n"
+        f"<b>Режим ИИ:</b> <code>{_html.escape(ai_label)}</code>\n"
+        f"<b>Порог ИИ:</b> <code>{_AI_MIN_WORD_COUNT_DEFAULT}+</code> слова (обычные пользователи), "
+        f"<code>{_AI_MIN_WORD_COUNT_OWNER_DEV}+</code> слова (владелец/разработчик)"
     )
 
 
-def _rt_build_main_kb() -> dict:
+def _rt_build_main_kb(ai_access_mode: str) -> dict:
+    mode = _normalize_ai_access_mode(ai_access_mode)
+    if mode == _AI_ACCESS_OWNER:
+        btn_ai_all = _rt_btn("ИИ для всех", "gcmd:ai_all")
+        btn_ai_owner = _rt_btn("»ИИ для владельца«", "gcmd:ai_owner", style="primary")
+    else:
+        btn_ai_all = _rt_btn("»ИИ для всех«", "gcmd:ai_all", style="primary")
+        btn_ai_owner = _rt_btn("ИИ для владельца", "gcmd:ai_owner")
     return _rt_inline_kb(
         [_rt_btn("Список команд", "gcmd:list:0", icon_custom_emoji_id="5334882760735598374")],
         [_rt_btn("Добавить команду", "gcmd:add", icon_custom_emoji_id="5226945370684140473")],
         [_rt_btn("Удалить команду", "gcmd:del_list", icon_custom_emoji_id="5229113891081956317")],
+        [btn_ai_all, btn_ai_owner],
     )
 
 
@@ -680,7 +764,8 @@ def _rt_build_delete_prompt(cmds: list[dict]) -> str:
 
 def _rt_show_main(chat_id: int, conn: sqlite3.Connection) -> None:
     cmds = _rt_list_commands_for_bot(conn, _BOT_USERNAME)
-    _rt_send(chat_id, _rt_build_main_text(cmds), _rt_build_main_kb())
+    ai_access_mode = _get_ai_access_mode(conn, _BOT_USERNAME)
+    _rt_send(chat_id, _rt_build_main_text(cmds, ai_access_mode), _rt_build_main_kb(ai_access_mode))
 
 
 def _rt_upsert_command(conn: sqlite3.Connection, bot_username: str, name: str, text: str, owner_only: bool) -> bool:
@@ -758,7 +843,8 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
 
     def _go_main() -> None:
         cmds = _rt_list_commands_for_bot(conn, _BOT_USERNAME)
-        _rt_edit(chat_id, message_id, _rt_build_main_text(cmds), _rt_build_main_kb())
+        ai_access_mode = _get_ai_access_mode(conn, _BOT_USERNAME)
+        _rt_edit(chat_id, message_id, _rt_build_main_text(cmds, ai_access_mode), _rt_build_main_kb(ai_access_mode))
 
     def _go_list(page: int = 0) -> None:
         cmds = _rt_list_commands_for_bot(conn, _BOT_USERNAME)
@@ -768,6 +854,18 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
     if data == "gcmd:main":
         _go_main()
         _rt_answer_cq(query_id)
+        return
+
+    if data == "gcmd:ai_all":
+        ok = _set_ai_access_mode(conn, _BOT_USERNAME, _AI_ACCESS_ALL)
+        _go_main()
+        _rt_answer_cq(query_id, "Режим ИИ: для всех." if ok else "Не удалось изменить режим ИИ.", show_alert=not ok)
+        return
+
+    if data == "gcmd:ai_owner":
+        ok = _set_ai_access_mode(conn, _BOT_USERNAME, _AI_ACCESS_OWNER)
+        _go_main()
+        _rt_answer_cq(query_id, "Режим ИИ: для владельца." if ok else "Не удалось изменить режим ИИ.", show_alert=not ok)
         return
 
     # ---- list page ----
@@ -1152,7 +1250,7 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
             _rt_send(
                 chat_id,
                 f"{_E_OK} <b>Команда <code>{_html.escape(cmd_name_display)}</code> удалена.</b>",
-                _rt_build_main_kb(),
+                _rt_build_main_kb(_get_ai_access_mode(conn, _BOT_USERNAME)),
             )
         else:
             _rt_replace_pending_ui(
@@ -1313,8 +1411,8 @@ def _count_words(text: str) -> int:
     return sum(1 for part in re.split(r"\s+", (text or "").strip()) if part)
 
 
-def _should_use_ai_fallback(text: str) -> bool:
-    return _count_words(text) >= _AI_MIN_WORD_COUNT
+def _should_use_ai_fallback(text: str, min_words: int) -> bool:
+    return _count_words(text) >= max(1, int(min_words or 1))
 
 
 def _build_inline_article_result(text: str, parse_mode: str | None = None) -> str:
@@ -1469,24 +1567,36 @@ def _handle_guest_update(update_obj: dict) -> None:
                 if not _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "failed to deliver response", text):
                     logger.warning("[GUEST RUNTIME] failed to notify owner about delivery failure cmd=%s", cmd_key)
             return
-        if _should_use_ai_fallback(text):
-            owner_user_id = _get_owner_user_id(conn, _BOT_USERNAME)
-            ai_response = _AI_SERVICE.generate_reply(
-                text,
-                is_owner_sender=bool(owner_user_id and sender_id == owner_user_id),
+        owner_user_id = _get_owner_user_id(conn, _BOT_USERNAME)
+        ai_access_mode = _get_ai_access_mode(conn, _BOT_USERNAME)
+        if not _is_sender_allowed_for_ai(sender_id, owner_user_id, ai_access_mode):
+            return
+        min_words = (
+            _AI_MIN_WORD_COUNT_OWNER_DEV
+            if _is_owner_or_dev_sender(sender_id, owner_user_id)
+            else _AI_MIN_WORD_COUNT_DEFAULT
+        )
+        if not _should_use_ai_fallback(text, min_words):
+            return
+        is_owner_sender = bool(owner_user_id and sender_id == owner_user_id)
+        owner_intent = _detect_owner_intent(text) if is_owner_sender else None
+        ai_response = _AI_SERVICE.generate_reply(
+            text,
+            is_owner_sender=is_owner_sender,
+            owner_intent=owner_intent,
+        )
+        ai_text = ai_response or _AI_FALLBACK_TEXT
+        if guest_query_id:
+            sent = _answer_guest_query(guest_query_id, ai_text)
+        if not sent and chat_id:
+            sent = _send_message_response(
+                chat_id=chat_id,
+                response_text=ai_text,
+                reply_to_message_id=reply_to_message_id,
+                message_thread_id=message_thread_id,
             )
-            ai_text = ai_response or _AI_FALLBACK_TEXT
-            if guest_query_id:
-                sent = _answer_guest_query(guest_query_id, ai_text)
-            if not sent and chat_id:
-                sent = _send_message_response(
-                    chat_id=chat_id,
-                    response_text=ai_text,
-                    reply_to_message_id=reply_to_message_id,
-                    message_thread_id=message_thread_id,
-                )
-            if sent:
-                return
+        if sent:
+            return
         if cmd_key:
             if not _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "command not found or module disabled", text):
                 logger.warning("[GUEST RUNTIME] failed to notify owner about unresolved cmd=%s", cmd_key)

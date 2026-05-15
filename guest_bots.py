@@ -499,7 +499,7 @@ def on_guest_pending_input(m: types.Message):
             bot_username=str(getattr(me, "username", "") or "").lower(),
             bot_token=token,
             display_name=str(getattr(me, "first_name", "") or getattr(me, "username", "") or ""),
-            linked_modules=["commands"],
+            linked_modules=["commands", "ai"],
         )
         if not created:
             err_text = _html.escape(str(err or "Ошибка"))
