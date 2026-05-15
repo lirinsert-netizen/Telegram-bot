@@ -49,6 +49,7 @@ _AI_ACCESS_OWNER = "owner"
 _GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 _GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip() or "llama-3.1-8b-instant"
 _AI_SERVICE = GuestAIService(api_key=_GROQ_API_KEY, model=_GROQ_MODEL)
+_MAX_NESTED_EXTRACTION_DEPTH = 4
 
 
 class _GuestQueryHTMLStripper(HTMLParser):
@@ -364,7 +365,7 @@ def _send_message_response(
 
 
 def _get_owner_user_id(conn: sqlite3.Connection, bot_username: str) -> int:
-    uname = str(bot_username or "").strip().lstrip("@").lower()
+    uname = _normalize_bot_username(bot_username)
     if not uname:
         return 0
     row = conn.execute(
@@ -419,10 +420,14 @@ def _normalize_ai_access_mode(value: str) -> str:
     return _AI_ACCESS_OWNER if mode == _AI_ACCESS_OWNER else _AI_ACCESS_ALL
 
 
+def _normalize_bot_username(value: str) -> str:
+    return str(value or "").strip().lstrip("@").lower()
+
+
 def _get_ai_access_mode(conn: sqlite3.Connection, bot_username: str) -> str:
-    uname = str(bot_username or "").strip().lstrip("@").lower()
+    uname = _normalize_bot_username(bot_username)
     if not uname:
-        return _AI_ACCESS_ALL
+        return _AI_ACCESS_OWNER
     row = conn.execute(
         """
         SELECT ai_access_mode
@@ -439,7 +444,7 @@ def _get_ai_access_mode(conn: sqlite3.Connection, bot_username: str) -> str:
 def _set_ai_access_mode(conn: sqlite3.Connection, bot_username: str, mode: str) -> bool:
     ts = int(time.time())
     norm_mode = _normalize_ai_access_mode(mode)
-    uname = str(bot_username or "").strip().lstrip("@").lower()
+    uname = _normalize_bot_username(bot_username)
     if not uname:
         return False
     try:
@@ -451,7 +456,7 @@ def _set_ai_access_mode(conn: sqlite3.Connection, bot_username: str, mode: str) 
             """,
             (norm_mode, ts, uname),
         )
-        if int(cur.rowcount or 0) <= 0:
+        if int(cur.rowcount or 0) == 0:
             return False
         conn.commit()
         return True
@@ -1362,7 +1367,7 @@ def _extract_guest_query_id(payload_obj: dict, update_obj: dict | None = None) -
                     return text
         return ""
 
-    direct_id = _candidate_id(payload_obj, allow_fallback_id=True)
+    direct_id = _candidate_id(payload_obj, allow_fallback_id=False)
     if direct_id:
         return direct_id
 
@@ -1383,7 +1388,15 @@ def _extract_guest_query_id(payload_obj: dict, update_obj: dict | None = None) -
 
 
 def _extract_sender_id(payload_obj: dict, update_obj: dict | None = None, _depth: int = 0) -> int:
-    if _depth > 4 or not isinstance(payload_obj, dict):
+    """Extract sender user ID from guest update payloads.
+
+    Supports legacy/new payload shapes and nested objects.
+    Uses bounded recursion via _depth to avoid infinite loops.
+    """
+    if _depth > _MAX_NESTED_EXTRACTION_DEPTH:
+        logger.debug("[GUEST RUNTIME] sender extraction depth exceeded")
+        return 0
+    if not isinstance(payload_obj, dict):
         return 0
 
     def _extract_user_id(candidate: object) -> int:
@@ -1443,7 +1456,10 @@ def _extract_message_text(
 
     Handles both guest_message and guest_query shapes and nested message objects.
     """
-    if _depth > 4:
+    if _depth > _MAX_NESTED_EXTRACTION_DEPTH:
+        logger.debug("[GUEST RUNTIME] message text extraction depth exceeded")
+        return ""
+    if not isinstance(payload_obj, dict):
         return ""
     text = payload_obj.get("text")
     if isinstance(text, str) and text.strip():
