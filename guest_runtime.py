@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import html as _html
 import logging
 import os
@@ -94,7 +95,7 @@ def _convert_custom_emoji_markup_to_telegram_html(text: str) -> str:
     if not raw:
         return ""
     return re.sub(
-        r"<emoji\s+id=['\"](\d+)['\"]\s*>(.*?)</>",
+        r"<emoji\s+id=['\"](\d+)['\"]\s*>(.*?)</(?:emoji)?\s*>",
         lambda m: f'<tg-emoji emoji-id="{m.group(1)}">{m.group(2)}</tg-emoji>',
         raw,
         flags=re.I | re.S,
@@ -131,8 +132,9 @@ def _db_connect() -> sqlite3.Connection:
     try:
         conn.execute("ALTER TABLE guest_bots ADD COLUMN ai_access_mode TEXT NOT NULL DEFAULT 'all'")
         conn.commit()
-    except Exception:
-        pass
+    except Exception as e:
+        if "duplicate column name" not in str(e).lower():
+            logger.warning("[GUEST RUNTIME] migration ai_access_mode failed: %s", e)
     return conn
 
 
@@ -2435,7 +2437,8 @@ def _should_use_ai_fallback(text: str, min_words: int) -> bool:
 
 
 def _build_inline_result_id(seed: str) -> str:
-    return f"{abs(hash(str(seed or '')[:256])) % 0xFFFFFF:06x}"
+    raw = str(seed or "")[:512].encode("utf-8", errors="ignore")
+    return hashlib.sha256(raw).hexdigest()[:6]
 
 
 def _build_inline_article_result(text: str, parse_mode: str | None = None, reply_markup: dict | None = None) -> dict:
@@ -2527,8 +2530,9 @@ def _answer_guest_query(
             )
             if media_result:
                 attempts.append(media_result)
-    article_html = html_response_text or _placeholder_text_for_buttons(reply_markup)
-    article_plain = clean_response_text or _placeholder_text_for_buttons(reply_markup)
+    placeholder_text = _placeholder_text_for_buttons(reply_markup)
+    article_html = html_response_text or placeholder_text
+    article_plain = clean_response_text or placeholder_text
     for text, parse_mode in ((article_html, "HTML"), (article_plain, None)):
         if text:
             attempts.append(_build_inline_article_result(text, parse_mode, reply_markup=reply_markup))
