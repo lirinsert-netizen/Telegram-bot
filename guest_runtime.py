@@ -710,7 +710,14 @@ def _poll_guest_updates(offset: int | None) -> list[dict]:
     return [item for item in result if isinstance(item, dict)]
 
 
-def _extract_chat_context(payload_obj: dict, update_obj: dict | None = None) -> tuple[int, int | None, int | None]:
+def _extract_chat_context(
+    payload_obj: dict,
+    update_obj: dict | None = None,
+    _depth: int = 0,
+) -> tuple[int, int | None, int | None]:
+    if _depth > _MAX_NESTED_EXTRACTION_DEPTH:
+        logger.debug("[GUEST RUNTIME] chat context extraction depth exceeded")
+        return 0, None, None
     chat_id = 0
     message_thread_id: int | None = None
     reply_to_message_id: int | None = None
@@ -734,9 +741,15 @@ def _extract_chat_context(payload_obj: dict, update_obj: dict | None = None) -> 
     except Exception:
         reply_to_message_id = None
 
-    message = payload_obj.get("message")
-    if isinstance(message, dict):
-        nested_chat_id, nested_thread_id, nested_reply_to = _extract_chat_context(message, None)
+    for nested_key in ("message", "guest_message", "guest_query", "inline_query"):
+        nested_payload = payload_obj.get(nested_key)
+        if not isinstance(nested_payload, dict):
+            continue
+        nested_chat_id, nested_thread_id, nested_reply_to = _extract_chat_context(
+            nested_payload,
+            None,
+            _depth + 1,
+        )
         if not chat_id:
             chat_id = nested_chat_id
         if message_thread_id is None:
@@ -745,10 +758,14 @@ def _extract_chat_context(payload_obj: dict, update_obj: dict | None = None) -> 
             reply_to_message_id = nested_reply_to
 
     if not chat_id and isinstance(update_obj, dict):
-        for key in ("message", "edited_message", "channel_post", "edited_channel_post", "guest_message"):
+        for key in ("message", "edited_message", "channel_post", "edited_channel_post", "guest_message", "guest_query", "inline_query"):
             upd_payload = update_obj.get(key)
             if isinstance(upd_payload, dict):
-                nested_chat_id, nested_thread_id, nested_reply_to = _extract_chat_context(upd_payload, None)
+                nested_chat_id, nested_thread_id, nested_reply_to = _extract_chat_context(
+                    upd_payload,
+                    None,
+                    _depth + 1,
+                )
                 if nested_chat_id:
                     chat_id = nested_chat_id
                     if message_thread_id is None:
