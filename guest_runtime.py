@@ -33,6 +33,7 @@ if not TOKEN:
     raise RuntimeError("BOT_TOKEN is required for guest runtime")
 
 _BOT_USERNAME = ""
+_BOT_DISPLAY_NAME = ""
 
 _CMD_MAX_NAME_LEN = 30
 _CMD_STRIP_CHARS = "`'\"«»()[]{}<>.,;:!?"
@@ -135,6 +136,45 @@ def _db_connect() -> sqlite3.Connection:
     except Exception as e:
         if "duplicate column name" not in str(e).lower():
             logger.warning("[GUEST RUNTIME] migration ai_access_mode failed: %s", e)
+    # Migration: add user_id and rebuild UNIQUE constraint to (guest_bot_id, user_id, name)
+    try:
+        cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(guest_commands)").fetchall()}
+        if "user_id" not in cols:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS _guest_commands_v2 (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guest_bot_id   INTEGER NOT NULL,
+                    user_id        INTEGER NOT NULL DEFAULT 0,
+                    name           TEXT    NOT NULL,
+                    response_text  TEXT    NOT NULL DEFAULT '',
+                    media_items    TEXT    NOT NULL DEFAULT '[]',
+                    buttons_json   TEXT    NOT NULL DEFAULT '{"rows":[],"popups":[]}',
+                    enabled        INTEGER NOT NULL DEFAULT 1,
+                    owner_only     INTEGER NOT NULL DEFAULT 0,
+                    created_at     INTEGER NOT NULL,
+                    updated_at     INTEGER NOT NULL,
+                    UNIQUE(guest_bot_id, user_id, name),
+                    FOREIGN KEY(guest_bot_id) REFERENCES guest_bots(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO _guest_commands_v2
+                SELECT id, guest_bot_id, 0, name, response_text, media_items, buttons_json,
+                       enabled, owner_only, created_at, updated_at
+                FROM guest_commands
+                """
+            )
+            conn.execute("DROP TABLE guest_commands")
+            conn.execute("ALTER TABLE _guest_commands_v2 RENAME TO guest_commands")
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.commit()
+            logger.info("[GUEST RUNTIME] Migrated guest_commands to per-user schema")
+    except Exception as e:
+        logger.warning("[GUEST RUNTIME] migration user_id failed: %s", e)
     return conn
 
 
@@ -640,16 +680,17 @@ def _bot_is_enabled(conn: sqlite3.Connection, bot_username: str) -> bool:
 def _resolve_guest_response(conn: sqlite3.Connection, bot_username: str, cmd_key: str, sender_id: int = 0) -> dict | None:
     row = conn.execute(
         """
-        SELECT gc.response_text, gc.media_items, gc.buttons_json, gb.linked_modules_json, gc.owner_only, gb.owner_user_id
+        SELECT gc.response_text, gc.media_items, gc.buttons_json, gb.linked_modules_json
         FROM guest_bots gb
         JOIN guest_commands gc ON gc.guest_bot_id = gb.id
         WHERE lower(gb.bot_username) = ?
           AND gb.enabled = 1
           AND gc.enabled = 1
           AND gc.name = ?
+          AND gc.user_id = ?
         LIMIT 1
         """,
-        (bot_username.lower(), cmd_key.lower()),
+        (bot_username.lower(), cmd_key.lower(), int(sender_id)),
     ).fetchone()
     if not row:
         return None
@@ -658,10 +699,6 @@ def _resolve_guest_response(conn: sqlite3.Connection, bot_username: str, cmd_key
     except Exception:
         modules = []
     if not isinstance(modules, list) or "commands" not in [str(m).lower() for m in modules]:
-        return None
-    owner_only = bool(int(row[4] or 0))
-    owner_user_id = int(row[5] or 0)
-    if owner_only and sender_id and sender_id != owner_user_id and not _is_dev_user(sender_id):
         return None
     text = str(row[0] or "").strip()
     media = _load_guest_media_payload(row[1] or "[]")
@@ -673,7 +710,6 @@ def _resolve_guest_response(conn: sqlite3.Connection, bot_username: str, cmd_key
         "text": text,
         "media": media,
         "buttons": buttons,
-        "owner_only": owner_only,
     }
 
 
@@ -692,14 +728,22 @@ def _api_request(method: str, params: dict | None = None, timeout: tuple[float, 
     return None
 
 
-def _get_bot_username() -> str:
+def _get_bot_info() -> tuple[str, str]:
+    """Return (username, display_name) for this bot."""
     data = _api_request("getMe", timeout=(10.0, 20.0))
     if not isinstance(data, dict) or not data.get("ok"):
-        return ""
+        return "", ""
     result = data.get("result") or {}
     if not isinstance(result, dict):
-        return ""
-    return str(result.get("username") or "").strip().lower()
+        return "", ""
+    username = str(result.get("username") or "").strip().lower()
+    display_name = str(result.get("first_name") or result.get("username") or "").strip()
+    return username, display_name
+
+
+def _get_bot_username() -> str:
+    username, _ = _get_bot_info()
+    return username
 
 
 def _poll_guest_updates(offset: int | None) -> list[dict]:
@@ -1073,11 +1117,8 @@ def _is_dev_user(user_id: int) -> bool:
 
 
 def _is_allowed_pm_user(user_id: int, conn: sqlite3.Connection) -> bool:
-    """Return True if user_id is the owner of this bot or a dev user."""
-    owner_id = _get_owner_user_id(conn, _BOT_USERNAME)
-    if owner_id and user_id == owner_id:
-        return True
-    return _is_dev_user(user_id)
+    """All users can access the personal command management interface."""
+    return bool(user_id)
 
 
 def _normalize_ai_access_mode(value: str) -> str:
@@ -1291,9 +1332,13 @@ _E_OFF      = '<tg-emoji emoji-id="5465665476971471368">❌</tg-emoji>'
 _E_TEXT     = _E_LIST
 _E_SETTINGS = '<tg-emoji emoji-id="5341715473882955310">⚙️</tg-emoji>'
 
+# Emoji IDs for draft keyboard buttons (mirror EMOJI_WELCOME_MEDIA_ID / EMOJI_WELCOME_BUTTONS_ID from config)
+_EMOJI_DRAFT_MEDIA_ID   = "5431783411981228752"
+_EMOJI_DRAFT_BUTTONS_ID = "5363850326577259091"
 
-def _rt_list_commands_for_bot(conn: sqlite3.Connection, bot_username: str) -> list[dict]:
-    """List all commands for this bot from DB."""
+
+def _rt_list_commands_for_bot(conn: sqlite3.Connection, bot_username: str, user_id: int = 0) -> list[dict]:
+    """List commands for this bot scoped to the given user_id."""
     try:
         row = conn.execute(
             "SELECT id FROM guest_bots WHERE lower(bot_username) = ? LIMIT 1",
@@ -1306,10 +1351,10 @@ def _rt_list_commands_for_bot(conn: sqlite3.Connection, bot_username: str) -> li
             """
             SELECT id, name, response_text, media_items, buttons_json, enabled, owner_only
             FROM guest_commands
-            WHERE guest_bot_id = ?
+            WHERE guest_bot_id = ? AND user_id = ?
             ORDER BY name ASC
             """,
-            (guest_bot_id,),
+            (guest_bot_id, int(user_id)),
         ).fetchall()
         return [
                 {
@@ -1341,35 +1386,45 @@ def _rt_get_guest_bot_id(conn: sqlite3.Connection, bot_username: str) -> int:
 
 # ---- Main commands page (shown on /start) ----
 
-def _rt_build_main_text(cmds: list[dict], ai_access_mode: str) -> str:
+def _rt_build_main_text(cmds: list[dict], sender: dict | None = None) -> str:
     count = len(cmds)
-    ai_label = "ИИ для владельца" if ai_access_mode == _AI_ACCESS_OWNER else "ИИ для всех"
+    sender = sender or {}
+    sender_id = int(sender.get("id") or 0)
+    first_name = str(sender.get("first_name") or "")
+    last_name = str(sender.get("last_name") or "")
+    username = str(sender.get("username") or "")
+    display = (first_name + (" " + last_name if last_name else "")).strip() or username or str(sender_id)
+    if sender_id:
+        mention = f'<a href="tg://user?id={sender_id}">{_html.escape(display)}</a>'
+    else:
+        mention = _html.escape(display)
+    bot_uname = _html.escape(_BOT_USERNAME)
+    bot_display = _html.escape(_BOT_DISPLAY_NAME or _BOT_USERNAME)
+    bot_link = f'<a href="https://t.me/{bot_uname}">{bot_display}</a>'
     return (
-        f"{_E_LIST} <b>Команды</b>\n\n"
-        f"Создайте пользовательские команды для бота @{_html.escape(_BOT_USERNAME)}. "
-        f"Для вызова команды напишите /имя команды или @{_html.escape(_BOT_USERNAME)} имя команды. "
-        "Команды поддерживают текст, медиа и кнопки.\n\n"
-        f"<b>Количество команд:</b> <code>{count}</code>\n"
-        f"<b>Режим ИИ:</b> <code>{_html.escape(ai_label)}</code>\n"
-        f"<b>Порог ИИ:</b> <code>{_AI_MIN_WORD_COUNT_DEFAULT}+</code> слова (обычные пользователи), "
-        f"<code>{_AI_MIN_WORD_COUNT_OWNER_DEV}+</code> слова (владелец/разработчик)"
+        f"<b>Привет, {mention}!</b>\n\n"
+        f"Я {bot_link} — бот для создания персональных команд, которые будут работать "
+        f"в гостевом режиме в группе, где меня даже нет.\n\n"
+        f"<b>Количество команд:</b> <code>{count}</code>"
     )
 
 
-def _rt_build_main_kb(ai_access_mode: str) -> dict:
+def _rt_build_main_kb(ai_access_mode: str, show_ai: bool = False) -> dict:
     mode = _normalize_ai_access_mode(ai_access_mode)
-    if mode == _AI_ACCESS_OWNER:
-        btn_ai_all = _rt_btn("ИИ для всех", "gcmd:ai_all")
-        btn_ai_owner = _rt_btn("»ИИ для владельца«", "gcmd:ai_owner", style="primary")
-    else:
-        btn_ai_all = _rt_btn("»ИИ для всех«", "gcmd:ai_all", style="primary")
-        btn_ai_owner = _rt_btn("ИИ для владельца", "gcmd:ai_owner")
-    return _rt_inline_kb(
+    rows: list[list[dict]] = [
         [_rt_btn("Список команд", "gcmd:list:0", icon_custom_emoji_id="5334882760735598374")],
         [_rt_btn("Добавить команду", "gcmd:add", icon_custom_emoji_id="5226945370684140473")],
         [_rt_btn("Удалить команду", "gcmd:del_list", icon_custom_emoji_id="5229113891081956317")],
-        [btn_ai_all, btn_ai_owner],
-    )
+    ]
+    if show_ai:
+        if mode == _AI_ACCESS_OWNER:
+            btn_ai_all = _rt_btn("ИИ для всех", "gcmd:ai_all")
+            btn_ai_owner = _rt_btn("»ИИ для владельца«", "gcmd:ai_owner", style="primary")
+        else:
+            btn_ai_all = _rt_btn("»ИИ для всех«", "gcmd:ai_all", style="primary")
+            btn_ai_owner = _rt_btn("ИИ для владельца", "gcmd:ai_owner")
+        rows.append([btn_ai_all, btn_ai_owner])
+    return _rt_inline_kb(*rows)
 
 
 # ---- List page (paginated) ----
@@ -1385,8 +1440,7 @@ def _rt_build_list_text(cmds: list[dict], page: int = 0) -> str:
     header = f"{_E_SETTINGS} <b>Список команд ({page + 1}/{total_pages})</b>\n"
     lines = [header]
     for i, cmd in enumerate(chunk, start=start + 1):
-        access_label = "Для владельца" if cmd["owner_only"] else "Все пользователи"
-        lines.append(f"{i}. <code>{_html.escape(cmd['name'])}</code> — {_html.escape(access_label)}")
+        lines.append(f"{i}. <code>{_html.escape(cmd['name'])}</code>")
     return "\n".join(lines)
 
 
@@ -1413,36 +1467,25 @@ def _rt_build_draft_text(draft: dict) -> str:
     has_text = "есть" if draft.get("text") else "нет"
     has_media = "есть" if draft.get("media") else "нет"
     has_buttons = "есть" if (draft.get("buttons") or {}).get("rows") else "нет"
-    owner_only = bool(draft.get("owner_only"))
-    access_label = "Для владельца" if owner_only else "Все пользователи"
     name_str = f"<code>{name}</code>" if name else "<i>не задано</i>"
     return (
         f"{_E_ADD} <b>Новая команда</b>\n\n"
         f"<b>Имя:</b> {name_str}\n"
         f"<b>Текст:</b> <code>{has_text}</code>\n"
         f"<b>Медиа:</b> <code>{has_media}</code>\n"
-        f"<b>Кнопки:</b> <code>{has_buttons}</code>\n"
-        f"<b>Доступ:</b> {access_label}"
+        f"<b>Кнопки:</b> <code>{has_buttons}</code>"
     )
 
 
 def _rt_build_draft_kb(draft: dict) -> dict:
-    owner_only = bool(draft.get("owner_only"))
     btn_text = _rt_btn("Текст", "gcmd:draft_text", icon_custom_emoji_id="5334882760735598374")
-    btn_media = _rt_btn("Медиа", "gcmd:draft_media", icon_custom_emoji_id="5431449001532594346")
-    btn_buttons = _rt_btn("Кнопки", "gcmd:draft_buttons", icon_custom_emoji_id="5395463497783983254")
-    if owner_only:
-        btn_owner = _rt_btn("»Для владельца«", "gcmd:draft_owner", style="primary")
-        btn_all = _rt_btn("Все пользователи", "gcmd:draft_all")
-    else:
-        btn_owner = _rt_btn("Для владельца", "gcmd:draft_owner")
-        btn_all = _rt_btn("»Все пользователи«", "gcmd:draft_all", style="primary")
+    btn_media = _rt_btn("Медиа", "gcmd:draft_media", icon_custom_emoji_id=_EMOJI_DRAFT_MEDIA_ID)
+    btn_buttons = _rt_btn("Кнопки", "gcmd:draft_buttons", icon_custom_emoji_id=_EMOJI_DRAFT_BUTTONS_ID)
     btn_discard = _rt_btn("Удалить", "gcmd:draft_cancel", style="danger")
     btn_save = _rt_btn("Сохранить", "gcmd:draft_save", style="success")
     return _rt_inline_kb(
         [btn_text, btn_media],
         [btn_buttons],
-        [btn_owner, btn_all],
         [btn_discard, btn_save],
         [_rt_btn("Назад", "gcmd:main", style="primary")],
     )
@@ -1460,10 +1503,12 @@ def _rt_build_delete_prompt(cmds: list[dict]) -> str:
     )
 
 
-def _rt_show_main(chat_id: int, conn: sqlite3.Connection) -> None:
-    cmds = _rt_list_commands_for_bot(conn, _BOT_USERNAME)
+def _rt_show_main(chat_id: int, conn: sqlite3.Connection, sender_id: int = 0, sender: dict | None = None) -> None:
+    cmds = _rt_list_commands_for_bot(conn, _BOT_USERNAME, user_id=sender_id)
     ai_access_mode = _get_ai_access_mode(conn, _BOT_USERNAME)
-    _rt_send(chat_id, _rt_build_main_text(cmds, ai_access_mode), _rt_build_main_kb(ai_access_mode))
+    owner_user_id = _get_owner_user_id(conn, _BOT_USERNAME)
+    show_ai = _is_owner_or_dev_sender(sender_id, owner_user_id)
+    _rt_send(chat_id, _rt_build_main_text(cmds, sender=sender), _rt_build_main_kb(ai_access_mode, show_ai=show_ai))
 
 
 def _rt_upsert_command(
@@ -1471,30 +1516,31 @@ def _rt_upsert_command(
     bot_username: str,
     name: str,
     text: str,
-    owner_only: bool,
     media: list[dict] | None = None,
     buttons: dict | None = None,
+    user_id: int = 0,
 ) -> bool:
     try:
         guest_bot_id = _rt_get_guest_bot_id(conn, bot_username)
         if not guest_bot_id:
             return False
         ts = int(time.time())
+        uid = int(user_id)
         media_json = json.dumps(_load_guest_media_payload(media or []), ensure_ascii=False)
         buttons_json = json.dumps(_normalize_guest_buttons_payload(buttons or {}), ensure_ascii=False)
         conn.execute(
             """
-            INSERT INTO guest_commands(guest_bot_id, name, response_text, media_items, buttons_json, enabled, owner_only, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
-            ON CONFLICT(guest_bot_id, name) DO UPDATE SET
+            INSERT INTO guest_commands(guest_bot_id, user_id, name, response_text, media_items, buttons_json, enabled, owner_only, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+            ON CONFLICT(guest_bot_id, user_id, name) DO UPDATE SET
                 response_text = excluded.response_text,
                 media_items = excluded.media_items,
                 buttons_json = excluded.buttons_json,
                 enabled = 1,
-                owner_only = excluded.owner_only,
+                owner_only = 0,
                 updated_at = excluded.updated_at
             """,
-            (guest_bot_id, name.strip().lower(), text, media_json, buttons_json, 1 if owner_only else 0, ts, ts),
+            (guest_bot_id, uid, name.strip().lower(), text, media_json, buttons_json, ts, ts),
         )
         conn.commit()
         return True
@@ -1503,14 +1549,14 @@ def _rt_upsert_command(
         return False
 
 
-def _rt_delete_command(conn: sqlite3.Connection, bot_username: str, name: str) -> bool:
+def _rt_delete_command(conn: sqlite3.Connection, bot_username: str, name: str, user_id: int = 0) -> bool:
     try:
         guest_bot_id = _rt_get_guest_bot_id(conn, bot_username)
         if not guest_bot_id:
             return False
         conn.execute(
-            "DELETE FROM guest_commands WHERE guest_bot_id = ? AND name = ?",
-            (guest_bot_id, name.strip().lower()),
+            "DELETE FROM guest_commands WHERE guest_bot_id = ? AND user_id = ? AND name = ?",
+            (guest_bot_id, int(user_id), name.strip().lower()),
         )
         conn.commit()
         return True
@@ -1519,22 +1565,22 @@ def _rt_delete_command(conn: sqlite3.Connection, bot_username: str, name: str) -
         return False
 
 
-def _rt_toggle_command(conn: sqlite3.Connection, bot_username: str, name: str) -> bool:
+def _rt_toggle_command(conn: sqlite3.Connection, bot_username: str, name: str, user_id: int = 0) -> bool:
     try:
         guest_bot_id = _rt_get_guest_bot_id(conn, bot_username)
         if not guest_bot_id:
             return False
         row = conn.execute(
-            "SELECT enabled FROM guest_commands WHERE guest_bot_id = ? AND name = ?",
-            (guest_bot_id, name.strip().lower()),
+            "SELECT enabled FROM guest_commands WHERE guest_bot_id = ? AND user_id = ? AND name = ?",
+            (guest_bot_id, int(user_id), name.strip().lower()),
         ).fetchone()
         if not row:
             return False
         new_enabled = 0 if int(row[0] or 0) else 1
         ts = int(time.time())
         conn.execute(
-            "UPDATE guest_commands SET enabled = ?, updated_at = ? WHERE guest_bot_id = ? AND name = ?",
-            (new_enabled, ts, guest_bot_id, name.strip().lower()),
+            "UPDATE guest_commands SET enabled = ?, updated_at = ? WHERE guest_bot_id = ? AND user_id = ? AND name = ?",
+            (new_enabled, ts, guest_bot_id, int(user_id), name.strip().lower()),
         )
         conn.commit()
         return True
@@ -1544,20 +1590,23 @@ def _rt_toggle_command(conn: sqlite3.Connection, bot_username: str, name: str) -
 
 
 def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> None:
-    """Handle inline keyboard callback from owner/dev in PM."""
+    """Handle inline keyboard callback from any user in PM."""
     query_id = str(cq.get("id") or "")
     data = str(cq.get("data") or "")
     msg = cq.get("message") or {}
     chat_id = int((msg.get("chat") or {}).get("id") or 0)
     message_id = int(msg.get("message_id") or 0)
+    sender = cq.get("from") or {}
 
     def _go_main() -> None:
-        cmds = _rt_list_commands_for_bot(conn, _BOT_USERNAME)
+        cmds = _rt_list_commands_for_bot(conn, _BOT_USERNAME, user_id=sender_id)
         ai_access_mode = _get_ai_access_mode(conn, _BOT_USERNAME)
-        _rt_edit(chat_id, message_id, _rt_build_main_text(cmds, ai_access_mode), _rt_build_main_kb(ai_access_mode))
+        owner_user_id = _get_owner_user_id(conn, _BOT_USERNAME)
+        show_ai = _is_owner_or_dev_sender(sender_id, owner_user_id)
+        _rt_edit(chat_id, message_id, _rt_build_main_text(cmds, sender=sender), _rt_build_main_kb(ai_access_mode, show_ai=show_ai))
 
     def _go_list(page: int = 0) -> None:
-        cmds = _rt_list_commands_for_bot(conn, _BOT_USERNAME)
+        cmds = _rt_list_commands_for_bot(conn, _BOT_USERNAME, user_id=sender_id)
         _rt_edit(chat_id, message_id, _rt_build_list_text(cmds, page), _rt_build_list_kb(cmds, page))
 
     # ---- main page ----
@@ -1567,6 +1616,10 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
         return
 
     if data == "gcmd:ai_all":
+        owner_user_id = _get_owner_user_id(conn, _BOT_USERNAME)
+        if not _is_owner_or_dev_sender(sender_id, owner_user_id):
+            _rt_answer_cq(query_id, "Недоступно.", show_alert=True)
+            return
         ok = _set_ai_access_mode(conn, _BOT_USERNAME, _AI_ACCESS_ALL)
         if not ok:
             logger.warning("[GUEST RUNTIME] failed to switch AI mode to all for @%s", _BOT_USERNAME)
@@ -1577,6 +1630,10 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
         return
 
     if data == "gcmd:ai_owner":
+        owner_user_id = _get_owner_user_id(conn, _BOT_USERNAME)
+        if not _is_owner_or_dev_sender(sender_id, owner_user_id):
+            _rt_answer_cq(query_id, "Недоступно.", show_alert=True)
+            return
         ok = _set_ai_access_mode(conn, _BOT_USERNAME, _AI_ACCESS_OWNER)
         if not ok:
             logger.warning("[GUEST RUNTIME] failed to switch AI mode to owner for @%s", _BOT_USERNAME)
@@ -1604,7 +1661,6 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
             "text": "",
             "media": [],
             "buttons": {"rows": [], "popups": []},
-            "owner_only": False,
         }
         _RT_PENDING[sender_id] = state
         _rt_replace_pending_ui(
@@ -1620,7 +1676,7 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
         return
 
     if data == "gcmd:del_list":
-        cmds = _rt_list_commands_for_bot(conn, _BOT_USERNAME)
+        cmds = _rt_list_commands_for_bot(conn, _BOT_USERNAME, user_id=sender_id)
         if not cmds:
             _go_main()
             _rt_answer_cq(query_id)
@@ -1743,9 +1799,7 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
             "<b>Формат:</b>\n"
             "<code>Название - example.com</code>\n"
             "<code>Название - popup: текст</code>\n"
-            "<code>Название - rules</code>\n"
-            "<code>Название - del</code>\n"
-            "<code>Название - cmd: имя_команды</code>\n\n"
+            "<code>Название - del</code>\n\n"
             "<b>Несколько в одном ряду:</b>\n"
             "<code>Кнопка1 - example.com & Кнопка2 - example.com</code>\n\n"
             "<b>Цвет:</b>\n"
@@ -1760,31 +1814,6 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
             _rt_inline_kb([_rt_btn("Отмена", "gcmd:draft_buttons_cancel")]),
             also_delete_msg_id=message_id,
         )
-        _rt_answer_cq(query_id)
-        return
-
-    # ---- draft: access toggle ----
-    if data == "gcmd:draft_owner":
-        draft = _RT_PENDING.get(sender_id, {})
-        if not draft:
-            _rt_answer_cq(query_id, "Черновик не найден.", show_alert=True)
-            return
-        draft["owner_only"] = True
-        draft["step"] = "draft"
-        _RT_PENDING[sender_id] = draft
-        _rt_edit(chat_id, message_id, _rt_build_draft_text(draft), _rt_build_draft_kb(draft))
-        _rt_answer_cq(query_id)
-        return
-
-    if data == "gcmd:draft_all":
-        draft = _RT_PENDING.get(sender_id, {})
-        if not draft:
-            _rt_answer_cq(query_id, "Черновик не найден.", show_alert=True)
-            return
-        draft["owner_only"] = False
-        draft["step"] = "draft"
-        _RT_PENDING[sender_id] = draft
-        _rt_edit(chat_id, message_id, _rt_build_draft_text(draft), _rt_build_draft_kb(draft))
         _rt_answer_cq(query_id)
         return
 
@@ -1826,14 +1855,13 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
         media_items = _load_guest_media_payload(draft.get("media") or [])
         buttons_payload = _normalize_guest_buttons_payload(draft.get("buttons") or {})
         has_buttons = _has_button_rows(buttons_payload)
-        owner_only = bool(draft.get("owner_only"))
         if not name:
             _rt_answer_cq(query_id, "Имя команды не задано.", show_alert=True)
             return
         if not text_val and not media_items and not has_buttons:
             _rt_answer_cq(query_id, "Нельзя сохранить пустую команду. Добавьте текст, медиа или кнопки.", show_alert=True)
             return
-        ok = _rt_upsert_command(conn, _BOT_USERNAME, name, text_val, owner_only, media_items, buttons_payload)
+        ok = _rt_upsert_command(conn, _BOT_USERNAME, name, text_val, media_items, buttons_payload, user_id=sender_id)
         state = _RT_PENDING.pop(sender_id, None)
         if isinstance(state, dict):
             state.pop("_ui_msg_id", None)
@@ -1943,21 +1971,22 @@ def _rt_entities_to_html(text: str, entities: list[dict]) -> str:
 
 
 def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> bool:
-    """Handle a private message from an allowed user. Returns True if handled."""
+    """Handle a private message from any user. Returns True if handled."""
     raw_text = str(msg.get("text") or "")
     text = raw_text.strip()
     has_text_field = isinstance(msg.get("text"), str)
     chat_id = int((msg.get("chat") or {}).get("id") or 0)
     message_id = int(msg.get("message_id") or 0)
+    sender = msg.get("from") or {}
 
     if not chat_id:
         return False
 
-    # /start or /help → show main commands page
+    # /start or /help → show main commands page (do NOT delete the /start message)
     if text in ("/start", "/help", f"/start@{_BOT_USERNAME}", f"/help@{_BOT_USERNAME}"):
         state = _RT_PENDING.pop(sender_id, None)
-        _rt_clear_pending_ui(chat_id, state, also_delete_msg_id=message_id)
-        _rt_show_main(chat_id, conn)
+        _rt_clear_pending_ui(chat_id, state)
+        _rt_show_main(chat_id, conn, sender_id=sender_id, sender=sender)
         return True
 
     # Cancel
@@ -2003,7 +2032,7 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
                 also_delete_msg_id=message_id,
             )
             return True
-        cmds_existing = _rt_list_commands_for_bot(conn, _BOT_USERNAME)
+        cmds_existing = _rt_list_commands_for_bot(conn, _BOT_USERNAME, user_id=sender_id)
         if text.lower() in {str(cmd.get("name") or "").lower() for cmd in cmds_existing}:
             _rt_replace_pending_ui(
                 chat_id,
@@ -2031,7 +2060,7 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
             )
             return True
         raw_del = text
-        cmds_del = _rt_list_commands_for_bot(conn, _BOT_USERNAME)
+        cmds_del = _rt_list_commands_for_bot(conn, _BOT_USERNAME, user_id=sender_id)
         cmd_by_key = {str(cmd.get("name") or "").lower(): cmd for cmd in cmds_del}
         cmd_key_del = raw_del.lower()
         if cmd_key_del not in cmd_by_key:
@@ -2044,14 +2073,16 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
             )
             return True
         cmd_name_display = str(cmd_by_key[cmd_key_del].get("name") or raw_del)
-        ok = _rt_delete_command(conn, _BOT_USERNAME, raw_del)
+        ok = _rt_delete_command(conn, _BOT_USERNAME, raw_del, user_id=sender_id)
         old_state = _RT_PENDING.pop(sender_id, None)
         _rt_clear_pending_ui(chat_id, old_state, also_delete_msg_id=message_id)
         if ok:
+            owner_user_id = _get_owner_user_id(conn, _BOT_USERNAME)
+            show_ai = _is_owner_or_dev_sender(sender_id, owner_user_id)
             _rt_send(
                 chat_id,
                 f"{_E_OK} <b>Команда <code>{_html.escape(cmd_name_display)}</code> удалена.</b>",
-                _rt_build_main_kb(_get_ai_access_mode(conn, _BOT_USERNAME)),
+                _rt_build_main_kb(_get_ai_access_mode(conn, _BOT_USERNAME), show_ai=show_ai),
             )
         else:
             _rt_replace_pending_ui(
@@ -2140,6 +2171,23 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
                 chat_id,
                 state,
                 f"{_E_OFF} <b>{_html.escape(_format_button_syntax_error(err))}</b>",
+                _rt_inline_kb([_rt_btn("Отмена", "gcmd:draft_buttons_cancel")]),
+                also_delete_msg_id=message_id,
+            )
+            return True
+        # Block forbidden button types in personal commands
+        forbidden_types = {"rules", "cmd"}
+        forbidden_btn = next(
+            (btn for row in rows for btn in row if (btn.get("type") or "") in forbidden_types),
+            None,
+        )
+        if forbidden_btn:
+            ftype = str(forbidden_btn.get("type") or "")
+            _rt_replace_pending_ui(
+                chat_id,
+                state,
+                f"{_E_OFF} <b>Тип кнопки «{_html.escape(ftype)}» нельзя использовать в персональных командах.</b>\n"
+                "Допустимые типы: ссылка, popup, del.",
                 _rt_inline_kb([_rt_btn("Отмена", "gcmd:draft_buttons_cancel")]),
                 also_delete_msg_id=message_id,
             )
@@ -2580,7 +2628,7 @@ def _handle_guest_update(update_obj: dict) -> None:
                         pass
         return
 
-    # Check if it's a private message from an allowed user — handle as management
+    # Check if it's a private message — handle as management and stop (no AI in DMs)
     msg = update_obj.get("message")
     if isinstance(msg, dict):
         chat = msg.get("chat") or {}
@@ -2591,9 +2639,7 @@ def _handle_guest_update(update_obj: dict) -> None:
                 conn = None
                 try:
                     conn = _db_connect()
-                    if _is_allowed_pm_user(sender_id, conn):
-                        if _handle_pm_message(msg, sender_id, conn):
-                            return
+                    _handle_pm_message(msg, sender_id, conn)
                 except Exception as e:
                     logger.warning("[GUEST RUNTIME] PM message error: %s", e)
                 finally:
@@ -2602,6 +2648,7 @@ def _handle_guest_update(update_obj: dict) -> None:
                             conn.close()
                         except Exception:
                             pass
+            return  # Always stop for private messages — no AI fallback in DMs
 
     guest_payload = None
     for key in ("guest_message", "guest_query", "message", "edited_message", "channel_post", "edited_channel_post"):
@@ -2615,7 +2662,7 @@ def _handle_guest_update(update_obj: dict) -> None:
     guest_query_id = _extract_guest_query_id(guest_payload, update_obj)
     chat_id, message_thread_id, reply_to_message_id = _extract_chat_context(guest_payload, update_obj)
 
-    # Extract sender ID for owner_only/AI access checks
+    # Extract sender ID for command lookup and AI access checks
     sender_id = _extract_sender_id(guest_payload, update_obj)
 
     text = _extract_message_text(guest_payload, update_obj)
@@ -2778,11 +2825,11 @@ def _wait_until_disabled() -> None:
 
 
 if __name__ == "__main__":
-    _BOT_USERNAME = _get_bot_username()
+    _BOT_USERNAME, _BOT_DISPLAY_NAME = _get_bot_info()
     if not _BOT_USERNAME:
         raise RuntimeError("Guest runtime requires bot username")
 
-    logger.info("Starting guest runtime for @%s", _BOT_USERNAME)
+    logger.info("Starting guest runtime for @%s (%s)", _BOT_USERNAME, _BOT_DISPLAY_NAME or "no display name")
 
     threading.Thread(target=_wait_until_disabled, daemon=True, name="guest-disable-watch").start()
     _run_guest_polling_loop()
