@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import html as _html
 import logging
 import os
@@ -89,6 +90,30 @@ def _prepare_guest_query_text(response_text: str) -> str:
     return clean_text[:_GUEST_QUERY_TEXT_MAX_LEN]
 
 
+def _convert_custom_emoji_markup_to_telegram_html(text: str) -> str:
+    raw = str(text or "")
+    if not raw:
+        return ""
+    return re.sub(
+        r"<emoji\s+id=['\"](\d+)['\"]\s*>(.*?)</(?:emoji)?\s*>",
+        lambda m: f'<tg-emoji emoji-id="{m.group(1)}">{m.group(2)}</tg-emoji>',
+        raw,
+        flags=re.I | re.S,
+    )
+
+
+def _has_button_rows(buttons_payload: dict | None) -> bool:
+    if not isinstance(buttons_payload, dict):
+        return False
+    return bool(buttons_payload.get("rows") or [])
+
+
+def _placeholder_text_for_buttons(reply_markup: dict | None) -> str:
+    # Telegram messages cannot have empty text, so use an invisible separator
+    # for button-only payloads.
+    return "\u2063" if reply_markup else ""
+
+
 def _db_connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=5.0)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -104,6 +129,12 @@ def _db_connect() -> sqlite3.Connection:
         conn.commit()
     except Exception:
         pass
+    try:
+        conn.execute("ALTER TABLE guest_bots ADD COLUMN ai_access_mode TEXT NOT NULL DEFAULT 'all'")
+        conn.commit()
+    except Exception as e:
+        if "duplicate column name" not in str(e).lower():
+            logger.warning("[GUEST RUNTIME] migration ai_access_mode failed: %s", e)
     return conn
 
 
@@ -635,7 +666,8 @@ def _resolve_guest_response(conn: sqlite3.Connection, bot_username: str, cmd_key
     text = str(row[0] or "").strip()
     media = _load_guest_media_payload(row[1] or "[]")
     buttons = _normalize_guest_buttons_payload(row[2] or _EMPTY_BUTTONS_JSON)
-    if not text and not media:
+    has_buttons = _has_button_rows(buttons)
+    if not text and not media and not has_buttons:
         return None
     return {
         "text": text,
@@ -876,7 +908,7 @@ def _send_payload_response(
 ) -> bool:
     if not chat_id:
         return False
-    html_text = str(response_text or "").strip()
+    html_text = _convert_custom_emoji_markup_to_telegram_html(str(response_text or "").strip())
     media_items = _load_guest_media_payload(media or [])
     normalized_buttons = _normalize_guest_buttons_payload(buttons_payload or {})
     reply_markup = _build_guest_reply_markup(
@@ -886,11 +918,12 @@ def _send_payload_response(
     )
 
     if not media_items:
-        if not html_text:
+        text_payload = html_text if html_text else _placeholder_text_for_buttons(reply_markup)
+        if not text_payload:
             return False
         ok, message_id = _send_message_response_ex(
             chat_id,
-            html_text,
+            text_payload,
             reply_to_message_id=reply_to_message_id,
             message_thread_id=message_thread_id,
             reply_markup=reply_markup,
@@ -1792,12 +1825,13 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
         text_val = (draft.get("text") or "").strip()
         media_items = _load_guest_media_payload(draft.get("media") or [])
         buttons_payload = _normalize_guest_buttons_payload(draft.get("buttons") or {})
+        has_buttons = _has_button_rows(buttons_payload)
         owner_only = bool(draft.get("owner_only"))
         if not name:
             _rt_answer_cq(query_id, "Имя команды не задано.", show_alert=True)
             return
-        if not text_val and not media_items:
-            _rt_answer_cq(query_id, "Нельзя сохранить пустую команду. Добавьте текст или медиа.", show_alert=True)
+        if not text_val and not media_items and not has_buttons:
+            _rt_answer_cq(query_id, "Нельзя сохранить пустую команду. Добавьте текст, медиа или кнопки.", show_alert=True)
             return
         ok = _rt_upsert_command(conn, _BOT_USERNAME, name, text_val, owner_only, media_items, buttons_payload)
         state = _RT_PENDING.pop(sender_id, None)
@@ -2063,6 +2097,7 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
             stored_text = _rt_entities_to_html(raw_text, entities).strip()
         else:
             stored_text = text
+        stored_text = _convert_custom_emoji_markup_to_telegram_html(stored_text).strip()
         state["text"] = stored_text
         state["step"] = "draft"
         _RT_PENDING[sender_id] = state
@@ -2401,47 +2436,113 @@ def _should_use_ai_fallback(text: str, min_words: int) -> bool:
     return _count_words(text) >= max(1, int(min_words or 1))
 
 
-def _build_inline_article_result(text: str, parse_mode: str | None = None) -> str:
-    """Return a JSON-serialised InlineQueryResultArticle for answerGuestQuery.
+def _build_inline_result_id(seed: str) -> str:
+    raw = str(seed or "")[:512].encode("utf-8", errors="ignore")
+    return hashlib.sha256(raw).hexdigest()[:12]
 
-    answerGuestQuery requires *result* to be an InlineQueryResult object
-    (not a plain text field).  We use the article type so the text is sent
-    as a chat message via InputTextMessageContent.
-    """
+
+def _build_inline_article_result(text: str, parse_mode: str | None = None, reply_markup: dict | None = None) -> dict:
+    """Return InlineQueryResultArticle payload object for answerGuestQuery."""
     input_content: dict = {"message_text": text}
     if parse_mode:
         input_content["parse_mode"] = parse_mode
     result_obj = {
         "type": "article",
-        "id": f"{abs(hash(text)) % 0xFFFFFF:06x}",
+        "id": _build_inline_result_id(f"article:{text}:{parse_mode or ''}"),
         "title": (text[:_INLINE_ARTICLE_TITLE_MAX_LEN].strip() or "Response"),
         "input_message_content": input_content,
     }
-    return json.dumps(result_obj, ensure_ascii=False)
+    if reply_markup:
+        result_obj["reply_markup"] = reply_markup
+    return result_obj
 
 
-def _answer_guest_query(guest_query_id: str, response_text: str) -> bool:
-    if not guest_query_id or not response_text:
+def _build_inline_cached_media_result(
+    media_item: dict,
+    caption: str,
+    parse_mode: str | None = None,
+    reply_markup: dict | None = None,
+) -> dict | None:
+    media_type = str(media_item.get("type") or "").strip().lower()
+    file_id = str(media_item.get("file_id") or "").strip()
+    if not file_id:
+        return None
+    type_map = {
+        "photo": ("photo", "photo_file_id"),
+        "video": ("video", "video_file_id"),
+        "document": ("document", "document_file_id"),
+        "audio": ("audio", "audio_file_id"),
+        "animation": ("mpeg4_gif", "mpeg4_file_id"),
+    }
+    mapped = type_map.get(media_type)
+    if not mapped:
+        return None
+    result_type, file_key = mapped
+    result_obj: dict = {
+        "type": result_type,
+        "id": _build_inline_result_id(f"{result_type}:{file_id}:{caption}:{parse_mode or ''}"),
+        file_key: file_id,
+    }
+    if result_type in {"video", "document", "audio", "mpeg4_gif"}:
+        result_obj["title"] = "Media"
+    if caption:
+        result_obj["caption"] = caption
+        if parse_mode:
+            result_obj["parse_mode"] = parse_mode
+    if reply_markup:
+        result_obj["reply_markup"] = reply_markup
+    return result_obj
+
+
+def _answer_guest_query(
+    guest_query_id: str,
+    response_text: str,
+    media: list[dict] | None = None,
+    buttons_payload: dict | None = None,
+    viewer_user_id: int = 0,
+) -> bool:
+    if not guest_query_id:
         return False
 
-    clean_response_text = _prepare_guest_query_text(response_text)
-    if not clean_response_text:
-        logger.warning("[GUEST RUNTIME] answerGuestQuery skipped: empty text after cleanup")
+    raw_response_text = str(response_text or "").strip()[:_GUEST_QUERY_TEXT_MAX_LEN]
+    html_response_text = _convert_custom_emoji_markup_to_telegram_html(raw_response_text)
+    clean_response_text = _prepare_guest_query_text(html_response_text) if html_response_text else ""
+
+    media_items = _load_guest_media_payload(media or [])
+    normalized_buttons = _normalize_guest_buttons_payload(buttons_payload or {})
+    reply_markup = _build_guest_reply_markup(
+        normalized_buttons.get("rows") or [],
+        normalized_buttons.get("popups") or [],
+        viewer_user_id,
+    )
+    if not html_response_text and not clean_response_text and not media_items and not reply_markup:
+        logger.warning("[GUEST RUNTIME] answerGuestQuery skipped: empty response")
         return False
 
-    # answerGuestQuery requires `result` to be an InlineQueryResult object.
-    # We try HTML formatting first, then fall back to plain (stripped) text.
-    attempts: list[tuple[str, str | None]] = [
-        (str(response_text or "").strip()[:_GUEST_QUERY_TEXT_MAX_LEN], "HTML"),
-        (clean_response_text, None),
-    ]
+    attempts: list[dict] = []
+    if media_items:
+        first_media = media_items[0]
+        for caption, parse_mode in ((html_response_text, "HTML"), (clean_response_text, None)):
+            media_result = _build_inline_cached_media_result(
+                first_media,
+                caption,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+            if media_result:
+                attempts.append(media_result)
+    placeholder_text = _placeholder_text_for_buttons(reply_markup)
+    article_html = html_response_text or placeholder_text
+    article_plain = clean_response_text or placeholder_text
+    for text, parse_mode in ((article_html, "HTML"), (article_plain, None)):
+        if text:
+            attempts.append(_build_inline_article_result(text, parse_mode, reply_markup=reply_markup))
+
     last_error = ""
-    for text, parse_mode in attempts:
-        if not text:
-            continue
+    for result_obj in attempts:
         payload = {
             "guest_query_id": guest_query_id,
-            "result": _build_inline_article_result(text, parse_mode),
+            "result": json.dumps(result_obj, ensure_ascii=False),
         }
         result = _api_request("answerGuestQuery", params=payload, timeout=(10.0, 30.0))
         if isinstance(result, dict) and result.get("ok"):
@@ -2555,16 +2656,20 @@ def _handle_guest_update(update_obj: dict) -> None:
                     reply_to_message_id=reply_to_message_id,
                     message_thread_id=message_thread_id,
                 )
-            if not sent and guest_query_id and response_text and (response_media or has_buttons):
-                # Inline queries have no chat_id, so media/buttons cannot be delivered via
-                # _send_payload_response.  Fall back to text-only answer via answerGuestQuery
-                # so at least the text portion reaches the user.  (If media/buttons were absent
-                # the first attempt above would already have tried _answer_guest_query.)
+            if not sent and guest_query_id and (response_media or has_buttons):
+                # Inline queries may have no chat_id, so payload delivery can fail.
+                # Retry via answerGuestQuery with media/buttons-aware result fallback.
                 logger.info(
-                    "[GUEST RUNTIME] inline query delivery skipped media/buttons; falling back to text-only answer for cmd=%s",
+                    "[GUEST RUNTIME] payload delivery failed; retrying answerGuestQuery with media/buttons fallback for cmd=%s",
                     cmd_key,
                 )
-                sent = _answer_guest_query(guest_query_id, response_text)
+                sent = _answer_guest_query(
+                    guest_query_id,
+                    response_text,
+                    media=response_media,
+                    buttons_payload=response_buttons,
+                    viewer_user_id=sender_id,
+                )
             if not sent and cmd_key:
                 if not _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "failed to deliver response", text):
                     logger.warning("[GUEST RUNTIME] failed to notify owner about delivery failure cmd=%s", cmd_key)
