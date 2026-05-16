@@ -2431,12 +2431,12 @@ def _extract_sender_id(payload_obj: dict, update_obj: dict | None = None, _depth
             uid = 0
         return uid if uid > 0 else 0
 
-    for key in ("from", "from_user", "sender", "user", "sender_user", "author", "actor", "owner"):
+    for key in ("from", "from_user", "sender", "user", "sender_user", "author", "actor"):
         uid = _extract_user_id(payload_obj.get(key))
         if uid:
             return uid
 
-    for key in ("from_user_id", "from_id", "sender_id", "user_id", "sender_user_id", "author_id", "actor_id", "owner_user_id"):
+    for key in ("from_user_id", "from_id", "sender_id", "user_id", "sender_user_id", "author_id", "actor_id"):
         value = payload_obj.get(key)
         try:
             uid = int(value or 0)
