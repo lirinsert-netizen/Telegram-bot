@@ -2539,8 +2539,12 @@ def _handle_guest_update(update_obj: dict) -> None:
                     message_thread_id=message_thread_id,
                 )
             if not sent and guest_query_id and response_text and (response_media or has_buttons):
+                # Inline queries have no chat_id, so media/buttons cannot be delivered via
+                # _send_payload_response.  Fall back to text-only answer via answerGuestQuery
+                # so at least the text portion reaches the user.  (If media/buttons were absent
+                # the first attempt above would already have tried _answer_guest_query.)
                 logger.info(
-                    "[GUEST RUNTIME] guest_query with media/buttons falling back to text-only answer for cmd=%s",
+                    "[GUEST RUNTIME] inline query delivery skipped media/buttons; falling back to text-only answer for cmd=%s",
                     cmd_key,
                 )
                 sent = _answer_guest_query(guest_query_id, response_text)
