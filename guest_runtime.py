@@ -101,6 +101,18 @@ def _convert_custom_emoji_markup_to_telegram_html(text: str) -> str:
     )
 
 
+def _has_button_rows(buttons_payload: dict | None) -> bool:
+    if not isinstance(buttons_payload, dict):
+        return False
+    return bool(buttons_payload.get("rows") or [])
+
+
+def _placeholder_text_for_buttons(reply_markup: dict | None) -> str:
+    # Telegram messages cannot have empty text, so use an invisible separator
+    # for button-only payloads.
+    return "\u2063" if reply_markup else ""
+
+
 def _db_connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=5.0)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -652,7 +664,7 @@ def _resolve_guest_response(conn: sqlite3.Connection, bot_username: str, cmd_key
     text = str(row[0] or "").strip()
     media = _load_guest_media_payload(row[1] or "[]")
     buttons = _normalize_guest_buttons_payload(row[2] or _EMPTY_BUTTONS_JSON)
-    has_buttons = bool((buttons.get("rows") or [])) if isinstance(buttons, dict) else False
+    has_buttons = _has_button_rows(buttons)
     if not text and not media and not has_buttons:
         return None
     return {
@@ -904,7 +916,7 @@ def _send_payload_response(
     )
 
     if not media_items:
-        text_payload = html_text if html_text else ("\u2063" if reply_markup else "")
+        text_payload = html_text if html_text else _placeholder_text_for_buttons(reply_markup)
         if not text_payload:
             return False
         ok, message_id = _send_message_response_ex(
@@ -1811,7 +1823,7 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
         text_val = (draft.get("text") or "").strip()
         media_items = _load_guest_media_payload(draft.get("media") or [])
         buttons_payload = _normalize_guest_buttons_payload(draft.get("buttons") or {})
-        has_buttons = bool((buttons_payload.get("rows") or [])) if isinstance(buttons_payload, dict) else False
+        has_buttons = _has_button_rows(buttons_payload)
         owner_only = bool(draft.get("owner_only"))
         if not name:
             _rt_answer_cq(query_id, "Имя команды не задано.", show_alert=True)
@@ -2423,7 +2435,7 @@ def _should_use_ai_fallback(text: str, min_words: int) -> bool:
 
 
 def _build_inline_result_id(seed: str) -> str:
-    return f"{abs(hash(seed)) % 0xFFFFFF:06x}"
+    return f"{abs(hash(str(seed or '')[:256])) % 0xFFFFFF:06x}"
 
 
 def _build_inline_article_result(text: str, parse_mode: str | None = None, reply_markup: dict | None = None) -> dict:
@@ -2515,8 +2527,8 @@ def _answer_guest_query(
             )
             if media_result:
                 attempts.append(media_result)
-    article_html = html_response_text or ("\u2063" if reply_markup else "")
-    article_plain = clean_response_text or ("\u2063" if reply_markup else "")
+    article_html = html_response_text or _placeholder_text_for_buttons(reply_markup)
+    article_plain = clean_response_text or _placeholder_text_for_buttons(reply_markup)
     for text, parse_mode in ((article_html, "HTML"), (article_plain, None)):
         if text:
             attempts.append(_build_inline_article_result(text, parse_mode, reply_markup=reply_markup))
