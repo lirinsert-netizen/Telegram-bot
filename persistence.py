@@ -133,6 +133,7 @@ def _db_connect() -> sqlite3.Connection:
             CREATE TABLE IF NOT EXISTS guest_commands (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
                 guest_bot_id   INTEGER NOT NULL,
+                user_id        INTEGER NOT NULL DEFAULT 0,
                 name           TEXT    NOT NULL,
                 response_text  TEXT    NOT NULL DEFAULT '',
                 media_items    TEXT    NOT NULL DEFAULT '[]',
@@ -141,7 +142,7 @@ def _db_connect() -> sqlite3.Connection:
                 owner_only     INTEGER NOT NULL DEFAULT 0,
                 created_at     INTEGER NOT NULL,
                 updated_at     INTEGER NOT NULL,
-                UNIQUE(guest_bot_id, name),
+                UNIQUE(guest_bot_id, user_id, name),
                 FOREIGN KEY(guest_bot_id) REFERENCES guest_bots(id) ON DELETE CASCADE
             )
             """
@@ -168,9 +169,51 @@ def _db_connect() -> sqlite3.Connection:
             conn.commit()
         except Exception:
             pass  # Column already exists
+        # Migration: add user_id to guest_commands and rebuild UNIQUE constraint
+        try:
+            cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(guest_commands)").fetchall()}
+            if "user_id" not in cols:
+                conn.execute("PRAGMA foreign_keys = OFF")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS _guest_commands_v2 (
+                        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                        guest_bot_id   INTEGER NOT NULL,
+                        user_id        INTEGER NOT NULL DEFAULT 0,
+                        name           TEXT    NOT NULL,
+                        response_text  TEXT    NOT NULL DEFAULT '',
+                        media_items    TEXT    NOT NULL DEFAULT '[]',
+                        buttons_json   TEXT    NOT NULL DEFAULT '{"rows":[],"popups":[]}',
+                        enabled        INTEGER NOT NULL DEFAULT 1,
+                        owner_only     INTEGER NOT NULL DEFAULT 0,
+                        created_at     INTEGER NOT NULL,
+                        updated_at     INTEGER NOT NULL,
+                        UNIQUE(guest_bot_id, user_id, name),
+                        FOREIGN KEY(guest_bot_id) REFERENCES guest_bots(id) ON DELETE CASCADE
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO _guest_commands_v2
+                    SELECT id, guest_bot_id, 0, name, response_text, media_items, buttons_json,
+                           enabled, owner_only, created_at, updated_at
+                    FROM guest_commands
+                    """
+                )
+                conn.execute("DROP TABLE guest_commands")
+                conn.execute("ALTER TABLE _guest_commands_v2 RENAME TO guest_commands")
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.commit()
+        except Exception as _e:
+            print(f"[MIGRATION user_id] Error: {_e}")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_guest_commands_bot_enabled "
             "ON guest_commands(guest_bot_id, enabled)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_guest_commands_user "
+            "ON guest_commands(guest_bot_id, user_id)"
         )
         conn.execute(
             """
@@ -1253,44 +1296,41 @@ def delete_guest_bot(guest_bot_id: int) -> bool:
         return False
 
 
-def list_guest_commands(guest_bot_id: int, enabled_only: bool = False) -> list[dict]:
+def list_guest_commands(guest_bot_id: int, enabled_only: bool = False, user_id: int | None = None) -> list[dict]:
     try:
         with _DB_LOCK:
             conn = _db_connect()
+            where = "guest_bot_id = ?"
+            params: list = [int(guest_bot_id)]
             if enabled_only:
-                rows = conn.execute(
-                    """
-                    SELECT id, guest_bot_id, name, response_text, media_items, buttons_json, enabled, owner_only, created_at, updated_at
-                    FROM guest_commands
-                    WHERE guest_bot_id = ? AND enabled = 1
-                    ORDER BY name ASC
-                    """,
-                    (int(guest_bot_id),),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT id, guest_bot_id, name, response_text, media_items, buttons_json, enabled, owner_only, created_at, updated_at
-                    FROM guest_commands
-                    WHERE guest_bot_id = ?
-                    ORDER BY name ASC
-                    """,
-                    (int(guest_bot_id),),
-                ).fetchall()
+                where += " AND enabled = 1"
+            if user_id is not None:
+                where += " AND user_id = ?"
+                params.append(int(user_id))
+            rows = conn.execute(
+                f"""
+                SELECT id, guest_bot_id, user_id, name, response_text, media_items, buttons_json, enabled, owner_only, created_at, updated_at
+                FROM guest_commands
+                WHERE {where}
+                ORDER BY name ASC
+                """,
+                params,
+            ).fetchall()
         out: list[dict] = []
         for row in rows:
             out.append(
                 {
                     "id": int(row[0]),
                     "guest_bot_id": int(row[1]),
-                    "name": str(row[2] or ""),
-                    "response_text": str(row[3] or ""),
-                    "media_items": str(row[4] or "[]"),
-                    "buttons_json": str(row[5] or '{"rows":[],"popups":[]}'),
-                    "enabled": bool(int(row[6] or 0)),
-                    "owner_only": bool(int(row[7] or 0)),
-                    "created_at": int(row[8] or 0),
-                    "updated_at": int(row[9] or 0),
+                    "user_id": int(row[2] or 0),
+                    "name": str(row[3] or ""),
+                    "response_text": str(row[4] or ""),
+                    "media_items": str(row[5] or "[]"),
+                    "buttons_json": str(row[6] or '{"rows":[],"popups":[]}'),
+                    "enabled": bool(int(row[7] or 0)),
+                    "owner_only": bool(int(row[8] or 0)),
+                    "created_at": int(row[9] or 0),
+                    "updated_at": int(row[10] or 0),
                 }
             )
         return out
@@ -1307,19 +1347,21 @@ def upsert_guest_command(
     owner_only: bool = False,
     media_items: str = "[]",
     buttons_json: str = '{"rows":[],"popups":[]}',
+    user_id: int = 0,
 ) -> bool:
     cmd_name = str(name or "").strip().lower()
     if not cmd_name:
         return False
     ts = int(time.time())
+    uid = int(user_id)
     try:
         with _DB_LOCK:
             conn = _db_connect()
             conn.execute(
                 """
-                INSERT INTO guest_commands(guest_bot_id, name, response_text, media_items, buttons_json, enabled, owner_only, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(guest_bot_id, name) DO UPDATE SET
+                INSERT INTO guest_commands(guest_bot_id, user_id, name, response_text, media_items, buttons_json, enabled, owner_only, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guest_bot_id, user_id, name) DO UPDATE SET
                     response_text = excluded.response_text,
                     media_items = excluded.media_items,
                     buttons_json = excluded.buttons_json,
@@ -1329,6 +1371,7 @@ def upsert_guest_command(
                 """,
                 (
                     int(guest_bot_id),
+                    uid,
                     cmd_name,
                     str(response_text or ""),
                     str(media_items or "[]"),
@@ -1346,16 +1389,17 @@ def upsert_guest_command(
         return False
 
 
-def delete_guest_command(guest_bot_id: int, name: str) -> bool:
+def delete_guest_command(guest_bot_id: int, name: str, user_id: int = 0) -> bool:
     cmd_name = str(name or "").strip().lower()
     if not cmd_name:
         return False
+    uid = int(user_id)
     try:
         with _DB_LOCK:
             conn = _db_connect()
             conn.execute(
-                "DELETE FROM guest_commands WHERE guest_bot_id = ? AND name = ?",
-                (int(guest_bot_id), cmd_name),
+                "DELETE FROM guest_commands WHERE guest_bot_id = ? AND user_id = ? AND name = ?",
+                (int(guest_bot_id), uid, cmd_name),
             )
             conn.commit()
         return True
@@ -1364,10 +1408,11 @@ def delete_guest_command(guest_bot_id: int, name: str) -> bool:
         return False
 
 
-def set_guest_command_enabled(guest_bot_id: int, name: str, enabled: bool) -> bool:
+def set_guest_command_enabled(guest_bot_id: int, name: str, enabled: bool, user_id: int = 0) -> bool:
     cmd_name = str(name or "").strip().lower()
     if not cmd_name:
         return False
+    uid = int(user_id)
     ts = int(time.time())
     try:
         with _DB_LOCK:
@@ -1376,9 +1421,9 @@ def set_guest_command_enabled(guest_bot_id: int, name: str, enabled: bool) -> bo
                 """
                 UPDATE guest_commands
                 SET enabled = ?, updated_at = ?
-                WHERE guest_bot_id = ? AND name = ?
+                WHERE guest_bot_id = ? AND user_id = ? AND name = ?
                 """,
-                (1 if enabled else 0, ts, int(guest_bot_id), cmd_name),
+                (1 if enabled else 0, ts, int(guest_bot_id), uid, cmd_name),
             )
             conn.commit()
         return True
