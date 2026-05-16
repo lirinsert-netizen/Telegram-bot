@@ -2589,9 +2589,11 @@ def _handle_guest_update(update_obj: dict) -> None:
                     raw_text=text,
                 )
             return
-        failure_reason = "failed to deliver ai response"
-        if not ai_result.ok:
-            failure_reason = f"{ai_result.error_code or 'ai_failure'}: {ai_result.debug_message or ai_result.user_message}"
+        failure_reason = (
+            f"{ai_result.error_code or 'ai_failure'}: {ai_result.debug_message or ai_result.user_message}"
+            if not ai_result.ok
+            else "failed to deliver ai response"
+        )
         if not _send_owner_ai_problem_report(conn, _BOT_USERNAME, failure_reason, text):
             logger.warning("[GUEST RUNTIME] failed to notify owner about AI failure sender=%s", sender_id)
         return
