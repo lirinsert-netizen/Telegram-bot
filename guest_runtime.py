@@ -2438,7 +2438,7 @@ def _should_use_ai_fallback(text: str, min_words: int) -> bool:
 
 def _build_inline_result_id(seed: str) -> str:
     raw = str(seed or "")[:512].encode("utf-8", errors="ignore")
-    return hashlib.sha256(raw).hexdigest()[:6]
+    return hashlib.sha256(raw).hexdigest()[:12]
 
 
 def _build_inline_article_result(text: str, parse_mode: str | None = None, reply_markup: dict | None = None) -> dict:
@@ -2504,7 +2504,8 @@ def _answer_guest_query(
     if not guest_query_id:
         return False
 
-    html_response_text = _convert_custom_emoji_markup_to_telegram_html(str(response_text or "").strip())[:_GUEST_QUERY_TEXT_MAX_LEN]
+    raw_response_text = str(response_text or "").strip()[:_GUEST_QUERY_TEXT_MAX_LEN]
+    html_response_text = _convert_custom_emoji_markup_to_telegram_html(raw_response_text)
     clean_response_text = _prepare_guest_query_text(html_response_text) if html_response_text else ""
 
     media_items = _load_guest_media_payload(media or [])
