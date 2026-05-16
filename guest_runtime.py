@@ -50,6 +50,13 @@ _GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 _GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip() or "llama-3.1-8b-instant"
 _AI_SERVICE = GuestAIService(api_key=_GROQ_API_KEY, model=_GROQ_MODEL)
 _MAX_NESTED_EXTRACTION_DEPTH = 4
+_MAX_BUTTON_ROWS = 10
+_MAX_BUTTONS_PER_ROW = 3
+_MAX_TOTAL_BUTTONS = 30
+_GUEST_BUTTON_CACHE_LIMIT = 512
+_EMPTY_BUTTONS_JSON = '{"rows":[],"popups":[]}'
+_GUEST_BUTTON_CACHE: dict[tuple[int, int], dict] = {}
+_GUEST_BUTTON_CACHE_LOCK = threading.Lock()
 
 
 class _GuestQueryHTMLStripper(HTMLParser):
@@ -87,6 +94,16 @@ def _db_connect() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
+    try:
+        conn.execute("ALTER TABLE guest_commands ADD COLUMN media_items TEXT NOT NULL DEFAULT '[]'")
+        conn.commit()
+    except Exception:
+        pass
+    try:
+        conn.execute("""ALTER TABLE guest_commands ADD COLUMN buttons_json TEXT NOT NULL DEFAULT '{"rows":[],"popups":[]}'""")
+        conn.commit()
+    except Exception:
+        pass
     return conn
 
 
@@ -96,6 +113,408 @@ def _normalize_space(value: str) -> str:
 
 def _normalize_key(value: str) -> str:
     return (value or "").strip().lower().strip(_CMD_STRIP_CHARS).strip()
+
+
+def _safe_json_loads(raw: str, fallback):
+    try:
+        value = json.loads(raw or "")
+    except Exception:
+        return fallback
+    return value
+
+
+def _utf16_units(text: str) -> list[int]:
+    raw = (text or "").encode("utf-16-le")
+    return [int.from_bytes(raw[i:i + 2], "little") for i in range(0, len(raw), 2)]
+
+
+def _utf16_len(text: str) -> int:
+    return len((text or "").encode("utf-16-le")) // 2
+
+
+def _remove_utf16_range(text: str, start_u: int, len_u: int) -> str:
+    units = _utf16_units(text)
+    start = max(int(start_u or 0), 0)
+    end = max(start + int(len_u or 0), 0)
+    if start >= len(units) or end <= start:
+        return text
+    end = min(end, len(units))
+    new_units = units[:start] + units[end:]
+    return b"".join(u.to_bytes(2, "little") for u in new_units).decode("utf-16-le")
+
+
+def _normalize_url(raw: str) -> str:
+    url = str(raw or "").strip()
+    if not url:
+        return ""
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+\-.]*://", url):
+        url = "https://" + url
+    return url
+
+
+def _is_supported_button_url(url: str) -> bool:
+    value = str(url or "").strip()
+    if not value or re.search(r"\s", value):
+        return False
+    if re.match(r"^tg://", value, flags=re.I):
+        return True
+    if not re.match(r"^https?://", value, flags=re.I):
+        return False
+    host = re.sub(r"^https?://", "", value, flags=re.I).split("/", 1)[0].strip()
+    return bool(host) and ("." in host or host.lower() == "localhost")
+
+
+class ButtonSyntaxError(ValueError):
+    def __init__(self, line_no: int, problem: str, details: str = ""):
+        self.line_no = int(line_no or 0)
+        self.problem = str(problem or "other")
+        self.details = str(details or "").strip()
+        super().__init__(self.details or self.problem)
+
+
+def _format_button_syntax_error(err: ButtonSyntaxError) -> str:
+    line_no = int(getattr(err, "line_no", 0) or 0)
+    problem = str(getattr(err, "problem", "other") or "other")
+    details = str(getattr(err, "details", "") or "").strip()
+    base = {
+        "format": "Неправильный формат",
+        "url": "Неправильная ссылка",
+    }.get(problem, "Другая проблема")
+    prefix = f"Строка {line_no}: " if line_no > 0 else "Ошибка: "
+    return f"{prefix}{base}. {details}".strip()
+
+
+def _button_syntax_error(line_no: int, problem: str, details: str = "") -> ButtonSyntaxError:
+    return ButtonSyntaxError(line_no=line_no, problem=problem, details=details)
+
+
+def _extract_button_icon_custom_emoji_id(label: str) -> tuple[str, str | None]:
+    value = str(label or "").strip()
+    match = re.match(r"^\s*<emoji\s+id=['\"](\d+)['\"]>\s*.*?\s*</>\s*", value, flags=re.I | re.S)
+    if not match:
+        return value, None
+    icon_id = match.group(1)
+    rest = re.sub(r"^\s*<emoji\s+id=['\"]\d+['\"]>\s*.*?\s*</>\s*", "", value, flags=re.I | re.S).strip()
+    return (rest if rest else " "), icon_id
+
+
+def _find_custom_emoji_entity_at_offset(entities: list[dict], offset_u: int) -> tuple[int, str] | None:
+    for entity in entities or []:
+        if not isinstance(entity, dict):
+            continue
+        entity_type = str(entity.get("type") or "").lower()
+        if entity_type != "custom_emoji":
+            continue
+        try:
+            offset = int(entity.get("offset") or 0)
+            length = int(entity.get("length") or 0)
+        except Exception:
+            continue
+        if offset != offset_u or length <= 0:
+            continue
+        custom_emoji_id = str(entity.get("custom_emoji_id") or "").strip()
+        if custom_emoji_id:
+            return length, custom_emoji_id
+    return None
+
+
+def _parse_buttons_text(user_text: str, entities: list[dict] | None = None) -> tuple[list[list[dict]], list[str]]:
+    original = str(user_text or "")
+    if not original.strip():
+        return [], []
+    if len(original) > 6000:
+        raise _button_syntax_error(0, "other", "Слишком длинный текст кнопок.")
+
+    has_custom_emoji_entities = any(
+        isinstance(entity, dict) and str(entity.get("type") or "").lower() == "custom_emoji"
+        for entity in (entities or [])
+    )
+    original_u = "".join(chr(unit) for unit in _utf16_units(original)) if has_custom_emoji_entities else ""
+    rows: list[list[dict]] = []
+    popups: list[str] = []
+    search_pos_u = 0
+
+    def _parse_button_token(token: str, token_start_u: int, line_no: int) -> dict:
+        tok = token.strip()
+        style = None
+        prefix_units = 0
+        match_color = re.match(r"^(#r|#g|#b)(\s+)(.*)$", tok, flags=re.I | re.S)
+        if match_color:
+            color = str(match_color.group(1) or "").lower()
+            prefix_units = _utf16_len((match_color.group(1) or "") + (match_color.group(2) or " "))
+            tok = str(match_color.group(3) or "").strip()
+            style = {"#r": "danger", "#g": "success", "#b": "primary"}.get(color)
+
+        if " - " not in tok:
+            raise _button_syntax_error(
+                line_no,
+                "format",
+                "Используйте формат «Название - ссылка», «Название - popup: текст», «Название - rules», «Название - del» или «Название - cmd: имя_команды».",
+            )
+
+        name_raw, value = tok.split(" - ", 1)
+        name_start_u = 0
+        name_end_u = 0
+        if has_custom_emoji_entities:
+            name_raw_start_u = token_start_u + prefix_units
+            name_raw_end_u = name_raw_start_u + _utf16_len(name_raw)
+            name_lead = name_raw[: len(name_raw) - len(name_raw.lstrip())]
+            name_trail = name_raw[len(name_raw.rstrip()):]
+            name_start_u = name_raw_start_u + _utf16_len(name_lead)
+            name_end_u = name_raw_end_u - _utf16_len(name_trail)
+
+        name = name_raw.strip()
+        value = str(value or "").strip()
+        name, icon_eid = _extract_button_icon_custom_emoji_id(name)
+        if not icon_eid and has_custom_emoji_entities and entities:
+            found = _find_custom_emoji_entity_at_offset(entities, name_start_u)
+            if found and name_end_u > name_start_u:
+                icon_len_u, icon_eid = found
+                stripped_name = _remove_utf16_range(name, 0, icon_len_u).strip()
+                name = stripped_name if stripped_name else " "
+
+        if not name.strip() and not icon_eid:
+            raise _button_syntax_error(line_no, "format", "У кнопки отсутствует название.")
+        if not name.strip():
+            name = " "
+        if not value:
+            raise _button_syntax_error(line_no, "format", "После « - » нужно указать ссылку, popup, rules, del или cmd: имя_команды.")
+
+        lowered = value.lower()
+        if lowered == "rules":
+            return {"type": "rules", "text": name, "style": style, "icon_emoji_id": icon_eid}
+        if lowered == "del":
+            return {"type": "del", "text": name, "style": style, "icon_emoji_id": icon_eid}
+        if lowered.startswith("cmd:"):
+            cmd_name = value[len("cmd:"):].strip()
+            if not cmd_name:
+                raise _button_syntax_error(line_no, "format", "После «cmd:» укажите имя команды.")
+            return {"type": "cmd", "text": name, "style": style, "cmd_name": cmd_name, "icon_emoji_id": icon_eid}
+        if lowered.startswith("popup:"):
+            popup_text = value[len("popup:"):].strip()
+            if not popup_text:
+                raise _button_syntax_error(line_no, "format", "Для popup укажите текст после «popup:».")
+            popups.append(popup_text)
+            return {
+                "type": "popup",
+                "text": name,
+                "style": style,
+                "popup_index": len(popups) - 1,
+                "icon_emoji_id": icon_eid,
+            }
+
+        url = _normalize_url(value)
+        if not _is_supported_button_url(url):
+            raise _button_syntax_error(line_no, "url", "Поддерживаются http(s) и tg:// ссылки без пробелов.")
+        return {"type": "url", "text": name, "style": style, "url": url, "icon_emoji_id": icon_eid}
+
+    for line_no, raw_line in enumerate([ln.strip() for ln in original.splitlines() if ln.strip()], start=1):
+        line_start_u = None
+        if has_custom_emoji_entities:
+            raw_line_u = "".join(chr(unit) for unit in _utf16_units(raw_line))
+            line_start_u = original_u.find(raw_line_u, search_pos_u)
+            if line_start_u != -1:
+                search_pos_u = line_start_u + len(raw_line_u)
+            else:
+                line_start_u = None
+        parts = [part.strip() for part in raw_line.split("&") if part.strip()]
+        if not parts:
+            continue
+        if len(parts) > _MAX_BUTTONS_PER_ROW:
+            raise _button_syntax_error(line_no, "format", f"В одном ряду можно использовать не больше {_MAX_BUTTONS_PER_ROW} кнопок.")
+        row: list[dict] = []
+        line_seek_u = line_start_u
+        for part in parts:
+            token_start_u = 0
+            if has_custom_emoji_entities and line_seek_u is not None:
+                token_units = "".join(chr(unit) for unit in _utf16_units(part))
+                token_start_u = original_u.find(token_units, line_seek_u)
+                if token_start_u == -1:
+                    token_start_u = line_seek_u
+                else:
+                    line_seek_u = token_start_u + len(token_units)
+            row.append(_parse_button_token(part, token_start_u, line_no))
+        rows.append(row)
+        if len(rows) > _MAX_BUTTON_ROWS:
+            raise _button_syntax_error(line_no, "other", f"Допустимо не больше {_MAX_BUTTON_ROWS} рядов кнопок.")
+    if sum(len(row) for row in rows) > _MAX_TOTAL_BUTTONS:
+        raise _button_syntax_error(0, "other", f"Допустимо не больше {_MAX_TOTAL_BUTTONS} кнопок в одном наборе.")
+    return rows, popups
+
+
+def _normalize_guest_buttons_payload(raw_buttons: object) -> dict:
+    default = {"rows": [], "popups": []}
+    buttons = raw_buttons
+    if isinstance(raw_buttons, str):
+        buttons = _safe_json_loads(raw_buttons, default)
+    if not isinstance(buttons, dict):
+        return default
+    rows = buttons.get("rows")
+    popups = buttons.get("popups")
+    if not isinstance(rows, list):
+        rows = []
+    if not isinstance(popups, list):
+        popups = []
+    return {"rows": rows, "popups": [str(item or "") for item in popups]}
+
+
+def _load_guest_media_payload(raw_media: object) -> list[dict]:
+    items = raw_media
+    if isinstance(raw_media, str):
+        items = _safe_json_loads(raw_media, [])
+    if not isinstance(items, list):
+        return []
+    normalized: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        media_type = str(item.get("type") or "").strip().lower()
+        file_id = str(item.get("file_id") or "").strip()
+        if media_type not in {"photo", "video", "document", "audio", "animation"} or not file_id:
+            continue
+        normalized.append({"type": media_type, "file_id": file_id})
+    return normalized
+
+
+def _extract_media_payload(msg: dict) -> dict | None:
+    if not isinstance(msg, dict):
+        return None
+    photos = msg.get("photo") or []
+    if isinstance(photos, list) and photos:
+        photo = photos[-1] if isinstance(photos[-1], dict) else {}
+        file_id = str(photo.get("file_id") or "").strip()
+        if file_id:
+            return {"type": "photo", "file_id": file_id}
+    for media_type, key in (
+        ("video", "video"),
+        ("document", "document"),
+        ("audio", "audio"),
+        ("animation", "animation"),
+    ):
+        obj = msg.get(key) or {}
+        if isinstance(obj, dict):
+            file_id = str(obj.get("file_id") or "").strip()
+            if file_id:
+                return {"type": media_type, "file_id": file_id}
+    return None
+
+
+def _media_can_album(items: list[dict]) -> bool:
+    return len(items) >= 2 and all(str(item.get("type") or "") in {"photo", "video"} for item in items)
+
+
+def _sanitize_button_for_payload(button: object, popups: list[str]) -> dict | None:
+    if not isinstance(button, dict):
+        return None
+    button_type = str(button.get("type") or "").strip().lower()
+    if button_type not in {"url", "popup", "rules", "del", "cmd"}:
+        return None
+    text = str(button.get("text") or "").strip()
+    icon_emoji_id = str(button.get("icon_emoji_id") or "").strip() or None
+    if not text and not icon_emoji_id:
+        return None
+    if not text:
+        text = " "
+    style = button.get("style")
+    if style not in {None, "danger", "success", "primary"}:
+        style = None
+    normalized = {
+        "type": button_type,
+        "text": text,
+        "style": style,
+        "icon_emoji_id": icon_emoji_id,
+    }
+    if button_type == "url":
+        url = _normalize_url(str(button.get("url") or ""))
+        if not _is_supported_button_url(url):
+            return None
+        normalized["url"] = url
+        return normalized
+    if button_type == "popup":
+        try:
+            popup_index = int(button.get("popup_index"))
+        except Exception:
+            return None
+        if popup_index < 0 or popup_index >= len(popups) or not str(popups[popup_index] or "").strip():
+            return None
+        normalized["popup_index"] = popup_index
+        return normalized
+    if button_type == "cmd":
+        cmd_name = str(button.get("cmd_name") or "").strip()
+        if not cmd_name:
+            return None
+        normalized["cmd_name"] = cmd_name
+        return normalized
+    return normalized
+
+
+def _build_guest_reply_markup(rows: list[list[dict]], popups: list[str], viewer_user_id: int) -> dict | None:
+    if not rows:
+        return None
+    keyboard: list[list[dict]] = []
+    for row in rows[:_MAX_BUTTON_ROWS]:
+        out_row: list[dict] = []
+        for button in (row or [])[:_MAX_BUTTONS_PER_ROW]:
+            normalized = _sanitize_button_for_payload(button, popups)
+            if not normalized:
+                continue
+            btn: dict = {"text": normalized.get("text") or " "}
+            button_type = normalized["type"]
+            if button_type == "url":
+                btn["url"] = normalized.get("url") or ""
+            elif button_type == "popup":
+                btn["callback_data"] = f"gbtn:popup:{int(viewer_user_id)}:{int(normalized.get('popup_index') or 0)}"[:64]
+            elif button_type == "del":
+                btn["callback_data"] = f"gbtn:del:{int(viewer_user_id)}"[:64]
+            elif button_type == "rules":
+                btn["callback_data"] = f"gbtn:rules:{int(viewer_user_id)}"[:64]
+            elif button_type == "cmd":
+                btn["callback_data"] = f"gbtn:cmd:{int(viewer_user_id)}:{str(normalized.get('cmd_name') or '').strip()}"[:64]
+            style = normalized.get("style")
+            if style:
+                btn["style"] = style
+            icon_emoji_id = normalized.get("icon_emoji_id")
+            if icon_emoji_id:
+                btn["icon_custom_emoji_id"] = str(icon_emoji_id)
+            out_row.append(btn)
+        if out_row:
+            keyboard.append(out_row)
+    return {"inline_keyboard": keyboard} if keyboard else None
+
+
+def _cache_guest_button_payload(chat_id: int, message_id: int | None, buttons_payload: dict, viewer_user_id: int) -> None:
+    if not chat_id or not message_id:
+        return
+    rows = list((buttons_payload.get("rows") or [])) if isinstance(buttons_payload, dict) else []
+    popups = list((buttons_payload.get("popups") or [])) if isinstance(buttons_payload, dict) else []
+    cache_value = {
+        "rows": rows,
+        "popups": popups,
+        "viewer_user_id": int(viewer_user_id or 0),
+        "updated_at": time.time(),
+    }
+    with _GUEST_BUTTON_CACHE_LOCK:
+        _GUEST_BUTTON_CACHE[(int(chat_id), int(message_id))] = cache_value
+        while len(_GUEST_BUTTON_CACHE) > _GUEST_BUTTON_CACHE_LIMIT:
+            try:
+                oldest_key = next(iter(_GUEST_BUTTON_CACHE))
+            except StopIteration:
+                break
+            _GUEST_BUTTON_CACHE.pop(oldest_key, None)
+
+
+def _get_cached_guest_button_payload(chat_id: int, message_id: int | None) -> dict | None:
+    if not chat_id or not message_id:
+        return None
+    with _GUEST_BUTTON_CACHE_LOCK:
+        return _GUEST_BUTTON_CACHE.get((int(chat_id), int(message_id)))
+
+
+def _drop_cached_guest_button_payload(chat_id: int, message_id: int | None) -> None:
+    if not chat_id or not message_id:
+        return
+    with _GUEST_BUTTON_CACHE_LOCK:
+        _GUEST_BUTTON_CACHE.pop((int(chat_id), int(message_id)), None)
 
 
 def _extract_command_key(text: str, bot_username: str) -> str | None:
@@ -187,10 +606,10 @@ def _bot_is_enabled(conn: sqlite3.Connection, bot_username: str) -> bool:
     return bool(row and int(row[0] or 0) == 1)
 
 
-def _resolve_guest_response(conn: sqlite3.Connection, bot_username: str, cmd_key: str, sender_id: int = 0) -> str | None:
+def _resolve_guest_response(conn: sqlite3.Connection, bot_username: str, cmd_key: str, sender_id: int = 0) -> dict | None:
     row = conn.execute(
         """
-        SELECT gc.response_text, gb.linked_modules_json, gc.owner_only, gb.owner_user_id
+        SELECT gc.response_text, gc.media_items, gc.buttons_json, gb.linked_modules_json, gc.owner_only, gb.owner_user_id
         FROM guest_bots gb
         JOIN guest_commands gc ON gc.guest_bot_id = gb.id
         WHERE lower(gb.bot_username) = ?
@@ -204,17 +623,26 @@ def _resolve_guest_response(conn: sqlite3.Connection, bot_username: str, cmd_key
     if not row:
         return None
     try:
-        modules = json.loads(row[1] or "[]")
+        modules = json.loads(row[3] or "[]")
     except Exception:
         modules = []
     if not isinstance(modules, list) or "commands" not in [str(m).lower() for m in modules]:
         return None
-    owner_only = bool(int(row[2] or 0))
-    owner_user_id = int(row[3] or 0)
+    owner_only = bool(int(row[4] or 0))
+    owner_user_id = int(row[5] or 0)
     if owner_only and sender_id and sender_id != owner_user_id and not _is_dev_user(sender_id):
         return None
     text = str(row[0] or "").strip()
-    return text or None
+    media = _load_guest_media_payload(row[1] or "[]")
+    buttons = _normalize_guest_buttons_payload(row[2] or _EMPTY_BUTTONS_JSON)
+    if not text and not media:
+        return None
+    return {
+        "text": text,
+        "media": media,
+        "buttons": buttons,
+        "owner_only": owner_only,
+    }
 
 
 def _api_request(method: str, params: dict | None = None, timeout: tuple[float, float] = (10.0, 70.0)) -> dict | None:
@@ -331,14 +759,35 @@ def _extract_chat_context(payload_obj: dict, update_obj: dict | None = None) -> 
     return chat_id, message_thread_id, reply_to_message_id
 
 
-def _send_message_response(
+def _extract_api_message_id(result: dict | None) -> int | None:
+    if not isinstance(result, dict) or not result.get("ok"):
+        return None
+    payload = result.get("result")
+    if isinstance(payload, dict):
+        try:
+            return int(payload.get("message_id") or 0) or None
+        except Exception:
+            return None
+    if isinstance(payload, list) and payload:
+        first = payload[0]
+        if isinstance(first, dict):
+            try:
+                return int(first.get("message_id") or 0) or None
+            except Exception:
+                return None
+    return None
+
+
+def _send_message_response_ex(
     chat_id: int,
     response_text: str,
     reply_to_message_id: int | None = None,
     message_thread_id: int | None = None,
-) -> bool:
+    *,
+    reply_markup: dict | None = None,
+) -> tuple[bool, int | None]:
     if not chat_id or not response_text:
-        return False
+        return False, None
     payload = {
         "chat_id": int(chat_id),
         "text": response_text,
@@ -349,9 +798,11 @@ def _send_message_response(
         payload["reply_to_message_id"] = int(reply_to_message_id)
     if message_thread_id:
         payload["message_thread_id"] = int(message_thread_id)
+    if reply_markup is not None:
+        payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
     result = _api_request("sendMessage", params=payload, timeout=(10.0, 30.0))
     if isinstance(result, dict) and result.get("ok"):
-        return True
+        return True, _extract_api_message_id(result)
     description = str(result.get("description") or "") if isinstance(result, dict) else ""
     _html_error = (
         "ENTITY_TEXT_INVALID" in description
@@ -360,12 +811,172 @@ def _send_message_response(
     )
     if _html_error:
         payload.pop("parse_mode", None)
+        payload["text"] = _prepare_guest_query_text(response_text)
         fallback_result = _api_request("sendMessage", params=payload, timeout=(10.0, 30.0))
         if isinstance(fallback_result, dict) and fallback_result.get("ok"):
-            return True
+            return True, _extract_api_message_id(fallback_result)
     if description:
         logger.warning("[GUEST RUNTIME] sendMessage failed: %s", description)
-    return False
+    return False, None
+
+
+def _send_message_response(
+    chat_id: int,
+    response_text: str,
+    reply_to_message_id: int | None = None,
+    message_thread_id: int | None = None,
+) -> bool:
+    ok, _ = _send_message_response_ex(
+        chat_id,
+        response_text,
+        reply_to_message_id=reply_to_message_id,
+        message_thread_id=message_thread_id,
+    )
+    return ok
+
+
+def _build_media_group_item(media_item: dict, caption: str | None = None) -> dict | None:
+    media_type = str(media_item.get("type") or "").strip().lower()
+    file_id = str(media_item.get("file_id") or "").strip()
+    if media_type not in {"photo", "video"} or not file_id:
+        return None
+    item: dict = {"type": media_type, "media": file_id}
+    if caption:
+        item["caption"] = caption
+        item["parse_mode"] = "HTML"
+    return item
+
+
+def _send_payload_response(
+    chat_id: int,
+    response_text: str,
+    media: list[dict] | None,
+    buttons_payload: dict | None,
+    viewer_user_id: int,
+    *,
+    reply_to_message_id: int | None = None,
+    message_thread_id: int | None = None,
+) -> bool:
+    if not chat_id:
+        return False
+    html_text = str(response_text or "").strip()
+    media_items = _load_guest_media_payload(media or [])
+    normalized_buttons = _normalize_guest_buttons_payload(buttons_payload or {})
+    reply_markup = _build_guest_reply_markup(
+        normalized_buttons.get("rows") or [],
+        normalized_buttons.get("popups") or [],
+        viewer_user_id,
+    )
+
+    if not media_items:
+        if not html_text:
+            return False
+        ok, message_id = _send_message_response_ex(
+            chat_id,
+            html_text,
+            reply_to_message_id=reply_to_message_id,
+            message_thread_id=message_thread_id,
+            reply_markup=reply_markup,
+        )
+        if ok and reply_markup and message_id:
+            _cache_guest_button_payload(chat_id, message_id, normalized_buttons, viewer_user_id)
+        return ok
+
+    if _media_can_album(media_items):
+        group_items: list[dict] = []
+        for index, item in enumerate(media_items):
+            payload_item = _build_media_group_item(item, html_text if index == 0 and html_text else None)
+            if payload_item:
+                group_items.append(payload_item)
+        if not group_items:
+            return False
+        payload: dict = {
+            "chat_id": int(chat_id),
+            "media": json.dumps(group_items, ensure_ascii=False),
+        }
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = int(reply_to_message_id)
+        if message_thread_id:
+            payload["message_thread_id"] = int(message_thread_id)
+        result = _api_request("sendMediaGroup", params=payload, timeout=(10.0, 60.0))
+        if not (isinstance(result, dict) and result.get("ok")):
+            description = str(result.get("description") or "") if isinstance(result, dict) else ""
+            if description:
+                logger.warning("[GUEST RUNTIME] sendMediaGroup failed: %s", description)
+            return False
+        if reply_markup:
+            ok, message_id = _send_message_response_ex(
+                chat_id,
+                "\u2063",
+                message_thread_id=message_thread_id,
+                reply_markup=reply_markup,
+            )
+            if ok and message_id:
+                _cache_guest_button_payload(chat_id, message_id, normalized_buttons, viewer_user_id)
+            return ok
+        return True
+
+    first_message_id: int | None = None
+    first_message_sent = False
+    for item in media_items:
+        media_type = str(item.get("type") or "").strip().lower()
+        file_id = str(item.get("file_id") or "").strip()
+        if not file_id:
+            continue
+        method = {
+            "photo": "sendPhoto",
+            "video": "sendVideo",
+            "document": "sendDocument",
+            "audio": "sendAudio",
+            "animation": "sendAnimation",
+        }.get(media_type)
+        if not method:
+            continue
+        payload: dict = {
+            "chat_id": int(chat_id),
+            media_type: file_id,
+        }
+        if not first_message_sent and html_text:
+            payload["caption"] = html_text
+            payload["parse_mode"] = "HTML"
+        if not first_message_sent and reply_markup is not None:
+            payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+        if not first_message_sent and reply_to_message_id:
+            payload["reply_to_message_id"] = int(reply_to_message_id)
+        if message_thread_id:
+            payload["message_thread_id"] = int(message_thread_id)
+        result = _api_request(method, params=payload, timeout=(10.0, 60.0))
+        if isinstance(result, dict) and result.get("ok"):
+            if not first_message_sent:
+                first_message_sent = True
+                first_message_id = _extract_api_message_id(result)
+            continue
+        description = str(result.get("description") or "") if isinstance(result, dict) else ""
+        caption_html_error = (
+            not first_message_sent
+            and bool(payload.get("caption"))
+            and (
+                "ENTITY_TEXT_INVALID" in description
+                or "can't parse entities" in description.lower()
+                or "wrong html" in description.lower()
+            )
+        )
+        if caption_html_error:
+            payload.pop("parse_mode", None)
+            payload["caption"] = _prepare_guest_query_text(str(payload.get("caption") or ""))
+            result = _api_request(method, params=payload, timeout=(10.0, 60.0))
+            if isinstance(result, dict) and result.get("ok"):
+                if not first_message_sent:
+                    first_message_sent = True
+                    first_message_id = _extract_api_message_id(result)
+                continue
+            description = str(result.get("description") or "") if isinstance(result, dict) else description
+        if description:
+            logger.warning("[GUEST RUNTIME] %s failed: %s", method, description)
+        return False
+    if first_message_sent and reply_markup and first_message_id:
+        _cache_guest_button_payload(chat_id, first_message_id, normalized_buttons, viewer_user_id)
+    return first_message_sent
 
 
 def _get_owner_user_id(conn: sqlite3.Connection, bot_username: str) -> int:
@@ -579,7 +1190,14 @@ def _rt_edit(chat_id: int, message_id: int, text: str, reply_markup: dict | None
     if reply_markup is not None:
         payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
     result = _rt_api("editMessageText", payload)
-    return isinstance(result, dict) and bool(result.get("ok"))
+    if isinstance(result, dict) and result.get("ok"):
+        return True
+    description = str(result.get("description") or "") if isinstance(result, dict) else ""
+    if "message is not modified" in description.lower():
+        return True
+    if description:
+        logger.warning("[GUEST RUNTIME] editMessageText failed: %s", description)
+    return False
 
 
 def _rt_answer_cq(query_id: str, text: str = "", show_alert: bool = False) -> None:
@@ -636,7 +1254,7 @@ def _rt_list_commands_for_bot(conn: sqlite3.Connection, bot_username: str) -> li
         guest_bot_id = int(row[0])
         rows = conn.execute(
             """
-            SELECT id, name, response_text, enabled, owner_only
+            SELECT id, name, response_text, media_items, buttons_json, enabled, owner_only
             FROM guest_commands
             WHERE guest_bot_id = ?
             ORDER BY name ASC
@@ -644,13 +1262,15 @@ def _rt_list_commands_for_bot(conn: sqlite3.Connection, bot_username: str) -> li
             (guest_bot_id,),
         ).fetchall()
         return [
-            {
-                "id": int(r[0]),
-                "name": str(r[1] or ""),
-                "response_text": str(r[2] or ""),
-                "enabled": bool(int(r[3] or 0)),
-                "owner_only": bool(int(r[4] or 0)),
-            }
+                {
+                    "id": int(r[0]),
+                    "name": str(r[1] or ""),
+                    "response_text": str(r[2] or ""),
+                    "media": _load_guest_media_payload(r[3] or "[]"),
+                    "buttons": _normalize_guest_buttons_payload(r[4] or _EMPTY_BUTTONS_JSON),
+                    "enabled": bool(int(r[5] or 0)),
+                    "owner_only": bool(int(r[6] or 0)),
+                }
             for r in rows
         ]
     except Exception as e:
@@ -677,7 +1297,8 @@ def _rt_build_main_text(cmds: list[dict], ai_access_mode: str) -> str:
     return (
         f"{_E_LIST} <b>Команды</b>\n\n"
         f"Создайте пользовательские команды для бота @{_html.escape(_BOT_USERNAME)}. "
-        f"Для вызова команды напишите /имя команды или @{_html.escape(_BOT_USERNAME)} имя команды.\n\n"
+        f"Для вызова команды напишите /имя команды или @{_html.escape(_BOT_USERNAME)} имя команды. "
+        "Команды поддерживают текст, медиа и кнопки.\n\n"
         f"<b>Количество команд:</b> <code>{count}</code>\n"
         f"<b>Режим ИИ:</b> <code>{_html.escape(ai_label)}</code>\n"
         f"<b>Порог ИИ:</b> <code>{_AI_MIN_WORD_COUNT_DEFAULT}+</code> слова (обычные пользователи), "
@@ -740,6 +1361,8 @@ def _rt_build_list_kb(cmds: list[dict], page: int = 0) -> dict:
 def _rt_build_draft_text(draft: dict) -> str:
     name = _html.escape(draft.get("name") or "")
     has_text = "есть" if draft.get("text") else "нет"
+    has_media = "есть" if draft.get("media") else "нет"
+    has_buttons = "есть" if (draft.get("buttons") or {}).get("rows") else "нет"
     owner_only = bool(draft.get("owner_only"))
     access_label = "Для владельца" if owner_only else "Все пользователи"
     name_str = f"<code>{name}</code>" if name else "<i>не задано</i>"
@@ -747,6 +1370,8 @@ def _rt_build_draft_text(draft: dict) -> str:
         f"{_E_ADD} <b>Новая команда</b>\n\n"
         f"<b>Имя:</b> {name_str}\n"
         f"<b>Текст:</b> <code>{has_text}</code>\n"
+        f"<b>Медиа:</b> <code>{has_media}</code>\n"
+        f"<b>Кнопки:</b> <code>{has_buttons}</code>\n"
         f"<b>Доступ:</b> {access_label}"
     )
 
@@ -754,6 +1379,8 @@ def _rt_build_draft_text(draft: dict) -> str:
 def _rt_build_draft_kb(draft: dict) -> dict:
     owner_only = bool(draft.get("owner_only"))
     btn_text = _rt_btn("Текст", "gcmd:draft_text", icon_custom_emoji_id="5334882760735598374")
+    btn_media = _rt_btn("Медиа", "gcmd:draft_media", icon_custom_emoji_id="5431449001532594346")
+    btn_buttons = _rt_btn("Кнопки", "gcmd:draft_buttons", icon_custom_emoji_id="5395463497783983254")
     if owner_only:
         btn_owner = _rt_btn("»Для владельца«", "gcmd:draft_owner", style="primary")
         btn_all = _rt_btn("Все пользователи", "gcmd:draft_all")
@@ -763,7 +1390,8 @@ def _rt_build_draft_kb(draft: dict) -> dict:
     btn_discard = _rt_btn("Удалить", "gcmd:draft_cancel", style="danger")
     btn_save = _rt_btn("Сохранить", "gcmd:draft_save", style="success")
     return _rt_inline_kb(
-        [btn_text],
+        [btn_text, btn_media],
+        [btn_buttons],
         [btn_owner, btn_all],
         [btn_discard, btn_save],
         [_rt_btn("Назад", "gcmd:main", style="primary")],
@@ -788,23 +1416,35 @@ def _rt_show_main(chat_id: int, conn: sqlite3.Connection) -> None:
     _rt_send(chat_id, _rt_build_main_text(cmds, ai_access_mode), _rt_build_main_kb(ai_access_mode))
 
 
-def _rt_upsert_command(conn: sqlite3.Connection, bot_username: str, name: str, text: str, owner_only: bool) -> bool:
+def _rt_upsert_command(
+    conn: sqlite3.Connection,
+    bot_username: str,
+    name: str,
+    text: str,
+    owner_only: bool,
+    media: list[dict] | None = None,
+    buttons: dict | None = None,
+) -> bool:
     try:
         guest_bot_id = _rt_get_guest_bot_id(conn, bot_username)
         if not guest_bot_id:
             return False
         ts = int(time.time())
+        media_json = json.dumps(_load_guest_media_payload(media or []), ensure_ascii=False)
+        buttons_json = json.dumps(_normalize_guest_buttons_payload(buttons or {}), ensure_ascii=False)
         conn.execute(
             """
-            INSERT INTO guest_commands(guest_bot_id, name, response_text, enabled, owner_only, created_at, updated_at)
-            VALUES (?, ?, ?, 1, ?, ?, ?)
+            INSERT INTO guest_commands(guest_bot_id, name, response_text, media_items, buttons_json, enabled, owner_only, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
             ON CONFLICT(guest_bot_id, name) DO UPDATE SET
                 response_text = excluded.response_text,
+                media_items = excluded.media_items,
+                buttons_json = excluded.buttons_json,
                 enabled = 1,
                 owner_only = excluded.owner_only,
                 updated_at = excluded.updated_at
             """,
-            (guest_bot_id, name.strip().lower(), text, 1 if owner_only else 0, ts, ts),
+            (guest_bot_id, name.strip().lower(), text, media_json, buttons_json, 1 if owner_only else 0, ts, ts),
         )
         conn.commit()
         return True
@@ -878,14 +1518,22 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
 
     if data == "gcmd:ai_all":
         ok = _set_ai_access_mode(conn, _BOT_USERNAME, _AI_ACCESS_ALL)
+        if not ok:
+            logger.warning("[GUEST RUNTIME] failed to switch AI mode to all for @%s", _BOT_USERNAME)
+            _rt_answer_cq(query_id, "Не удалось изменить режим ИИ.", show_alert=True)
+            return
         _go_main()
-        _rt_answer_cq(query_id, "Режим ИИ: для всех." if ok else "Не удалось изменить режим ИИ.", show_alert=not ok)
+        _rt_answer_cq(query_id, "Режим ИИ: для всех.")
         return
 
     if data == "gcmd:ai_owner":
         ok = _set_ai_access_mode(conn, _BOT_USERNAME, _AI_ACCESS_OWNER)
+        if not ok:
+            logger.warning("[GUEST RUNTIME] failed to switch AI mode to owner for @%s", _BOT_USERNAME)
+            _rt_answer_cq(query_id, "Не удалось изменить режим ИИ.", show_alert=True)
+            return
         _go_main()
-        _rt_answer_cq(query_id, "Режим ИИ: для владельца." if ok else "Не удалось изменить режим ИИ.", show_alert=not ok)
+        _rt_answer_cq(query_id, "Режим ИИ: для владельца.")
         return
 
     # ---- list page ----
@@ -900,7 +1548,14 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
 
     # ---- add command ----
     if data == "gcmd:add":
-        state = {"step": "await_name", "name": "", "text": "", "owner_only": False}
+        state = {
+            "step": "await_name",
+            "name": "",
+            "text": "",
+            "media": [],
+            "buttons": {"rows": [], "popups": []},
+            "owner_only": False,
+        }
         _RT_PENDING[sender_id] = state
         _rt_replace_pending_ui(
             chat_id,
@@ -1003,6 +1658,61 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
         _rt_answer_cq(query_id)
         return
 
+    if data == "gcmd:draft_media":
+        draft = _RT_PENDING.get(sender_id, {})
+        if not draft:
+            _rt_answer_cq(query_id, "Черновик не найден.", show_alert=True)
+            return
+        draft["step"] = "await_media"
+        _RT_PENDING[sender_id] = draft
+        _rt_replace_pending_ui(
+            chat_id,
+            draft,
+            f"{_E_SETTINGS} <b>Пришлите медиа для команды.</b>\n\n"
+            "<b>Поддерживается:</b>\n"
+            "• Фото\n• Видео\n• Файл\n• Музыка\n• GIF\n\n"
+            "<i>Подпись отдельно не задаётся.</i>\n"
+            "Если у команды есть текст, он будет автоматически использоваться как подпись.",
+            _rt_inline_kb([_rt_btn("Отмена", "gcmd:draft_media_cancel")]),
+            also_delete_msg_id=message_id,
+        )
+        _rt_answer_cq(query_id)
+        return
+
+    if data == "gcmd:draft_buttons":
+        draft = _RT_PENDING.get(sender_id, {})
+        if not draft:
+            _rt_answer_cq(query_id, "Черновик не найден.", show_alert=True)
+            return
+        draft["step"] = "await_buttons"
+        _RT_PENDING[sender_id] = draft
+        _rt_replace_pending_ui(
+            chat_id,
+            draft,
+            f"{_E_SETTINGS} <b>Пришлите кнопки для команды.</b>\n\n"
+            "<b>Формат:</b>\n"
+            "<code>Название - example.com</code>\n"
+            "<code>Название - popup: текст</code>\n"
+            "<code>Название - rules</code>\n"
+            "<code>Название - del</code>\n"
+            "<code>Название - cmd: имя_команды</code>\n\n"
+            "<b>Несколько в одном ряду:</b>\n"
+            "<code>Кнопка1 - example.com & Кнопка2 - example.com</code>\n\n"
+            "<b>Цвет:</b>\n"
+            "<code>#r Название - example.com</code> (красный)\n"
+            "<code>#g Название - example.com</code> (зелёный)\n"
+            "<code>#b Название - example.com</code> (цвет зависит от темы пользователя)\n\n"
+            "<b>Лимиты:</b>\n"
+            f"• 1–{_MAX_BUTTONS_PER_ROW} кнопки в ряду\n"
+            f"• до {_MAX_BUTTON_ROWS} рядов\n"
+            f"• до {_MAX_TOTAL_BUTTONS} кнопок всего\n"
+            "• до 1 премиум-эмодзи в кнопке (только в начале названия)",
+            _rt_inline_kb([_rt_btn("Отмена", "gcmd:draft_buttons_cancel")]),
+            also_delete_msg_id=message_id,
+        )
+        _rt_answer_cq(query_id)
+        return
+
     # ---- draft: access toggle ----
     if data == "gcmd:draft_owner":
         draft = _RT_PENDING.get(sender_id, {})
@@ -1028,6 +1738,24 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
         _rt_answer_cq(query_id)
         return
 
+    if data == "gcmd:draft_media_cancel":
+        draft = _RT_PENDING.get(sender_id, {})
+        if draft:
+            draft["step"] = "draft"
+            _RT_PENDING[sender_id] = draft
+            _rt_edit(chat_id, message_id, _rt_build_draft_text(draft), _rt_build_draft_kb(draft))
+        _rt_answer_cq(query_id)
+        return
+
+    if data == "gcmd:draft_buttons_cancel":
+        draft = _RT_PENDING.get(sender_id, {})
+        if draft:
+            draft["step"] = "draft"
+            _RT_PENDING[sender_id] = draft
+            _rt_edit(chat_id, message_id, _rt_build_draft_text(draft), _rt_build_draft_kb(draft))
+        _rt_answer_cq(query_id)
+        return
+
     # ---- draft: cancel ----
     if data == "gcmd:draft_cancel":
         state = _RT_PENDING.pop(sender_id, None)
@@ -1045,14 +1773,16 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
             return
         name = (draft.get("name") or "").strip()
         text_val = (draft.get("text") or "").strip()
+        media_items = _load_guest_media_payload(draft.get("media") or [])
+        buttons_payload = _normalize_guest_buttons_payload(draft.get("buttons") or {})
         owner_only = bool(draft.get("owner_only"))
         if not name:
             _rt_answer_cq(query_id, "Имя команды не задано.", show_alert=True)
             return
-        if not text_val:
-            _rt_answer_cq(query_id, "Текст команды не задан.", show_alert=True)
+        if not text_val and not media_items:
+            _rt_answer_cq(query_id, "Нельзя сохранить пустую команду. Добавьте текст или медиа.", show_alert=True)
             return
-        ok = _rt_upsert_command(conn, _BOT_USERNAME, name, text_val, owner_only)
+        ok = _rt_upsert_command(conn, _BOT_USERNAME, name, text_val, owner_only, media_items, buttons_payload)
         state = _RT_PENDING.pop(sender_id, None)
         if isinstance(state, dict):
             state.pop("_ui_msg_id", None)
@@ -1323,6 +2053,52 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
         _rt_send(chat_id, _rt_build_draft_text(state), _rt_build_draft_kb(state))
         return True
 
+    if step == "await_media":
+        media_payload = _extract_media_payload(msg)
+        if not media_payload:
+            _rt_replace_pending_ui(
+                chat_id,
+                state,
+                f"{_E_OFF} <b>Этот тип медиа не поддерживается.</b>\nПришлите фото/видео/файл/музыку/gif.",
+                _rt_inline_kb([_rt_btn("Отмена", "gcmd:draft_media_cancel")]),
+                also_delete_msg_id=message_id,
+            )
+            return True
+        state["media"] = [media_payload]
+        state["step"] = "draft"
+        _RT_PENDING[sender_id] = state
+        _rt_clear_pending_ui(chat_id, state, also_delete_msg_id=message_id)
+        _rt_send(chat_id, _rt_build_draft_text(state), _rt_build_draft_kb(state))
+        return True
+
+    if step == "await_buttons":
+        if not has_text_field:
+            _rt_replace_pending_ui(
+                chat_id,
+                state,
+                f"{_E_OFF} <b>Это не текст.</b>\nПришлите кнопки текстом.",
+                _rt_inline_kb([_rt_btn("Отмена", "gcmd:draft_buttons_cancel")]),
+                also_delete_msg_id=message_id,
+            )
+            return True
+        try:
+            rows, popups = _parse_buttons_text(raw_text, msg.get("entities") or [])
+        except ButtonSyntaxError as err:
+            _rt_replace_pending_ui(
+                chat_id,
+                state,
+                f"{_E_OFF} <b>{_html.escape(_format_button_syntax_error(err))}</b>",
+                _rt_inline_kb([_rt_btn("Отмена", "gcmd:draft_buttons_cancel")]),
+                also_delete_msg_id=message_id,
+            )
+            return True
+        state["buttons"] = {"rows": rows, "popups": popups}
+        state["step"] = "draft"
+        _RT_PENDING[sender_id] = state
+        _rt_clear_pending_ui(chat_id, state, also_delete_msg_id=message_id)
+        _rt_send(chat_id, _rt_build_draft_text(state), _rt_build_draft_kb(state))
+        return True
+
     return False
 
 
@@ -1347,6 +2123,112 @@ def _send_owner_problem_report(
     if raw_safe:
         text += f"\n<b>Вход:</b> <code>{raw_safe}</code>"
     return _send_message_response(owner_user_id, text)
+
+
+def _send_owner_ai_problem_report(
+    conn: sqlite3.Connection,
+    bot_username: str,
+    reason: str,
+    raw_text: str = "",
+) -> bool:
+    owner_user_id = _get_owner_user_id(conn, bot_username)
+    if not owner_user_id:
+        return False
+    reason_safe = _html.escape((reason or "").strip()[:_OWNER_DEBUG_MAX_LEN])
+    raw_safe = _html.escape((raw_text or "").strip()[:_OWNER_DEBUG_MAX_LEN])
+    text = (
+        f"⚠️ <b>@{_html.escape(bot_username)} не смог выполнить AI-запрос</b>\n"
+        f"<b>Причина:</b> <code>{reason_safe or 'unknown'}</code>"
+    )
+    if raw_safe:
+        text += f"\n<b>Запрос:</b> <code>{raw_safe}</code>"
+    return _send_message_response(owner_user_id, text)
+
+
+def _format_ai_failure_text(user_message: str) -> str:
+    detail = _html.escape((user_message or "").strip() or "Неизвестная ошибка.")
+    return f"⚠️ <b>ИИ сейчас недоступен.</b>\n{detail}"
+
+
+def _handle_guest_button_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> bool:
+    data = str(cq.get("data") or "")
+    if not data.startswith("gbtn:"):
+        return False
+    query_id = str(cq.get("id") or "")
+    message = cq.get("message") or {}
+    chat = message.get("chat") or {}
+    try:
+        chat_id = int(chat.get("id") or 0)
+    except Exception:
+        chat_id = 0
+    try:
+        message_id = int(message.get("message_id") or 0)
+    except Exception:
+        message_id = 0
+    parts = data.split(":", 3)
+    action = parts[1] if len(parts) > 1 else ""
+    try:
+        viewer_user_id = int(parts[2]) if len(parts) > 2 else 0
+    except Exception:
+        viewer_user_id = 0
+    if viewer_user_id and sender_id != viewer_user_id:
+        _rt_answer_cq(query_id, "Недоступно.", show_alert=True)
+        return True
+
+    if action == "popup":
+        cached = _get_cached_guest_button_payload(chat_id, message_id)
+        if not cached:
+            _rt_answer_cq(query_id, "Данные кнопки устарели. Отправьте команду заново.", show_alert=True)
+            return True
+        try:
+            popup_index = int(parts[3]) if len(parts) > 3 else -1
+        except Exception:
+            popup_index = -1
+        popups = cached.get("popups") or []
+        if popup_index < 0 or popup_index >= len(popups):
+            _rt_answer_cq(query_id, "Попап недоступен.", show_alert=True)
+            return True
+        _rt_answer_cq(query_id, str(popups[popup_index] or "").strip()[:200], show_alert=True)
+        return True
+
+    if action == "del":
+        _drop_cached_guest_button_payload(chat_id, message_id)
+        _rt_delete_message(chat_id, message_id)
+        _rt_answer_cq(query_id)
+        return True
+
+    if action == "rules":
+        _rt_answer_cq(query_id, "Кнопка rules недоступна для guest-команд.", show_alert=True)
+        return True
+
+    if action == "cmd":
+        cmd_name = parts[3] if len(parts) > 3 else ""
+        payload = _resolve_guest_response(conn, _BOT_USERNAME, cmd_name, sender_id)
+        if not payload:
+            _rt_answer_cq(query_id, "Команда недоступна.", show_alert=True)
+            return True
+        _drop_cached_guest_button_payload(chat_id, message_id)
+        try:
+            _rt_delete_message(chat_id, message_id)
+        except Exception:
+            pass
+        sent = _send_payload_response(
+            chat_id=chat_id,
+            response_text=str(payload.get("text") or ""),
+            media=payload.get("media") or [],
+            buttons_payload=payload.get("buttons") or {},
+            viewer_user_id=sender_id,
+            message_thread_id=int(message.get("message_thread_id") or 0) or None,
+        )
+        if not sent:
+            logger.warning("[GUEST RUNTIME] failed to send payload for guest button command=%s", cmd_name)
+            _rt_answer_cq(query_id, "Не удалось выполнить команду.", show_alert=True)
+            return True
+        _rt_answer_cq(query_id)
+        return True
+
+    _rt_answer_cq(query_id)
+    return True
 
 
 def _extract_guest_query_id(payload_obj: dict, update_obj: dict | None = None) -> str:
@@ -1556,7 +2438,7 @@ def _answer_guest_query(guest_query_id: str, response_text: str) -> bool:
 
 
 def _handle_guest_update(update_obj: dict) -> None:
-    # Handle callback_query from allowed users in PM (management interface)
+    # Handle callback_query from command buttons and PM management interface.
     cq = update_obj.get("callback_query")
     if isinstance(cq, dict):
         sender = cq.get("from") or {}
@@ -1565,11 +2447,13 @@ def _handle_guest_update(update_obj: dict) -> None:
             conn = None
             try:
                 conn = _db_connect()
+                if _handle_guest_button_callback(cq, sender_id, conn):
+                    return
                 if _is_allowed_pm_user(sender_id, conn):
                     _handle_pm_callback(cq, sender_id, conn)
                     return
             except Exception as e:
-                logger.warning("[GUEST RUNTIME] PM callback error: %s", e)
+                logger.warning("[GUEST RUNTIME] callback handling error: %s", e)
             finally:
                 if conn is not None:
                     try:
@@ -1634,14 +2518,23 @@ def _handle_guest_update(update_obj: dict) -> None:
             response = _resolve_guest_response(conn, _BOT_USERNAME, cmd_key, sender_id)
         sent = False
         if response:
-            if guest_query_id:
-                sent = _answer_guest_query(guest_query_id, response)
+            response_text = str(response.get("text") or "")
+            response_media = response.get("media") or []
+            response_buttons = response.get("buttons") or {}
+            has_buttons = bool((response_buttons.get("rows") or [])) if isinstance(response_buttons, dict) else False
+            if guest_query_id and not response_media and not has_buttons and response_text:
+                sent = _answer_guest_query(guest_query_id, response_text)
             if not sent and chat_id:
-                if not guest_query_id:
-                    logger.debug("[GUEST RUNTIME] no guest_query_id; using sendMessage fallback")
-                sent = _send_message_response(
+                if guest_query_id and (response_media or has_buttons):
+                    logger.info("[GUEST RUNTIME] guest_query response requires chat delivery because media/buttons are present")
+                elif not guest_query_id:
+                    logger.debug("[GUEST RUNTIME] no guest_query_id; using chat payload delivery")
+                sent = _send_payload_response(
                     chat_id=chat_id,
-                    response_text=response,
+                    response_text=response_text,
+                    media=response_media,
+                    buttons_payload=response_buttons,
+                    viewer_user_id=sender_id,
                     reply_to_message_id=reply_to_message_id,
                     message_thread_id=message_thread_id,
                 )
@@ -1662,12 +2555,22 @@ def _handle_guest_update(update_obj: dict) -> None:
             return
         is_owner_sender = bool(owner_user_id and sender_id == owner_user_id)
         owner_intent = _detect_owner_intent(text) if is_owner_sender else None
-        ai_response = _AI_SERVICE.generate_reply(
+        ai_result = _AI_SERVICE.generate_reply_result(
             text,
             is_owner_sender=is_owner_sender,
             owner_intent=owner_intent,
         )
-        ai_text = ai_response or _AI_FALLBACK_TEXT
+        ai_text = ai_result.text if ai_result.ok else _format_ai_failure_text(ai_result.user_message or _AI_FALLBACK_TEXT)
+        if not ai_result.ok:
+            logger.warning(
+                "[GUEST RUNTIME] AI request failed for @%s sender=%s code=%s details=%s query=%r",
+                _BOT_USERNAME,
+                sender_id,
+                ai_result.error_code or "unknown",
+                ai_result.debug_message or "-",
+                text[:120],
+            )
+        sent = False
         if guest_query_id:
             sent = _answer_guest_query(guest_query_id, ai_text)
         if not sent and chat_id:
@@ -1678,11 +2581,20 @@ def _handle_guest_update(update_obj: dict) -> None:
                 message_thread_id=message_thread_id,
             )
         if sent:
+            if not ai_result.ok:
+                _send_owner_ai_problem_report(
+                    conn,
+                    _BOT_USERNAME,
+                    f"{ai_result.error_code or 'ai_failure'}: {ai_result.debug_message or ai_result.user_message}",
+                    raw_text=text,
+                )
             return
-        if cmd_key:
-            if not _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "command not found or module disabled", text):
-                logger.warning("[GUEST RUNTIME] failed to notify owner about unresolved cmd=%s", cmd_key)
-            return
+        failure_reason = "failed to deliver ai response"
+        if not ai_result.ok:
+            failure_reason = f"{ai_result.error_code or 'ai_failure'}: {ai_result.debug_message or ai_result.user_message}"
+        if not _send_owner_ai_problem_report(conn, _BOT_USERNAME, failure_reason, text):
+            logger.warning("[GUEST RUNTIME] failed to notify owner about AI failure sender=%s", sender_id)
+        return
     except Exception as e:
         logger.warning("[GUEST RUNTIME] command handling failed: %s", e)
     finally:

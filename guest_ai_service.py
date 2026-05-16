@@ -96,6 +96,18 @@ class GroundingSource:
         return parsed.netloc.lower().removeprefix("www.")
 
 
+@dataclass
+class AIReplyResult:
+    text: str | None = None
+    error_code: str = ""
+    user_message: str = ""
+    debug_message: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return bool((self.text or "").strip())
+
+
 class _TelegramHTMLSanitizer(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -578,6 +590,52 @@ def _append_sources_footer(answer_html: str, sources: list[GroundingSource]) -> 
     return sanitize_ai_response_html(result)[:_MAX_AI_REPLY_LEN]
 
 
+def _format_groq_failure(exc: Exception) -> AIReplyResult:
+    if isinstance(exc, requests.HTTPError):
+        response = exc.response
+        status = int(getattr(response, "status_code", 0) or 0)
+        body = ""
+        try:
+            body = _truncate(_normalize_space(getattr(response, "text", "") or ""), 240)
+        except Exception:
+            body = ""
+        if status in (401, 403):
+            user_message = "Не удалось авторизоваться в Groq. Проверьте GROQ_API_KEY."
+        elif status == 404:
+            user_message = "Указанная модель Groq не найдена. Проверьте GROQ_MODEL."
+        elif status == 429:
+            user_message = "Groq временно отклоняет запросы из-за лимитов. Попробуйте позже."
+        elif status >= 500:
+            user_message = "Groq сейчас недоступен. Попробуйте позже."
+        else:
+            user_message = f"Groq отклонил запрос (HTTP {status})."
+        debug = f"http_status={status}"
+        if body:
+            debug = f"{debug}; body={body}"
+        return AIReplyResult(
+            error_code="groq_http_error",
+            user_message=user_message,
+            debug_message=debug,
+        )
+    if isinstance(exc, requests.Timeout):
+        return AIReplyResult(
+            error_code="groq_timeout",
+            user_message="Groq не ответил вовремя. Попробуйте позже.",
+            debug_message=str(exc),
+        )
+    if isinstance(exc, requests.RequestException):
+        return AIReplyResult(
+            error_code="groq_request_error",
+            user_message="Не удалось подключиться к Groq. Проверьте сеть и повторите попытку.",
+            debug_message=str(exc),
+        )
+    return AIReplyResult(
+        error_code="groq_unknown_error",
+        user_message="Не удалось выполнить AI-запрос.",
+        debug_message=str(exc),
+    )
+
+
 class GuestAIService:
     def __init__(
         self,
@@ -659,12 +717,34 @@ class GuestAIService:
         is_owner_sender: bool,
         owner_intent: str | None = None,
     ) -> str | None:
+        result = self.generate_reply_result(
+            user_text,
+            is_owner_sender=is_owner_sender,
+            owner_intent=owner_intent,
+        )
+        return result.text if result.ok else None
+
+    def generate_reply_result(
+        self,
+        user_text: str,
+        *,
+        is_owner_sender: bool,
+        owner_intent: str | None = None,
+    ) -> AIReplyResult:
         if not self.available():
-            return None
+            return AIReplyResult(
+                error_code="missing_api_key",
+                user_message="ИИ отключён: не задан GROQ_API_KEY.",
+                debug_message="missing GROQ_API_KEY",
+            )
 
         question = _normalize_space(user_text)
         if not question:
-            return None
+            return AIReplyResult(
+                error_code="empty_question",
+                user_message="Запрос к ИИ пустой.",
+                debug_message="normalized question is empty",
+            )
 
         sources = self._collect_sources(question)
         has_sources = bool(sources)
@@ -706,8 +786,16 @@ class GuestAIService:
             response.raise_for_status()
             data = response.json()
         except Exception as e:
-            logger.warning("[GUEST AI] Groq request failed: %s", e)
-            return None
+            failure = _format_groq_failure(e)
+            logger.warning(
+                "[GUEST AI] Groq request failed for query=%r model=%s sources=%s code=%s details=%s",
+                question,
+                self._model,
+                len(sources),
+                failure.error_code,
+                failure.debug_message or str(e),
+            )
+            return failure
 
         try:
             choices = data.get("choices") if isinstance(data, dict) else []
@@ -717,12 +805,30 @@ class GuestAIService:
         except Exception:
             content = ""
         if not isinstance(content, str) or not content.strip():
-            return None
+            logger.warning("[GUEST AI] empty content returned for query=%r model=%s", question, self._model)
+            return AIReplyResult(
+                error_code="empty_model_response",
+                user_message="Groq вернул пустой ответ.",
+                debug_message="response choices did not contain non-empty message.content",
+            )
 
         cleaned = sanitize_ai_response_html(content)
         if not cleaned:
-            return None
+            logger.warning("[GUEST AI] sanitized content is empty for query=%r model=%s", question, self._model)
+            return AIReplyResult(
+                error_code="empty_sanitized_response",
+                user_message="Ответ ИИ не удалось подготовить для Telegram.",
+                debug_message="sanitize_ai_response_html returned empty string",
+            )
         if not has_sources:
-            return cleaned[:_MAX_AI_REPLY_LEN]
+            return AIReplyResult(text=cleaned[:_MAX_AI_REPLY_LEN])
         with_sources = _append_sources_footer(cleaned, sources)
-        return with_sources[:_MAX_AI_REPLY_LEN] or None
+        final_text = with_sources[:_MAX_AI_REPLY_LEN] or None
+        if not final_text:
+            logger.warning("[GUEST AI] final response is empty after footer append for query=%r", question)
+            return AIReplyResult(
+                error_code="empty_final_response",
+                user_message="Ответ ИИ оказался пустым после обработки.",
+                debug_message="final response empty after _append_sources_footer",
+            )
+        return AIReplyResult(text=final_text)
