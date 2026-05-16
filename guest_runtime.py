@@ -90,6 +90,10 @@ def _db_connect() -> sqlite3.Connection:
     return conn
 
 
+def _normalize_space(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
 def _normalize_key(value: str) -> str:
     return (value or "").strip().lower().strip(_CMD_STRIP_CHARS).strip()
 
