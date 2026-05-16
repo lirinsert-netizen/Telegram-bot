@@ -745,7 +745,7 @@ def _extract_chat_context(payload_obj: dict, update_obj: dict | None = None) -> 
             reply_to_message_id = nested_reply_to
 
     if not chat_id and isinstance(update_obj, dict):
-        for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
+        for key in ("message", "edited_message", "channel_post", "edited_channel_post", "guest_message"):
             upd_payload = update_obj.get(key)
             if isinstance(upd_payload, dict):
                 nested_chat_id, nested_thread_id, nested_reply_to = _extract_chat_context(upd_payload, None)
@@ -2538,6 +2538,12 @@ def _handle_guest_update(update_obj: dict) -> None:
                     reply_to_message_id=reply_to_message_id,
                     message_thread_id=message_thread_id,
                 )
+            if not sent and guest_query_id and response_text and (response_media or has_buttons):
+                logger.info(
+                    "[GUEST RUNTIME] guest_query with media/buttons falling back to text-only answer for cmd=%s",
+                    cmd_key,
+                )
+                sent = _answer_guest_query(guest_query_id, response_text)
             if not sent and cmd_key:
                 if not _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "failed to deliver response", text):
                     logger.warning("[GUEST RUNTIME] failed to notify owner about delivery failure cmd=%s", cmd_key)
