@@ -1332,6 +1332,10 @@ _E_OFF      = '<tg-emoji emoji-id="5465665476971471368">❌</tg-emoji>'
 _E_TEXT     = _E_LIST
 _E_SETTINGS = '<tg-emoji emoji-id="5341715473882955310">⚙️</tg-emoji>'
 
+# Emoji IDs for draft keyboard buttons (mirror EMOJI_WELCOME_MEDIA_ID / EMOJI_WELCOME_BUTTONS_ID from config)
+_EMOJI_DRAFT_MEDIA_ID   = "5431783411981228752"
+_EMOJI_DRAFT_BUTTONS_ID = "5363850326577259091"
+
 
 def _rt_list_commands_for_bot(conn: sqlite3.Connection, bot_username: str, user_id: int = 0) -> list[dict]:
     """List commands for this bot scoped to the given user_id."""
@@ -1474,11 +1478,9 @@ def _rt_build_draft_text(draft: dict) -> str:
 
 
 def _rt_build_draft_kb(draft: dict) -> dict:
-    # Media emoji: EMOJI_WELCOME_MEDIA_ID = "5431783411981228752"
-    # Buttons emoji: EMOJI_WELCOME_BUTTONS_ID = "5363850326577259091"
     btn_text = _rt_btn("Текст", "gcmd:draft_text", icon_custom_emoji_id="5334882760735598374")
-    btn_media = _rt_btn("Медиа", "gcmd:draft_media", icon_custom_emoji_id="5431783411981228752")
-    btn_buttons = _rt_btn("Кнопки", "gcmd:draft_buttons", icon_custom_emoji_id="5363850326577259091")
+    btn_media = _rt_btn("Медиа", "gcmd:draft_media", icon_custom_emoji_id=_EMOJI_DRAFT_MEDIA_ID)
+    btn_buttons = _rt_btn("Кнопки", "gcmd:draft_buttons", icon_custom_emoji_id=_EMOJI_DRAFT_BUTTONS_ID)
     btn_discard = _rt_btn("Удалить", "gcmd:draft_cancel", style="danger")
     btn_save = _rt_btn("Сохранить", "gcmd:draft_save", style="success")
     return _rt_inline_kb(
@@ -1514,7 +1516,6 @@ def _rt_upsert_command(
     bot_username: str,
     name: str,
     text: str,
-    owner_only: bool,
     media: list[dict] | None = None,
     buttons: dict | None = None,
     user_id: int = 0,
@@ -1860,7 +1861,7 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
         if not text_val and not media_items and not has_buttons:
             _rt_answer_cq(query_id, "Нельзя сохранить пустую команду. Добавьте текст, медиа или кнопки.", show_alert=True)
             return
-        ok = _rt_upsert_command(conn, _BOT_USERNAME, name, text_val, False, media_items, buttons_payload, user_id=sender_id)
+        ok = _rt_upsert_command(conn, _BOT_USERNAME, name, text_val, media_items, buttons_payload, user_id=sender_id)
         state = _RT_PENDING.pop(sender_id, None)
         if isinstance(state, dict):
             state.pop("_ui_msg_id", None)

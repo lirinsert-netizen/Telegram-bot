@@ -206,7 +206,7 @@ def _db_connect() -> sqlite3.Connection:
                 conn.execute("PRAGMA foreign_keys = ON")
                 conn.commit()
         except Exception as _e:
-            print(f"[MIGRATION user_id] Error: {_e}")
+            print(f"[MIGRATION user_id] Error: {_e}")  # Consistent with other print-based error handling in this module
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_guest_commands_bot_enabled "
             "ON guest_commands(guest_bot_id, enabled)"
