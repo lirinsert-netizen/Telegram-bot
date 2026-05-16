@@ -135,6 +135,8 @@ def _db_connect() -> sqlite3.Connection:
                 guest_bot_id   INTEGER NOT NULL,
                 name           TEXT    NOT NULL,
                 response_text  TEXT    NOT NULL DEFAULT '',
+                media_items    TEXT    NOT NULL DEFAULT '[]',
+                buttons_json   TEXT    NOT NULL DEFAULT '{"rows":[],"popups":[]}',
                 enabled        INTEGER NOT NULL DEFAULT 1,
                 owner_only     INTEGER NOT NULL DEFAULT 0,
                 created_at     INTEGER NOT NULL,
@@ -147,6 +149,16 @@ def _db_connect() -> sqlite3.Connection:
         # Migration: add owner_only column to existing tables
         try:
             conn.execute("ALTER TABLE guest_commands ADD COLUMN owner_only INTEGER NOT NULL DEFAULT 0")
+            conn.commit()
+        except Exception:
+            pass  # Column already exists
+        try:
+            conn.execute("ALTER TABLE guest_commands ADD COLUMN media_items TEXT NOT NULL DEFAULT '[]'")
+            conn.commit()
+        except Exception:
+            pass  # Column already exists
+        try:
+            conn.execute("""ALTER TABLE guest_commands ADD COLUMN buttons_json TEXT NOT NULL DEFAULT '{"rows":[],"popups":[]}'""")
             conn.commit()
         except Exception:
             pass  # Column already exists
@@ -1248,7 +1260,7 @@ def list_guest_commands(guest_bot_id: int, enabled_only: bool = False) -> list[d
             if enabled_only:
                 rows = conn.execute(
                     """
-                    SELECT id, guest_bot_id, name, response_text, enabled, owner_only, created_at, updated_at
+                    SELECT id, guest_bot_id, name, response_text, media_items, buttons_json, enabled, owner_only, created_at, updated_at
                     FROM guest_commands
                     WHERE guest_bot_id = ? AND enabled = 1
                     ORDER BY name ASC
@@ -1258,7 +1270,7 @@ def list_guest_commands(guest_bot_id: int, enabled_only: bool = False) -> list[d
             else:
                 rows = conn.execute(
                     """
-                    SELECT id, guest_bot_id, name, response_text, enabled, owner_only, created_at, updated_at
+                    SELECT id, guest_bot_id, name, response_text, media_items, buttons_json, enabled, owner_only, created_at, updated_at
                     FROM guest_commands
                     WHERE guest_bot_id = ?
                     ORDER BY name ASC
@@ -1273,10 +1285,12 @@ def list_guest_commands(guest_bot_id: int, enabled_only: bool = False) -> list[d
                     "guest_bot_id": int(row[1]),
                     "name": str(row[2] or ""),
                     "response_text": str(row[3] or ""),
-                    "enabled": bool(int(row[4] or 0)),
-                    "owner_only": bool(int(row[5] or 0)),
-                    "created_at": int(row[6] or 0),
-                    "updated_at": int(row[7] or 0),
+                    "media_items": str(row[4] or "[]"),
+                    "buttons_json": str(row[5] or '{"rows":[],"popups":[]}'),
+                    "enabled": bool(int(row[6] or 0)),
+                    "owner_only": bool(int(row[7] or 0)),
+                    "created_at": int(row[8] or 0),
+                    "updated_at": int(row[9] or 0),
                 }
             )
         return out
@@ -1285,7 +1299,15 @@ def list_guest_commands(guest_bot_id: int, enabled_only: bool = False) -> list[d
         return []
 
 
-def upsert_guest_command(guest_bot_id: int, name: str, response_text: str, enabled: bool = True, owner_only: bool = False) -> bool:
+def upsert_guest_command(
+    guest_bot_id: int,
+    name: str,
+    response_text: str,
+    enabled: bool = True,
+    owner_only: bool = False,
+    media_items: str = "[]",
+    buttons_json: str = '{"rows":[],"popups":[]}',
+) -> bool:
     cmd_name = str(name or "").strip().lower()
     if not cmd_name:
         return False
@@ -1295,15 +1317,27 @@ def upsert_guest_command(guest_bot_id: int, name: str, response_text: str, enabl
             conn = _db_connect()
             conn.execute(
                 """
-                INSERT INTO guest_commands(guest_bot_id, name, response_text, enabled, owner_only, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO guest_commands(guest_bot_id, name, response_text, media_items, buttons_json, enabled, owner_only, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guest_bot_id, name) DO UPDATE SET
                     response_text = excluded.response_text,
+                    media_items = excluded.media_items,
+                    buttons_json = excluded.buttons_json,
                     enabled = excluded.enabled,
                     owner_only = excluded.owner_only,
                     updated_at = excluded.updated_at
                 """,
-                (int(guest_bot_id), cmd_name, str(response_text or ""), 1 if enabled else 0, 1 if owner_only else 0, ts, ts),
+                (
+                    int(guest_bot_id),
+                    cmd_name,
+                    str(response_text or ""),
+                    str(media_items or "[]"),
+                    str(buttons_json or '{"rows":[],"popups":[]}'),
+                    1 if enabled else 0,
+                    1 if owner_only else 0,
+                    ts,
+                    ts,
+                ),
             )
             conn.commit()
         return True
