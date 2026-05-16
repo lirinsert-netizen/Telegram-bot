@@ -49,6 +49,7 @@ _AI_ACCESS_OWNER = "owner"
 _GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 _GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip() or "llama-3.1-8b-instant"
 _AI_SERVICE = GuestAIService(api_key=_GROQ_API_KEY, model=_GROQ_MODEL)
+_MAX_NESTED_EXTRACTION_DEPTH = 4
 
 
 class _GuestQueryHTMLStripper(HTMLParser):
@@ -364,6 +365,9 @@ def _send_message_response(
 
 
 def _get_owner_user_id(conn: sqlite3.Connection, bot_username: str) -> int:
+    uname = _normalize_bot_username(bot_username)
+    if not uname:
+        return 0
     row = conn.execute(
         """
         SELECT owner_user_id
@@ -371,7 +375,7 @@ def _get_owner_user_id(conn: sqlite3.Connection, bot_username: str) -> int:
         WHERE lower(bot_username) = ?
         LIMIT 1
         """,
-        (bot_username.lower(),),
+        (uname,),
     ).fetchone()
     try:
         return int(row[0] or 0) if row else 0
@@ -416,7 +420,14 @@ def _normalize_ai_access_mode(value: str) -> str:
     return _AI_ACCESS_OWNER if mode == _AI_ACCESS_OWNER else _AI_ACCESS_ALL
 
 
+def _normalize_bot_username(value: str) -> str:
+    return str(value or "").strip().lstrip("@").lower()
+
+
 def _get_ai_access_mode(conn: sqlite3.Connection, bot_username: str) -> str:
+    uname = _normalize_bot_username(bot_username)
+    if not uname:
+        return _AI_ACCESS_OWNER
     row = conn.execute(
         """
         SELECT ai_access_mode
@@ -424,7 +435,7 @@ def _get_ai_access_mode(conn: sqlite3.Connection, bot_username: str) -> str:
         WHERE lower(bot_username) = ?
         LIMIT 1
         """,
-        (bot_username.lower(),),
+        (uname,),
     ).fetchone()
     raw = row[0] if row else _AI_ACCESS_ALL
     return _normalize_ai_access_mode(str(raw or ""))
@@ -433,15 +444,20 @@ def _get_ai_access_mode(conn: sqlite3.Connection, bot_username: str) -> str:
 def _set_ai_access_mode(conn: sqlite3.Connection, bot_username: str, mode: str) -> bool:
     ts = int(time.time())
     norm_mode = _normalize_ai_access_mode(mode)
+    uname = _normalize_bot_username(bot_username)
+    if not uname:
+        return False
     try:
-        conn.execute(
+        cur = conn.execute(
             """
             UPDATE guest_bots
             SET ai_access_mode = ?, updated_at = ?
             WHERE lower(bot_username) = ?
             """,
-            (norm_mode, ts, bot_username.lower()),
+            (norm_mode, ts, uname),
         )
+        if int(cur.rowcount or 0) == 0:
+            return False
         conn.commit()
         return True
     except Exception as e:
@@ -1337,26 +1353,30 @@ def _extract_guest_query_id(payload_obj: dict, update_obj: dict | None = None) -
     def _candidate_id(candidate: object, *, allow_fallback_id: bool = False) -> str:
         if not isinstance(candidate, dict):
             return ""
-        value = candidate.get("guest_query_id")
-        if value is None and allow_fallback_id:
+        for key in ("guest_query_id", "query_id", "inline_query_id"):
+            value = candidate.get(key)
+            if value is not None:
+                text = str(value).strip()
+                if text:
+                    return text
+        if allow_fallback_id:
             value = candidate.get("id")
-        return str(value).strip() if value is not None else ""
+            if value is not None:
+                text = str(value).strip()
+                if text:
+                    return text
+        return ""
 
-    direct_id = _candidate_id(payload_obj)
+    direct_id = _candidate_id(payload_obj, allow_fallback_id=False)
     if direct_id:
         return direct_id
 
     for source in (payload_obj, update_obj):
         if not isinstance(source, dict):
             continue
-        nested_guest_query = source.get("guest_query")
-        nested_id = _candidate_id(nested_guest_query, allow_fallback_id=True)
-        if nested_id:
-            return nested_id
-
-        for nested_key in ("guest_message", "message"):
+        for nested_key in ("guest_query", "guest_message", "message", "inline_query"):
             nested_payload = source.get(nested_key)
-            nested_id = _candidate_id(nested_payload)
+            nested_id = _candidate_id(nested_payload, allow_fallback_id=True)
             if nested_id:
                 return nested_id
             if isinstance(nested_payload, dict):
@@ -1365,6 +1385,66 @@ def _extract_guest_query_id(payload_obj: dict, update_obj: dict | None = None) -
                 if nested_id:
                     return nested_id
     return ""
+
+
+def _extract_sender_id(payload_obj: dict, update_obj: dict | None = None, _depth: int = 0) -> int:
+    """Extract sender user ID from guest update payloads.
+
+    Supports legacy/new payload shapes and nested objects.
+    Uses bounded recursion via _depth to avoid infinite loops.
+    """
+    if _depth > _MAX_NESTED_EXTRACTION_DEPTH:
+        logger.debug("[GUEST RUNTIME] sender extraction depth exceeded")
+        return 0
+    if not isinstance(payload_obj, dict):
+        return 0
+
+    def _extract_user_id(candidate: object) -> int:
+        if not isinstance(candidate, dict):
+            return 0
+        try:
+            uid = int(candidate.get("id") or 0)
+        except Exception:
+            uid = 0
+        return uid if uid > 0 else 0
+
+    for key in ("from", "sender", "user", "sender_user"):
+        uid = _extract_user_id(payload_obj.get(key))
+        if uid:
+            return uid
+
+    for key in ("from_user_id", "sender_id", "user_id", "sender_user_id"):
+        value = payload_obj.get(key)
+        try:
+            uid = int(value or 0)
+        except Exception:
+            uid = 0
+        if uid > 0:
+            return uid
+
+    for nested_key in ("guest_query", "guest_message", "message", "inline_query"):
+        nested_payload = payload_obj.get(nested_key)
+        if isinstance(nested_payload, dict):
+            uid = _extract_sender_id(nested_payload, None, _depth + 1)
+            if uid:
+                return uid
+
+    if isinstance(update_obj, dict):
+        for nested_key in (
+            "guest_query",
+            "guest_message",
+            "message",
+            "edited_message",
+            "channel_post",
+            "edited_channel_post",
+            "inline_query",
+        ):
+            nested_payload = update_obj.get(nested_key)
+            if isinstance(nested_payload, dict):
+                uid = _extract_sender_id(nested_payload, None, _depth + 1)
+                if uid:
+                    return uid
+    return 0
 
 
 def _extract_message_text(
@@ -1376,7 +1456,10 @@ def _extract_message_text(
 
     Handles both guest_message and guest_query shapes and nested message objects.
     """
-    if _depth > 4:
+    if _depth > _MAX_NESTED_EXTRACTION_DEPTH:
+        logger.debug("[GUEST RUNTIME] message text extraction depth exceeded")
+        return ""
+    if not isinstance(payload_obj, dict):
         return ""
     text = payload_obj.get("text")
     if isinstance(text, str) and text.strip():
@@ -1526,13 +1609,8 @@ def _handle_guest_update(update_obj: dict) -> None:
     guest_query_id = _extract_guest_query_id(guest_payload, update_obj)
     chat_id, message_thread_id, reply_to_message_id = _extract_chat_context(guest_payload, update_obj)
 
-    # Extract sender ID for owner_only check
-    sender_id = 0
-    try:
-        from_user = guest_payload.get("from") or {}
-        sender_id = int(from_user.get("id") or 0)
-    except Exception:
-        pass
+    # Extract sender ID for owner_only/AI access checks
+    sender_id = _extract_sender_id(guest_payload, update_obj)
 
     text = _extract_message_text(guest_payload, update_obj)
     if not text:
