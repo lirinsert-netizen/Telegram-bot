@@ -2560,7 +2560,7 @@ def _handle_guest_update(update_obj: dict) -> None:
             is_owner_sender=is_owner_sender,
             owner_intent=owner_intent,
         )
-        ai_text = ai_result.text if ai_result.ok else _format_ai_failure_text(ai_result.user_message or _AI_FALLBACK_TEXT)
+        ai_text = ai_result.text if ai_result.ok else _format_ai_failure_text(ai_result.user_message or "Неизвестная ошибка.")
         if not ai_result.ok:
             logger.warning(
                 "[GUEST RUNTIME] AI request failed for @%s sender=%s code=%s details=%s query=%r",
