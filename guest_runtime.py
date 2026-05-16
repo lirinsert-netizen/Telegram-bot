@@ -811,7 +811,7 @@ def _send_message_response_ex(
     )
     if _html_error:
         payload.pop("parse_mode", None)
-        payload["text"] = _prepare_guest_query_text(response_text)
+        payload["text"] = _prepare_guest_query_text(str(payload.get("text") or ""))
         fallback_result = _api_request("sendMessage", params=payload, timeout=(10.0, 30.0))
         if isinstance(fallback_result, dict) and fallback_result.get("ok"):
             return True, _extract_api_message_id(fallback_result)
