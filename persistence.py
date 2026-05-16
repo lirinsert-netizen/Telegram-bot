@@ -207,6 +207,40 @@ def _db_connect() -> sqlite3.Connection:
                 conn.commit()
         except Exception as _e:
             print(f"[MIGRATION user_id] Error: {_e}")  # Consistent with other print-based error handling in this module
+        # Migration: move legacy user_id=0 commands to the bot owner so old commands keep working.
+        try:
+            ts = int(time.time())
+            conn.execute(
+                """
+                UPDATE guest_commands AS gc
+                SET user_id = (
+                        SELECT gb.owner_user_id
+                        FROM guest_bots gb
+                        WHERE gb.id = gc.guest_bot_id
+                    ),
+                    updated_at = ?
+                WHERE gc.user_id = 0
+                  AND EXISTS (
+                        SELECT 1
+                        FROM guest_bots gb
+                        WHERE gb.id = gc.guest_bot_id
+                          AND gb.owner_user_id > 0
+                    )
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM guest_commands dup
+                        JOIN guest_bots gb2 ON gb2.id = gc.guest_bot_id
+                        WHERE dup.guest_bot_id = gc.guest_bot_id
+                          AND dup.user_id = gb2.owner_user_id
+                          AND dup.name = gc.name
+                          AND dup.id != gc.id
+                    )
+                """,
+                (ts,),
+            )
+            conn.commit()
+        except Exception as _e:
+            print(f"[MIGRATION legacy owner scope] Error: {_e}")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_guest_commands_bot_enabled "
             "ON guest_commands(guest_bot_id, enabled)"

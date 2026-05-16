@@ -175,6 +175,43 @@ def _db_connect() -> sqlite3.Connection:
             logger.info("[GUEST RUNTIME] Migrated guest_commands to per-user schema")
     except Exception as e:
         logger.warning("[GUEST RUNTIME] migration user_id failed: %s", e)
+    # Migration: move legacy user_id=0 commands to the bot owner so old commands keep working.
+    try:
+        ts = int(time.time())
+        cur = conn.execute(
+            """
+            UPDATE guest_commands AS gc
+            SET user_id = (
+                    SELECT gb.owner_user_id
+                    FROM guest_bots gb
+                    WHERE gb.id = gc.guest_bot_id
+                ),
+                updated_at = ?
+            WHERE gc.user_id = 0
+              AND EXISTS (
+                    SELECT 1
+                    FROM guest_bots gb
+                    WHERE gb.id = gc.guest_bot_id
+                      AND gb.owner_user_id > 0
+                )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM guest_commands dup
+                    JOIN guest_bots gb2 ON gb2.id = gc.guest_bot_id
+                    WHERE dup.guest_bot_id = gc.guest_bot_id
+                      AND dup.user_id = gb2.owner_user_id
+                      AND dup.name = gc.name
+                      AND dup.id != gc.id
+                )
+            """
+            ,
+            (ts,),
+        )
+        if int(cur.rowcount or 0) > 0:
+            conn.commit()
+            logger.info("[GUEST RUNTIME] migrated %s legacy guest commands to owner scope", int(cur.rowcount or 0))
+    except Exception as e:
+        logger.warning("[GUEST RUNTIME] migration legacy owner scope failed: %s", e)
     return conn
 
 
@@ -2394,12 +2431,12 @@ def _extract_sender_id(payload_obj: dict, update_obj: dict | None = None, _depth
             uid = 0
         return uid if uid > 0 else 0
 
-    for key in ("from", "sender", "user", "sender_user"):
+    for key in ("from", "from_user", "sender", "user", "sender_user", "author", "actor", "owner"):
         uid = _extract_user_id(payload_obj.get(key))
         if uid:
             return uid
 
-    for key in ("from_user_id", "sender_id", "user_id", "sender_user_id"):
+    for key in ("from_user_id", "from_id", "sender_id", "user_id", "sender_user_id", "author_id", "actor_id", "owner_user_id"):
         value = payload_obj.get(key)
         try:
             uid = int(value or 0)
