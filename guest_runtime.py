@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import hashlib
 import html as _html
@@ -64,6 +65,13 @@ _EMPTY_BUTTONS_JSON = '{"rows":[],"popups":[]}'
 _GUEST_BUTTON_CACHE: dict[tuple[int, int], dict] = {}
 _GUEST_BUTTON_CACHE_LOCK = threading.Lock()
 
+# Migration guard: run heavy DB migrations only once per process.
+_MIGRATION_DONE = False
+_MIGRATION_LOCK = threading.Lock()
+
+# Thread pool for handling guest updates without blocking the polling loop.
+_UPDATE_EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
+
 
 class _GuestQueryHTMLStripper(HTMLParser):
     def __init__(self) -> None:
@@ -119,11 +127,8 @@ def _placeholder_text_for_buttons(reply_markup: dict | None) -> str:
     return "\u2063" if reply_markup else ""
 
 
-def _db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=5.0)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    """Run all one-time schema migrations. Called once per process via _db_connect."""
     try:
         conn.execute("ALTER TABLE guest_commands ADD COLUMN media_items TEXT NOT NULL DEFAULT '[]'")
         conn.commit()
@@ -240,7 +245,21 @@ def _db_connect() -> sqlite3.Connection:
         conn.commit()
     except Exception as e:
         logger.warning("[GUEST RUNTIME] migration guest_button_cache failed: %s", e)
+
+
+def _db_connect() -> sqlite3.Connection:
+    global _MIGRATION_DONE
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=5.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    if not _MIGRATION_DONE:
+        with _MIGRATION_LOCK:
+            if not _MIGRATION_DONE:
+                _run_migrations(conn)
+                _MIGRATION_DONE = True
     return conn
+
 
 
 def _normalize_space(value: str) -> str:
@@ -646,6 +665,7 @@ def _cache_guest_button_payload(chat_id: int, message_id: int | None, buttons_pa
             except StopIteration:
                 break
             _GUEST_BUTTON_CACHE.pop(oldest_key, None)
+    conn = None
     try:
         conn = _db_connect()
         conn.execute(
@@ -677,6 +697,12 @@ def _cache_guest_button_payload(chat_id: int, message_id: int | None, buttons_pa
         conn.commit()
     except Exception as e:
         logger.debug("[GUEST RUNTIME] failed to persist button cache: %s", e)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _get_cached_guest_button_payload(chat_id: int, message_id: int | None) -> dict | None:
@@ -686,6 +712,7 @@ def _get_cached_guest_button_payload(chat_id: int, message_id: int | None) -> di
         cached = _GUEST_BUTTON_CACHE.get((int(chat_id), int(message_id)))
     if cached:
         return cached
+    conn = None
     try:
         conn = _db_connect()
         row = conn.execute(
@@ -708,6 +735,12 @@ def _get_cached_guest_button_payload(chat_id: int, message_id: int | None) -> di
     except Exception as e:
         logger.debug("[GUEST RUNTIME] failed to read button cache: %s", e)
         return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _drop_cached_guest_button_payload(chat_id: int, message_id: int | None) -> None:
@@ -715,6 +748,7 @@ def _drop_cached_guest_button_payload(chat_id: int, message_id: int | None) -> N
         return
     with _GUEST_BUTTON_CACHE_LOCK:
         _GUEST_BUTTON_CACHE.pop((int(chat_id), int(message_id)), None)
+    conn = None
     try:
         conn = _db_connect()
         conn.execute(
@@ -724,6 +758,12 @@ def _drop_cached_guest_button_payload(chat_id: int, message_id: int | None) -> N
         conn.commit()
     except Exception as e:
         logger.debug("[GUEST RUNTIME] failed to delete button cache: %s", e)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _extract_command_key(text: str, bot_username: str) -> str | None:
@@ -1643,14 +1683,12 @@ def _rt_build_main_text(
     if show_ai_provider_hint:
         body += (
             "\n"
-            f"<b>Модель ИИ:</b> <code>{_html.escape(_ai_provider_label(ai_provider))}</code>\n"
-            "Сменить модель можно текстом:\n"
-            "<code>groq</code> или <code>gemini google ai studio</code>"
+            f"<b>Модель ИИ:</b> <code>{_html.escape(_ai_provider_label(ai_provider))}</code>"
         )
     return body
 
 
-def _rt_build_main_kb(ai_access_mode: str, show_ai: bool = False) -> dict:
+def _rt_build_main_kb(ai_access_mode: str, show_ai: bool = False, ai_provider: str = _AI_PROVIDER_GROQ) -> dict:
     mode = _normalize_ai_access_mode(ai_access_mode)
     rows: list[list[dict]] = [
         [_rt_btn("Список команд", "gcmd:list:0", icon_custom_emoji_id="5334882760735598374")],
@@ -1665,6 +1703,14 @@ def _rt_build_main_kb(ai_access_mode: str, show_ai: bool = False) -> dict:
             btn_ai_all = _rt_btn("»ИИ для всех«", "gcmd:ai_all", style="primary")
             btn_ai_owner = _rt_btn("ИИ для владельца", "gcmd:ai_owner")
         rows.append([btn_ai_all, btn_ai_owner])
+        provider = _normalize_ai_provider(ai_provider)
+        if provider == _AI_PROVIDER_GEMINI:
+            btn_groq = _rt_btn("Groq", "gcmd:ai_model_groq")
+            btn_gemini = _rt_btn("»Gemini«", "gcmd:ai_model_gemini", style="primary")
+        else:
+            btn_groq = _rt_btn("»Groq«", "gcmd:ai_model_groq", style="primary")
+            btn_gemini = _rt_btn("Gemini", "gcmd:ai_model_gemini")
+        rows.append([btn_groq, btn_gemini])
     return _rt_inline_kb(*rows)
 
 
@@ -1753,7 +1799,7 @@ def _rt_show_main(chat_id: int, conn: sqlite3.Connection, sender_id: int = 0, se
     _rt_send(
         chat_id,
         _rt_build_main_text(cmds, sender=sender, ai_provider=ai_provider, show_ai_provider_hint=bool(owner_user_id and sender_id == owner_user_id)),
-        _rt_build_main_kb(ai_access_mode, show_ai=show_ai),
+        _rt_build_main_kb(ai_access_mode, show_ai=show_ai, ai_provider=ai_provider),
     )
 
 
@@ -1854,7 +1900,7 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
             chat_id,
             message_id,
             _rt_build_main_text(cmds, sender=sender, ai_provider=ai_provider, show_ai_provider_hint=bool(owner_user_id and sender_id == owner_user_id)),
-            _rt_build_main_kb(ai_access_mode, show_ai=show_ai),
+            _rt_build_main_kb(ai_access_mode, show_ai=show_ai, ai_provider=ai_provider),
         )
 
     def _go_list(page: int = 0) -> None:
@@ -1895,7 +1941,35 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
         _rt_answer_cq(query_id, "Режим ИИ: для владельца.")
         return
 
-    # ---- list page ----
+    if data == "gcmd:ai_model_groq":
+        owner_user_id = _get_owner_user_id(conn, _BOT_USERNAME)
+        if not _is_owner_or_dev_sender(sender_id, owner_user_id):
+            _rt_answer_cq(query_id, "Недоступно.", show_alert=True)
+            return
+        ok = _set_ai_provider(conn, _BOT_USERNAME, _AI_PROVIDER_GROQ)
+        if not ok:
+            logger.warning("[GUEST RUNTIME] failed to switch AI model to groq for @%s", _BOT_USERNAME)
+            _rt_answer_cq(query_id, "Не удалось изменить модель ИИ.", show_alert=True)
+            return
+        _go_main()
+        _rt_answer_cq(query_id, "Модель ИИ: Groq.")
+        return
+
+    if data == "gcmd:ai_model_gemini":
+        owner_user_id = _get_owner_user_id(conn, _BOT_USERNAME)
+        if not _is_owner_or_dev_sender(sender_id, owner_user_id):
+            _rt_answer_cq(query_id, "Недоступно.", show_alert=True)
+            return
+        ok = _set_ai_provider(conn, _BOT_USERNAME, _AI_PROVIDER_GEMINI)
+        if not ok:
+            logger.warning("[GUEST RUNTIME] failed to switch AI model to gemini for @%s", _BOT_USERNAME)
+            _rt_answer_cq(query_id, "Не удалось изменить модель ИИ.", show_alert=True)
+            return
+        _go_main()
+        _rt_answer_cq(query_id, "Модель ИИ: Gemini Google AI Studio.")
+        return
+
+
     if data.startswith("gcmd:list:"):
         try:
             page = int(data.split(":", 2)[2])
@@ -3280,22 +3354,43 @@ def _handle_guest_update(update_obj: dict) -> None:
                 pass
 
 
+def _log_future_exception(fut: concurrent.futures.Future) -> None:
+    """Callback to log any unhandled exception from a submitted update-handler future."""
+    try:
+        exc = fut.exception()
+        if exc is not None:
+            logger.warning("[GUEST RUNTIME] unhandled exception in update worker: %s", exc)
+    except concurrent.futures.CancelledError:
+        pass
+
+
 def _run_guest_polling_loop() -> None:
+    global _UPDATE_EXECUTOR
+    _UPDATE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+        max_workers=BOT_THREADS,
+        thread_name_prefix="guest-update",
+    )
     offset: int | None = None
-    while not _STOP_EVENT.is_set():
-        updates = _poll_guest_updates(offset)
-        if not updates:
-            continue
-        for update_obj in updates:
-            update_id = update_obj.get("update_id")
-            if isinstance(update_id, int):
-                offset = update_id + 1
-            else:
-                try:
-                    offset = int(update_id) + 1
-                except Exception:
-                    pass
-            _handle_guest_update(update_obj)
+    try:
+        while not _STOP_EVENT.is_set():
+            updates = _poll_guest_updates(offset)
+            if not updates:
+                continue
+            for update_obj in updates:
+                update_id = update_obj.get("update_id")
+                if isinstance(update_id, int):
+                    offset = update_id + 1
+                else:
+                    try:
+                        offset = int(update_id) + 1
+                    except Exception:
+                        pass
+                fut = _UPDATE_EXECUTOR.submit(_handle_guest_update, update_obj)
+                fut.add_done_callback(_log_future_exception)
+    finally:
+        # Allow in-flight updates to finish (up to a reasonable time); Telegram
+        # will re-deliver any updates that were not acknowledged on the next start.
+        _UPDATE_EXECUTOR.shutdown(wait=True, cancel_futures=False)
 
 
 def _wait_until_disabled() -> None:
