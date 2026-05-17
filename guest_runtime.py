@@ -1374,7 +1374,8 @@ def _set_ai_provider(conn: sqlite3.Connection, bot_username: str, provider: str)
 def _get_ai_service(provider: str) -> GuestAIService:
     norm_provider = _normalize_ai_provider(provider)
     if norm_provider == _AI_PROVIDER_GEMINI:
-        cache_key = f"{norm_provider}:{_GEMINI_MODEL}:{bool(_GEMINI_API_KEY)}"
+        key_sig = hashlib.sha256(_GEMINI_API_KEY.encode("utf-8")).hexdigest()[:10] if _GEMINI_API_KEY else "none"
+        cache_key = f"{norm_provider}:{_GEMINI_MODEL}:{key_sig}"
         service = _AI_SERVICE_CACHE.get(cache_key)
         if service is None:
             service = GuestAIService(
@@ -1384,7 +1385,8 @@ def _get_ai_service(provider: str) -> GuestAIService:
             )
             _AI_SERVICE_CACHE[cache_key] = service
         return service
-    cache_key = f"{_AI_PROVIDER_GROQ}:{_GROQ_MODEL}:{bool(_GROQ_API_KEY)}"
+    key_sig = hashlib.sha256(_GROQ_API_KEY.encode("utf-8")).hexdigest()[:10] if _GROQ_API_KEY else "none"
+    cache_key = f"{_AI_PROVIDER_GROQ}:{_GROQ_MODEL}:{key_sig}"
     service = _AI_SERVICE_CACHE.get(cache_key)
     if service is None:
         service = GuestAIService(
