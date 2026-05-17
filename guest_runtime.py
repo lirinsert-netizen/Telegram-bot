@@ -2444,7 +2444,9 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
                 also_delete_msg_id=message_id,
             )
             return True
-        # Block forbidden button types in personal commands
+        # Block forbidden button types in personal commands.
+        # "del" is disabled here because personal commands are user-scoped and
+        # message-deletion controls should not be user-created in this flow.
         forbidden_types = {"rules", "cmd", "del"}
         forbidden_btn = next(
             (btn for row in rows for btn in row if (btn.get("type") or "") in forbidden_types),
@@ -2534,8 +2536,9 @@ def _handle_guest_button_callback(cq: dict, sender_id: int, conn: sqlite3.Connec
         message_id = int(message.get("message_id") or 0)
     except Exception:
         message_id = 0
-    parts = data.split(":")
-    action = parts[1] if len(parts) > 1 else ""
+    action_probe = data.split(":", 2)
+    action = action_probe[1] if len(action_probe) > 1 else ""
+    parts = data.split(":", 4) if action == "popup" else data.split(":", 3)
     try:
         viewer_user_id = int(parts[2]) if len(parts) > 2 else 0
     except Exception:
@@ -2552,7 +2555,7 @@ def _handle_guest_button_callback(cq: dict, sender_id: int, conn: sqlite3.Connec
             popup_index = -1
         popups = (cached or {}).get("popups") or []
         if (popup_index < 0 or popup_index >= len(popups)) and len(parts) > 4:
-            source_cmd = ":".join(parts[4:]).strip()
+            source_cmd = str(parts[4] or "").strip()
             source_user_id = viewer_user_id if viewer_user_id > 0 else sender_id
             if source_cmd:
                 payload = _resolve_guest_response(conn, _BOT_USERNAME, source_cmd, source_user_id)
@@ -2578,7 +2581,7 @@ def _handle_guest_button_callback(cq: dict, sender_id: int, conn: sqlite3.Connec
         return True
 
     if action == "cmd":
-        cmd_name = ":".join(parts[3:]) if len(parts) > 3 else ""
+        cmd_name = parts[3] if len(parts) > 3 else ""
         payload = _resolve_guest_response(conn, _BOT_USERNAME, cmd_name, sender_id)
         if not payload:
             _rt_answer_cq(query_id, "Команда недоступна.", show_alert=True)
