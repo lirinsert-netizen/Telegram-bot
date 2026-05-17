@@ -13,6 +13,7 @@ import requests
 logger = logging.getLogger("guest_runtime.ai")
 
 _GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+_GEMINI_API_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 _DDG_INSTANT_API_URL = "https://api.duckduckgo.com/"
 _DDG_HTML_SEARCH_URL = "https://html.duckduckgo.com/html/"
 _WIKIPEDIA_SEARCH_API_URL = "https://ru.wikipedia.org/w/api.php"
@@ -21,6 +22,9 @@ _WIKIPEDIA_PAGE_URL_TEMPLATE = "https://ru.wikipedia.org/wiki/{title}"
 _WIKIPEDIA_EN_PAGE_URL_TEMPLATE = "https://en.wikipedia.org/wiki/{title}"
 
 _DEFAULT_MODEL = "llama-3.1-8b-instant"
+_DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
+_PROVIDER_GROQ = "groq"
+_PROVIDER_GEMINI = "gemini_google_ai_studio"
 _MAX_AI_REPLY_LEN = 3500
 _COMPLETION_TEMPERATURE = 0.2
 _MAX_COMPLETION_TOKENS = 700
@@ -636,16 +640,66 @@ def _format_groq_failure(exc: Exception) -> AIReplyResult:
     )
 
 
+def _format_gemini_failure(exc: Exception) -> AIReplyResult:
+    if isinstance(exc, requests.HTTPError):
+        response = exc.response
+        status = int(getattr(response, "status_code", 0) or 0)
+        body = ""
+        try:
+            body = _truncate(_normalize_space(getattr(response, "text", "") or ""), 240)
+        except Exception:
+            body = ""
+        if status in (401, 403):
+            user_message = "Не удалось авторизоваться в Gemini. Проверьте GEMINI_API_KEY."
+        elif status == 404:
+            user_message = "Указанная модель Gemini не найдена. Проверьте GEMINI_MODEL."
+        elif status == 429:
+            user_message = "Gemini временно отклоняет запросы из-за лимитов. Попробуйте позже."
+        elif status >= 500:
+            user_message = "Gemini сейчас недоступен. Попробуйте позже."
+        else:
+            user_message = f"Gemini отклонил запрос (HTTP {status})."
+        debug = f"http_status={status}"
+        if body:
+            debug = f"{debug}; body={body}"
+        return AIReplyResult(
+            error_code="gemini_http_error",
+            user_message=user_message,
+            debug_message=debug,
+        )
+    if isinstance(exc, requests.Timeout):
+        return AIReplyResult(
+            error_code="gemini_timeout",
+            user_message="Gemini не ответил вовремя. Попробуйте позже.",
+            debug_message=str(exc),
+        )
+    if isinstance(exc, requests.RequestException):
+        return AIReplyResult(
+            error_code="gemini_request_error",
+            user_message="Не удалось подключиться к Gemini. Проверьте сеть и повторите попытку.",
+            debug_message=str(exc),
+        )
+    return AIReplyResult(
+        error_code="gemini_unknown_error",
+        user_message="Не удалось выполнить AI-запрос.",
+        debug_message=str(exc),
+    )
+
+
 class GuestAIService:
     def __init__(
         self,
         api_key: str,
         model: str | None = None,
+        provider: str = _PROVIDER_GROQ,
         timeout: tuple[float, float] = (8.0, 25.0),
         session: requests.Session | None = None,
     ) -> None:
+        raw_provider = str(provider or "").strip().lower()
+        self._provider = _PROVIDER_GEMINI if raw_provider in {"gemini", _PROVIDER_GEMINI} else _PROVIDER_GROQ
         self._api_key = (api_key or "").strip()
-        self._model = (model or _DEFAULT_MODEL).strip() or _DEFAULT_MODEL
+        default_model = _DEFAULT_GEMINI_MODEL if self._provider == _PROVIDER_GEMINI else _DEFAULT_MODEL
+        self._model = (model or default_model).strip() or default_model
         self._timeout = timeout
         self._session = session or requests.Session()
         self._session.headers.setdefault("User-Agent", _HTTP_USER_AGENT)
@@ -732,10 +786,11 @@ class GuestAIService:
         owner_intent: str | None = None,
     ) -> AIReplyResult:
         if not self.available():
+            provider_name = "GEMINI_API_KEY" if self._provider == _PROVIDER_GEMINI else "GROQ_API_KEY"
             return AIReplyResult(
                 error_code="missing_api_key",
-                user_message="ИИ отключён: не задан GROQ_API_KEY.",
-                debug_message="missing GROQ_API_KEY",
+                user_message=f"ИИ отключён: не задан {provider_name}.",
+                debug_message=f"missing {provider_name}",
             )
 
         question = _normalize_space(user_text)
@@ -756,39 +811,60 @@ class GuestAIService:
             else _build_no_sources_context(question)
         )
 
-        payload = {
-            "model": self._model,
-            "temperature": _COMPLETION_TEMPERATURE,
-            "max_tokens": _MAX_COMPLETION_TOKENS,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": self.build_system_prompt(
-                        is_owner_sender,
-                        has_sources=has_sources,
-                        owner_intent=owner_intent,
-                    ),
-                },
-                {"role": "user", "content": user_content},
-            ],
-        }
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
+        system_prompt = self.build_system_prompt(
+            is_owner_sender,
+            has_sources=has_sources,
+            owner_intent=owner_intent,
+        )
         try:
-            response = self._session.post(
-                _GROQ_API_URL,
-                json=payload,
-                headers=headers,
-                timeout=self._timeout,
-            )
+            if self._provider == _PROVIDER_GEMINI:
+                payload = {
+                    "systemInstruction": {"parts": [{"text": system_prompt}]},
+                    "contents": [
+                        {
+                            "role": "user",
+                            "parts": [{"text": user_content}],
+                        }
+                    ],
+                    "generationConfig": {
+                        "temperature": _COMPLETION_TEMPERATURE,
+                        "maxOutputTokens": _MAX_COMPLETION_TOKENS,
+                    },
+                }
+                response = self._session.post(
+                    _GEMINI_API_URL_TEMPLATE.format(model=self._model),
+                    params={"key": self._api_key},
+                    json=payload,
+                    timeout=self._timeout,
+                )
+            else:
+                payload = {
+                    "model": self._model,
+                    "temperature": _COMPLETION_TEMPERATURE,
+                    "max_tokens": _MAX_COMPLETION_TOKENS,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content},
+                    ],
+                }
+                headers = {
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                }
+                response = self._session.post(
+                    _GROQ_API_URL,
+                    json=payload,
+                    headers=headers,
+                    timeout=self._timeout,
+                )
             response.raise_for_status()
             data = response.json()
         except Exception as e:
-            failure = _format_groq_failure(e)
+            failure = _format_gemini_failure(e) if self._provider == _PROVIDER_GEMINI else _format_groq_failure(e)
+            provider_label = "Gemini" if self._provider == _PROVIDER_GEMINI else "Groq"
             logger.warning(
-                "[GUEST AI] Groq request failed for query=%r model=%s sources=%s code=%s details=%s",
+                "[GUEST AI] %s request failed for query=%r model=%s sources=%s code=%s details=%s",
+                provider_label,
                 question,
                 self._model,
                 len(sources),
@@ -798,17 +874,30 @@ class GuestAIService:
             return failure
 
         try:
-            choices = data.get("choices") if isinstance(data, dict) else []
-            first = choices[0] if isinstance(choices, list) and choices else {}
-            message = first.get("message") if isinstance(first, dict) else {}
-            content = message.get("content") if isinstance(message, dict) else ""
+            if self._provider == _PROVIDER_GEMINI:
+                candidates = data.get("candidates") if isinstance(data, dict) else []
+                first_candidate = candidates[0] if isinstance(candidates, list) and candidates else {}
+                candidate_content = first_candidate.get("content") if isinstance(first_candidate, dict) else {}
+                parts = candidate_content.get("parts") if isinstance(candidate_content, dict) else []
+                text_parts = [
+                    str(part.get("text") or "").strip()
+                    for part in (parts if isinstance(parts, list) else [])
+                    if isinstance(part, dict) and str(part.get("text") or "").strip()
+                ]
+                content = "\n".join(text_parts).strip()
+            else:
+                choices = data.get("choices") if isinstance(data, dict) else []
+                first = choices[0] if isinstance(choices, list) and choices else {}
+                message = first.get("message") if isinstance(first, dict) else {}
+                content = message.get("content") if isinstance(message, dict) else ""
         except Exception:
             content = ""
         if not isinstance(content, str) or not content.strip():
             logger.warning("[GUEST AI] empty content returned for query=%r model=%s", question, self._model)
+            provider_name = "Gemini" if self._provider == _PROVIDER_GEMINI else "Groq"
             return AIReplyResult(
                 error_code="empty_model_response",
-                user_message="Groq вернул пустой ответ.",
+                user_message=f"{provider_name} вернул пустой ответ.",
                 debug_message="response choices did not contain non-empty message.content",
             )
 

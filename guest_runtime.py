@@ -48,9 +48,13 @@ _AI_MIN_WORD_COUNT_OWNER_DEV = 2
 _AI_FALLBACK_TEXT = "⚠️ <b>ИИ временно недоступен.</b>\nПопробуйте чуть позже."
 _AI_ACCESS_ALL = "all"
 _AI_ACCESS_OWNER = "owner"
+_AI_PROVIDER_GROQ = "groq"
+_AI_PROVIDER_GEMINI = "gemini_google_ai_studio"
 _GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 _GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip() or "llama-3.1-8b-instant"
-_AI_SERVICE = GuestAIService(api_key=_GROQ_API_KEY, model=_GROQ_MODEL)
+_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip() or "gemini-1.5-flash"
+_AI_SERVICE_CACHE: dict[str, GuestAIService] = {}
 _MAX_NESTED_EXTRACTION_DEPTH = 4
 _MAX_BUTTON_ROWS = 10
 _MAX_BUTTONS_PER_ROW = 3
@@ -136,6 +140,12 @@ def _db_connect() -> sqlite3.Connection:
     except Exception as e:
         if "duplicate column name" not in str(e).lower():
             logger.warning("[GUEST RUNTIME] migration ai_access_mode failed: %s", e)
+    try:
+        conn.execute("ALTER TABLE guest_bots ADD COLUMN ai_provider TEXT NOT NULL DEFAULT 'groq'")
+        conn.commit()
+    except Exception as e:
+        if "duplicate column name" not in str(e).lower():
+            logger.warning("[GUEST RUNTIME] migration ai_provider failed: %s", e)
     # Migration: add user_id and rebuild UNIQUE constraint to (guest_bot_id, user_id, name)
     try:
         cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(guest_commands)").fetchall()}
@@ -212,6 +222,24 @@ def _db_connect() -> sqlite3.Connection:
             logger.info("[GUEST RUNTIME] migrated %s legacy guest commands to owner scope", int(cur.rowcount or 0))
     except Exception as e:
         logger.warning("[GUEST RUNTIME] migration legacy owner scope failed: %s", e)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS guest_button_cache (
+                chat_id      INTEGER NOT NULL,
+                message_id   INTEGER NOT NULL,
+                payload_json TEXT    NOT NULL,
+                updated_at   INTEGER NOT NULL,
+                PRIMARY KEY (chat_id, message_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_guest_button_cache_updated_at ON guest_button_cache(updated_at)"
+        )
+        conn.commit()
+    except Exception as e:
+        logger.warning("[GUEST RUNTIME] migration guest_button_cache failed: %s", e)
     return conn
 
 
@@ -556,7 +584,14 @@ def _sanitize_button_for_payload(button: object, popups: list[str]) -> dict | No
     return normalized
 
 
-def _build_guest_reply_markup(rows: list[list[dict]], popups: list[str], viewer_user_id: int) -> dict | None:
+def _build_guest_reply_markup(
+    rows: list[list[dict]],
+    popups: list[str],
+    viewer_user_id: int,
+    *,
+    source_user_id: int = 0,
+    source_cmd_key: str = "",
+) -> dict | None:
     if not rows:
         return None
     keyboard: list[list[dict]] = []
@@ -571,7 +606,9 @@ def _build_guest_reply_markup(rows: list[list[dict]], popups: list[str], viewer_
             if button_type == "url":
                 btn["url"] = normalized.get("url") or ""
             elif button_type == "popup":
-                btn["callback_data"] = f"gbtn:popup:{int(viewer_user_id)}:{int(normalized.get('popup_index') or 0)}"[:64]
+                btn["callback_data"] = (
+                    f"gbtn:popup:{int(source_user_id)}:{int(normalized.get('popup_index') or 0)}:{str(source_cmd_key or '').strip()}"
+                )[:64]
             elif button_type == "del":
                 btn["callback_data"] = f"gbtn:del:{int(viewer_user_id)}"[:64]
             elif button_type == "rules":
@@ -609,13 +646,68 @@ def _cache_guest_button_payload(chat_id: int, message_id: int | None, buttons_pa
             except StopIteration:
                 break
             _GUEST_BUTTON_CACHE.pop(oldest_key, None)
+    try:
+        conn = _db_connect()
+        conn.execute(
+            """
+            INSERT INTO guest_button_cache(chat_id, message_id, payload_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(chat_id, message_id) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                int(chat_id),
+                int(message_id),
+                json.dumps(cache_value, ensure_ascii=False),
+                int(time.time()),
+            ),
+        )
+        conn.execute(
+            """
+            DELETE FROM guest_button_cache
+            WHERE rowid IN (
+                SELECT rowid FROM guest_button_cache
+                ORDER BY updated_at DESC
+                LIMIT -1 OFFSET ?
+            )
+            """,
+            (_GUEST_BUTTON_CACHE_LIMIT * 4,),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.debug("[GUEST RUNTIME] failed to persist button cache: %s", e)
 
 
 def _get_cached_guest_button_payload(chat_id: int, message_id: int | None) -> dict | None:
     if not chat_id or not message_id:
         return None
     with _GUEST_BUTTON_CACHE_LOCK:
-        return _GUEST_BUTTON_CACHE.get((int(chat_id), int(message_id)))
+        cached = _GUEST_BUTTON_CACHE.get((int(chat_id), int(message_id)))
+    if cached:
+        return cached
+    try:
+        conn = _db_connect()
+        row = conn.execute(
+            """
+            SELECT payload_json
+            FROM guest_button_cache
+            WHERE chat_id = ? AND message_id = ?
+            LIMIT 1
+            """,
+            (int(chat_id), int(message_id)),
+        ).fetchone()
+        if not row:
+            return None
+        loaded = _safe_json_loads(str(row[0] or ""), {})
+        if not isinstance(loaded, dict):
+            return None
+        with _GUEST_BUTTON_CACHE_LOCK:
+            _GUEST_BUTTON_CACHE[(int(chat_id), int(message_id))] = loaded
+        return loaded
+    except Exception as e:
+        logger.debug("[GUEST RUNTIME] failed to read button cache: %s", e)
+        return None
 
 
 def _drop_cached_guest_button_payload(chat_id: int, message_id: int | None) -> None:
@@ -623,6 +715,15 @@ def _drop_cached_guest_button_payload(chat_id: int, message_id: int | None) -> N
         return
     with _GUEST_BUTTON_CACHE_LOCK:
         _GUEST_BUTTON_CACHE.pop((int(chat_id), int(message_id)), None)
+    try:
+        conn = _db_connect()
+        conn.execute(
+            "DELETE FROM guest_button_cache WHERE chat_id = ? AND message_id = ?",
+            (int(chat_id), int(message_id)),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.debug("[GUEST RUNTIME] failed to delete button cache: %s", e)
 
 
 def _extract_command_key(text: str, bot_username: str) -> str | None:
@@ -915,6 +1016,7 @@ def _send_message_response_ex(
     message_thread_id: int | None = None,
     *,
     reply_markup: dict | None = None,
+    disable_web_page_preview: bool = True,
 ) -> tuple[bool, int | None]:
     if not chat_id or not response_text:
         return False, None
@@ -922,7 +1024,7 @@ def _send_message_response_ex(
         "chat_id": int(chat_id),
         "text": response_text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": True,
+        "disable_web_page_preview": bool(disable_web_page_preview),
     }
     if reply_to_message_id:
         payload["reply_to_message_id"] = int(reply_to_message_id)
@@ -955,12 +1057,15 @@ def _send_message_response(
     response_text: str,
     reply_to_message_id: int | None = None,
     message_thread_id: int | None = None,
+    *,
+    disable_web_page_preview: bool = True,
 ) -> bool:
     ok, _ = _send_message_response_ex(
         chat_id,
         response_text,
         reply_to_message_id=reply_to_message_id,
         message_thread_id=message_thread_id,
+        disable_web_page_preview=disable_web_page_preview,
     )
     return ok
 
@@ -986,6 +1091,9 @@ def _send_payload_response(
     *,
     reply_to_message_id: int | None = None,
     message_thread_id: int | None = None,
+    disable_web_page_preview: bool = True,
+    source_user_id: int = 0,
+    source_cmd_key: str = "",
 ) -> bool:
     if not chat_id:
         return False
@@ -996,6 +1104,8 @@ def _send_payload_response(
         normalized_buttons.get("rows") or [],
         normalized_buttons.get("popups") or [],
         viewer_user_id,
+        source_user_id=source_user_id,
+        source_cmd_key=source_cmd_key,
     )
 
     if not media_items:
@@ -1008,6 +1118,7 @@ def _send_payload_response(
             reply_to_message_id=reply_to_message_id,
             message_thread_id=message_thread_id,
             reply_markup=reply_markup,
+            disable_web_page_preview=disable_web_page_preview,
         )
         if ok and reply_markup and message_id:
             _cache_guest_button_payload(chat_id, message_id, normalized_buttons, viewer_user_id)
@@ -1163,6 +1274,17 @@ def _normalize_ai_access_mode(value: str) -> str:
     return _AI_ACCESS_OWNER if mode == _AI_ACCESS_OWNER else _AI_ACCESS_ALL
 
 
+def _normalize_ai_provider(value: str) -> str:
+    provider = _normalize_space(value).lower()
+    if provider in {"gemini", "gemini google ai studio", _AI_PROVIDER_GEMINI}:
+        return _AI_PROVIDER_GEMINI
+    return _AI_PROVIDER_GROQ
+
+
+def _ai_provider_label(provider: str) -> str:
+    return "Gemini Google AI Studio" if _normalize_ai_provider(provider) == _AI_PROVIDER_GEMINI else "Groq"
+
+
 def _normalize_bot_username(value: str) -> str:
     return str(value or "").strip().lstrip("@").lower()
 
@@ -1206,6 +1328,74 @@ def _set_ai_access_mode(conn: sqlite3.Connection, bot_username: str, mode: str) 
     except Exception as e:
         logger.warning("[GUEST RUNTIME] set ai_access_mode error: %s", e)
         return False
+
+
+def _get_ai_provider(conn: sqlite3.Connection, bot_username: str) -> str:
+    uname = _normalize_bot_username(bot_username)
+    if not uname:
+        return _AI_PROVIDER_GROQ
+    row = conn.execute(
+        """
+        SELECT ai_provider
+        FROM guest_bots
+        WHERE lower(bot_username) = ?
+        LIMIT 1
+        """,
+        (uname,),
+    ).fetchone()
+    raw = row[0] if row else _AI_PROVIDER_GROQ
+    return _normalize_ai_provider(str(raw or ""))
+
+
+def _set_ai_provider(conn: sqlite3.Connection, bot_username: str, provider: str) -> bool:
+    ts = int(time.time())
+    norm_provider = _normalize_ai_provider(provider)
+    uname = _normalize_bot_username(bot_username)
+    if not uname:
+        return False
+    try:
+        cur = conn.execute(
+            """
+            UPDATE guest_bots
+            SET ai_provider = ?, updated_at = ?
+            WHERE lower(bot_username) = ?
+            """,
+            (norm_provider, ts, uname),
+        )
+        if int(cur.rowcount or 0) == 0:
+            return False
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.warning("[GUEST RUNTIME] set ai_provider error: %s", e)
+        return False
+
+
+def _get_ai_service(provider: str) -> GuestAIService:
+    norm_provider = _normalize_ai_provider(provider)
+    if norm_provider == _AI_PROVIDER_GEMINI:
+        key_sig = hashlib.sha256(_GEMINI_API_KEY.encode("utf-8")).hexdigest()[:10] if _GEMINI_API_KEY else "none"
+        cache_key = f"{norm_provider}:{_GEMINI_MODEL}:{key_sig}"
+        service = _AI_SERVICE_CACHE.get(cache_key)
+        if service is None:
+            service = GuestAIService(
+                api_key=_GEMINI_API_KEY,
+                model=_GEMINI_MODEL,
+                provider=_AI_PROVIDER_GEMINI,
+            )
+            _AI_SERVICE_CACHE[cache_key] = service
+        return service
+    key_sig = hashlib.sha256(_GROQ_API_KEY.encode("utf-8")).hexdigest()[:10] if _GROQ_API_KEY else "none"
+    cache_key = f"{_AI_PROVIDER_GROQ}:{_GROQ_MODEL}:{key_sig}"
+    service = _AI_SERVICE_CACHE.get(cache_key)
+    if service is None:
+        service = GuestAIService(
+            api_key=_GROQ_API_KEY,
+            model=_GROQ_MODEL,
+            provider=_AI_PROVIDER_GROQ,
+        )
+        _AI_SERVICE_CACHE[cache_key] = service
+    return service
 
 
 def _is_owner_or_dev_sender(sender_id: int, owner_user_id: int) -> bool:
@@ -1423,7 +1613,13 @@ def _rt_get_guest_bot_id(conn: sqlite3.Connection, bot_username: str) -> int:
 
 # ---- Main commands page (shown on /start) ----
 
-def _rt_build_main_text(cmds: list[dict], sender: dict | None = None) -> str:
+def _rt_build_main_text(
+    cmds: list[dict],
+    sender: dict | None = None,
+    *,
+    ai_provider: str = _AI_PROVIDER_GROQ,
+    show_ai_provider_hint: bool = False,
+) -> str:
     count = len(cmds)
     sender = sender or {}
     sender_id = int(sender.get("id") or 0)
@@ -1438,12 +1634,20 @@ def _rt_build_main_text(cmds: list[dict], sender: dict | None = None) -> str:
     bot_uname = _html.escape(_BOT_USERNAME)
     bot_display = _html.escape(_BOT_DISPLAY_NAME or _BOT_USERNAME)
     bot_link = f'<a href="https://t.me/{bot_uname}">{bot_display}</a>'
-    return (
+    body = (
         f"<b>Привет, {mention}!</b>\n\n"
         f"Я {bot_link} — бот для создания персональных команд, которые будут работать "
         f"в гостевом режиме в группе, где меня даже нет.\n\n"
         f"<b>Количество команд:</b> <code>{count}</code>"
     )
+    if show_ai_provider_hint:
+        body += (
+            "\n"
+            f"<b>Модель ИИ:</b> <code>{_html.escape(_ai_provider_label(ai_provider))}</code>\n"
+            "Сменить модель можно текстом:\n"
+            "<code>groq</code> или <code>gemini google ai studio</code>"
+        )
+    return body
 
 
 def _rt_build_main_kb(ai_access_mode: str, show_ai: bool = False) -> dict:
@@ -1545,7 +1749,12 @@ def _rt_show_main(chat_id: int, conn: sqlite3.Connection, sender_id: int = 0, se
     ai_access_mode = _get_ai_access_mode(conn, _BOT_USERNAME)
     owner_user_id = _get_owner_user_id(conn, _BOT_USERNAME)
     show_ai = _is_owner_or_dev_sender(sender_id, owner_user_id)
-    _rt_send(chat_id, _rt_build_main_text(cmds, sender=sender), _rt_build_main_kb(ai_access_mode, show_ai=show_ai))
+    ai_provider = _get_ai_provider(conn, _BOT_USERNAME)
+    _rt_send(
+        chat_id,
+        _rt_build_main_text(cmds, sender=sender, ai_provider=ai_provider, show_ai_provider_hint=bool(owner_user_id and sender_id == owner_user_id)),
+        _rt_build_main_kb(ai_access_mode, show_ai=show_ai),
+    )
 
 
 def _rt_upsert_command(
@@ -1640,7 +1849,13 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
         ai_access_mode = _get_ai_access_mode(conn, _BOT_USERNAME)
         owner_user_id = _get_owner_user_id(conn, _BOT_USERNAME)
         show_ai = _is_owner_or_dev_sender(sender_id, owner_user_id)
-        _rt_edit(chat_id, message_id, _rt_build_main_text(cmds, sender=sender), _rt_build_main_kb(ai_access_mode, show_ai=show_ai))
+        ai_provider = _get_ai_provider(conn, _BOT_USERNAME)
+        _rt_edit(
+            chat_id,
+            message_id,
+            _rt_build_main_text(cmds, sender=sender, ai_provider=ai_provider, show_ai_provider_hint=bool(owner_user_id and sender_id == owner_user_id)),
+            _rt_build_main_kb(ai_access_mode, show_ai=show_ai),
+        )
 
     def _go_list(page: int = 0) -> None:
         cmds = _rt_list_commands_for_bot(conn, _BOT_USERNAME, user_id=sender_id)
@@ -1835,8 +2050,7 @@ def _handle_pm_callback(cq: dict, sender_id: int, conn: sqlite3.Connection) -> N
             f"{_E_SETTINGS} <b>Пришлите кнопки для команды.</b>\n\n"
             "<b>Формат:</b>\n"
             "<code>Название - example.com</code>\n"
-            "<code>Название - popup: текст</code>\n"
-            "<code>Название - del</code>\n\n"
+            "<code>Название - popup: текст</code>\n\n"
             "<b>Несколько в одном ряду:</b>\n"
             "<code>Кнопка1 - example.com & Кнопка2 - example.com</code>\n\n"
             "<b>Цвет:</b>\n"
@@ -2026,6 +2240,26 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
         _rt_show_main(chat_id, conn, sender_id=sender_id, sender=sender)
         return True
 
+    owner_user_id = _get_owner_user_id(conn, _BOT_USERNAME)
+    normalized_text = _normalize_space(text).lower()
+    provider_selection_commands = {
+        "groq": _AI_PROVIDER_GROQ,
+        "gemini google ai studio": _AI_PROVIDER_GEMINI,
+        "режим ии groq": _AI_PROVIDER_GROQ,
+        "режим ии gemini google ai studio": _AI_PROVIDER_GEMINI,
+    }
+    requested_provider = provider_selection_commands.get(normalized_text)
+    if requested_provider:
+        if not owner_user_id or sender_id != owner_user_id:
+            _rt_send(chat_id, f"{_E_OFF} Выбор модели ИИ доступен только владельцу guest-бота.")
+            return True
+        if not _set_ai_provider(conn, _BOT_USERNAME, requested_provider):
+            _rt_send(chat_id, f"{_E_OFF} Не удалось изменить модель ИИ.")
+            return True
+        _rt_show_main(chat_id, conn, sender_id=sender_id, sender=sender)
+        _rt_send(chat_id, f"{_E_OK} Модель ИИ переключена: <code>{_html.escape(_ai_provider_label(requested_provider))}</code>.")
+        return True
+
     # Cancel
     if text.lower() in {"отмена", "cancel", "/cancel"}:
         if sender_id in _RT_PENDING:
@@ -2212,8 +2446,10 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
                 also_delete_msg_id=message_id,
             )
             return True
-        # Block forbidden button types in personal commands
-        forbidden_types = {"rules", "cmd"}
+        # Block forbidden button types in personal commands.
+        # "del" is disabled here because personal commands are user-scoped and
+        # message-deletion controls should not be user-created in this flow.
+        forbidden_types = {"rules", "cmd", "del"}
         forbidden_btn = next(
             (btn for row in rows for btn in row if (btn.get("type") or "") in forbidden_types),
             None,
@@ -2224,7 +2460,7 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
                 chat_id,
                 state,
                 f"{_E_OFF} <b>Тип кнопки «{_html.escape(ftype)}» нельзя использовать в персональных командах.</b>\n"
-                "Допустимые типы: ссылка, popup, del.",
+                "Допустимые типы: ссылка, popup.",
                 _rt_inline_kb([_rt_btn("Отмена", "gcmd:draft_buttons_cancel")]),
                 also_delete_msg_id=message_id,
             )
@@ -2302,27 +2538,35 @@ def _handle_guest_button_callback(cq: dict, sender_id: int, conn: sqlite3.Connec
         message_id = int(message.get("message_id") or 0)
     except Exception:
         message_id = 0
-    parts = data.split(":", 3)
-    action = parts[1] if len(parts) > 1 else ""
+    action_probe = data.split(":", 2)
+    action = action_probe[1] if len(action_probe) > 1 else ""
+    parts = data.split(":", 4) if action == "popup" else data.split(":", 3)
     try:
         viewer_user_id = int(parts[2]) if len(parts) > 2 else 0
     except Exception:
         viewer_user_id = 0
-    if viewer_user_id and sender_id != viewer_user_id:
+    if action != "popup" and viewer_user_id and sender_id != viewer_user_id:
         _rt_answer_cq(query_id, "Недоступно.", show_alert=True)
         return True
 
     if action == "popup":
         cached = _get_cached_guest_button_payload(chat_id, message_id)
-        if not cached:
-            _rt_answer_cq(query_id, "Данные кнопки устарели. Отправьте команду заново.", show_alert=True)
-            return True
         try:
             popup_index = int(parts[3]) if len(parts) > 3 else -1
         except Exception:
             popup_index = -1
-        popups = cached.get("popups") or []
+        popups = (cached or {}).get("popups") or []
+        if (popup_index < 0 or popup_index >= len(popups)) and len(parts) > 4:
+            source_cmd = str(parts[4] or "").strip()
+            source_user_id = viewer_user_id if viewer_user_id > 0 else sender_id
+            if source_cmd:
+                payload = _resolve_guest_response(conn, _BOT_USERNAME, source_cmd, source_user_id)
+                if payload:
+                    popups = ((payload.get("buttons") or {}).get("popups") or [])
         if popup_index < 0 or popup_index >= len(popups):
+            if not cached:
+                _rt_answer_cq(query_id, "Данные кнопки устарели. Отправьте команду заново.", show_alert=True)
+                return True
             _rt_answer_cq(query_id, "Попап недоступен.", show_alert=True)
             return True
         _rt_answer_cq(query_id, str(popups[popup_index] or "").strip()[:200], show_alert=True)
@@ -2356,6 +2600,8 @@ def _handle_guest_button_callback(cq: dict, sender_id: int, conn: sqlite3.Connec
             buttons_payload=payload.get("buttons") or {},
             viewer_user_id=sender_id,
             message_thread_id=int(message.get("message_thread_id") or 0) or None,
+            source_user_id=sender_id,
+            source_cmd_key=cmd_name,
         )
         if not sent:
             logger.warning("[GUEST RUNTIME] failed to send payload for guest button command=%s", cmd_name)
@@ -2513,6 +2759,172 @@ def _extract_message_text(
     return ""
 
 
+def _extract_user_object(
+    payload_obj: dict,
+    update_obj: dict | None = None,
+    *,
+    _depth: int = 0,
+) -> dict | None:
+    if _depth > _MAX_NESTED_EXTRACTION_DEPTH or not isinstance(payload_obj, dict):
+        return None
+    for key in ("from", "from_user", "sender", "user", "sender_user", "author", "actor"):
+        candidate = payload_obj.get(key)
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            uid = int(candidate.get("id") or 0)
+        except Exception:
+            uid = 0
+        if uid > 0:
+            return candidate
+    for nested_key in ("guest_query", "guest_message", "message", "inline_query"):
+        nested_payload = payload_obj.get(nested_key)
+        if isinstance(nested_payload, dict):
+            found = _extract_user_object(nested_payload, None, _depth=_depth + 1)
+            if found:
+                return found
+    if isinstance(update_obj, dict):
+        for nested_key in ("guest_query", "guest_message", "message", "edited_message", "channel_post", "edited_channel_post", "inline_query"):
+            nested_payload = update_obj.get(nested_key)
+            if isinstance(nested_payload, dict):
+                found = _extract_user_object(nested_payload, None, _depth=_depth + 1)
+                if found:
+                    return found
+    return None
+
+
+def _extract_reply_user_object(
+    payload_obj: dict,
+    update_obj: dict | None = None,
+    *,
+    _depth: int = 0,
+) -> dict | None:
+    if _depth > _MAX_NESTED_EXTRACTION_DEPTH or not isinstance(payload_obj, dict):
+        return None
+    reply_to = payload_obj.get("reply_to_message")
+    if isinstance(reply_to, dict):
+        return _extract_user_object(reply_to, None, _depth=_depth + 1)
+    for nested_key in ("guest_query", "guest_message", "message", "inline_query"):
+        nested_payload = payload_obj.get(nested_key)
+        if isinstance(nested_payload, dict):
+            found = _extract_reply_user_object(nested_payload, None, _depth=_depth + 1)
+            if found:
+                return found
+    if isinstance(update_obj, dict):
+        for nested_key in ("guest_query", "guest_message", "message", "edited_message", "channel_post", "edited_channel_post", "inline_query"):
+            nested_payload = update_obj.get(nested_key)
+            if isinstance(nested_payload, dict):
+                found = _extract_reply_user_object(nested_payload, None, _depth=_depth + 1)
+                if found:
+                    return found
+    return None
+
+
+def _extract_chat_title(payload_obj: dict, update_obj: dict | None = None, *, _depth: int = 0) -> str:
+    if _depth > _MAX_NESTED_EXTRACTION_DEPTH or not isinstance(payload_obj, dict):
+        return ""
+    chat = payload_obj.get("chat")
+    if isinstance(chat, dict):
+        title = str(chat.get("title") or chat.get("username") or "").strip()
+        if title:
+            return title
+    for key in ("chat_title", "group_name", "title"):
+        value = str(payload_obj.get(key) or "").strip()
+        if value:
+            return value
+    for nested_key in ("guest_query", "guest_message", "message", "inline_query"):
+        nested_payload = payload_obj.get(nested_key)
+        if isinstance(nested_payload, dict):
+            found = _extract_chat_title(nested_payload, None, _depth=_depth + 1)
+            if found:
+                return found
+    if isinstance(update_obj, dict):
+        for nested_key in ("guest_query", "guest_message", "message", "edited_message", "channel_post", "edited_channel_post", "inline_query"):
+            nested_payload = update_obj.get(nested_key)
+            if isinstance(nested_payload, dict):
+                found = _extract_chat_title(nested_payload, None, _depth=_depth + 1)
+                if found:
+                    return found
+    return ""
+
+
+def _mention_html_for_user(user_obj: dict, fallback_user_id: int = 0) -> str:
+    uid = 0
+    try:
+        uid = int(user_obj.get("id") or 0) if isinstance(user_obj, dict) else 0
+    except Exception:
+        uid = 0
+    if not uid:
+        uid = int(fallback_user_id or 0)
+    full_name = ""
+    if isinstance(user_obj, dict):
+        first_name = str(user_obj.get("first_name") or "").strip()
+        last_name = str(user_obj.get("last_name") or "").strip()
+        username = str(user_obj.get("username") or "").strip()
+        full_name = (first_name + (" " + last_name if last_name else "")).strip() or username
+    label = _html.escape(full_name or "Участник")
+    if uid > 0:
+        return f'<a href="tg://user?id={uid}">{label}</a>'
+    return label
+
+
+def _build_user_display_name(user_obj: dict | None) -> str:
+    if not isinstance(user_obj, dict):
+        return "Участник"
+    first_name = str(user_obj.get("first_name") or "").strip()
+    last_name = str(user_obj.get("last_name") or "").strip()
+    username = str(user_obj.get("username") or "").strip()
+    return (first_name + (" " + last_name if last_name else "")).strip() or username or "Участник"
+
+
+def _apply_guest_text_variables(
+    html_text: str,
+    *,
+    chat_id: int = 0,
+    chat_title: str = "",
+    user_obj: dict | None = None,
+    reply_user_obj: dict | None = None,
+) -> tuple[str, bool]:
+    raw = str(html_text or "")
+    has_nolink = "[NOLINK]" in raw
+    has_link = "[LINK]" in raw
+    disable_preview = True
+    if has_link and not has_nolink:
+        disable_preview = False
+
+    viewer = user_obj or {}
+    try:
+        viewer_id = int(viewer.get("id") or 0)
+    except Exception:
+        viewer_id = 0
+    viewer_name = _build_user_display_name(viewer)
+    viewer_mention = _mention_html_for_user(viewer, fallback_user_id=viewer_id)
+
+    result = raw
+    result = result.replace("[NOLINK]", "")
+    result = result.replace("[LINK]", "")
+    result = result.replace("[GROUP_NAME]", _html.escape(chat_title or str(chat_id or "")))
+    result = result.replace("[USER_MENTION]", viewer_mention)
+    result = result.replace("[USER_ID]", str(viewer_id or ""))
+    result = result.replace("[USER_NAME]", _html.escape(viewer_name))
+
+    if isinstance(reply_user_obj, dict):
+        try:
+            reply_id = int(reply_user_obj.get("id") or 0)
+        except Exception:
+            reply_id = 0
+        reply_name = _build_user_display_name(reply_user_obj)
+        result = result.replace("[REPLY_MENTION]", _mention_html_for_user(reply_user_obj, fallback_user_id=reply_id))
+        result = result.replace("[REPLY_ID]", str(reply_id or ""))
+        result = result.replace("[REPLY_NAME]", _html.escape(reply_name))
+    else:
+        result = result.replace("[REPLY_MENTION]", "")
+        result = result.replace("[REPLY_ID]", "")
+        result = result.replace("[REPLY_NAME]", "")
+
+    return result, disable_preview
+
+
 def _count_words(text: str) -> int:
     return sum(1 for part in re.split(r"\s+", (text or "").strip()) if part)
 
@@ -2526,11 +2938,18 @@ def _build_inline_result_id(seed: str) -> str:
     return hashlib.sha256(raw).hexdigest()[:12]
 
 
-def _build_inline_article_result(text: str, parse_mode: str | None = None, reply_markup: dict | None = None) -> dict:
+def _build_inline_article_result(
+    text: str,
+    parse_mode: str | None = None,
+    reply_markup: dict | None = None,
+    *,
+    disable_web_page_preview: bool = True,
+) -> dict:
     """Return InlineQueryResultArticle payload object for answerGuestQuery."""
     input_content: dict = {"message_text": text}
     if parse_mode:
         input_content["parse_mode"] = parse_mode
+    input_content["disable_web_page_preview"] = bool(disable_web_page_preview)
     result_obj = {
         "type": "article",
         "id": _build_inline_result_id(f"article:{text}:{parse_mode or ''}"),
@@ -2585,6 +3004,10 @@ def _answer_guest_query(
     media: list[dict] | None = None,
     buttons_payload: dict | None = None,
     viewer_user_id: int = 0,
+    *,
+    disable_web_page_preview: bool = True,
+    source_user_id: int = 0,
+    source_cmd_key: str = "",
 ) -> bool:
     if not guest_query_id:
         return False
@@ -2599,6 +3022,8 @@ def _answer_guest_query(
         normalized_buttons.get("rows") or [],
         normalized_buttons.get("popups") or [],
         viewer_user_id,
+        source_user_id=source_user_id,
+        source_cmd_key=source_cmd_key,
     )
     if not html_response_text and not clean_response_text and not media_items and not reply_markup:
         logger.warning("[GUEST RUNTIME] answerGuestQuery skipped: empty response")
@@ -2621,7 +3046,14 @@ def _answer_guest_query(
     article_plain = clean_response_text or placeholder_text
     for text, parse_mode in ((article_html, "HTML"), (article_plain, None)):
         if text:
-            attempts.append(_build_inline_article_result(text, parse_mode, reply_markup=reply_markup))
+            attempts.append(
+                _build_inline_article_result(
+                    text,
+                    parse_mode,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=disable_web_page_preview,
+                )
+            )
 
     last_error = ""
     for result_obj in attempts:
@@ -2701,6 +3133,9 @@ def _handle_guest_update(update_obj: dict) -> None:
 
     # Extract sender ID for command lookup and AI access checks
     sender_id = _extract_sender_id(guest_payload, update_obj)
+    sender_obj = _extract_user_object(guest_payload, update_obj) or {}
+    reply_user_obj = _extract_reply_user_object(guest_payload, update_obj)
+    chat_title = _extract_chat_title(guest_payload, update_obj)
 
     text = _extract_message_text(guest_payload, update_obj)
     if not text:
@@ -2720,12 +3155,25 @@ def _handle_guest_update(update_obj: dict) -> None:
             response = _resolve_guest_response(conn, _BOT_USERNAME, cmd_key, sender_id)
         sent = False
         if response:
-            response_text = str(response.get("text") or "")
+            response_text_raw = str(response.get("text") or "")
+            response_text, disable_preview = _apply_guest_text_variables(
+                response_text_raw,
+                chat_id=chat_id,
+                chat_title=chat_title,
+                user_obj=sender_obj,
+                reply_user_obj=reply_user_obj,
+            )
             response_media = response.get("media") or []
             response_buttons = response.get("buttons") or {}
             has_buttons = bool((response_buttons.get("rows") or [])) if isinstance(response_buttons, dict) else False
             if guest_query_id and not response_media and not has_buttons and response_text:
-                sent = _answer_guest_query(guest_query_id, response_text)
+                sent = _answer_guest_query(
+                    guest_query_id,
+                    response_text,
+                    disable_web_page_preview=disable_preview,
+                    source_user_id=sender_id,
+                    source_cmd_key=cmd_key or "",
+                )
             if not sent and chat_id:
                 if guest_query_id and (response_media or has_buttons):
                     logger.info("[GUEST RUNTIME] guest_query response requires chat delivery because media/buttons are present")
@@ -2739,6 +3187,9 @@ def _handle_guest_update(update_obj: dict) -> None:
                     viewer_user_id=sender_id,
                     reply_to_message_id=reply_to_message_id,
                     message_thread_id=message_thread_id,
+                    disable_web_page_preview=disable_preview,
+                    source_user_id=sender_id,
+                    source_cmd_key=cmd_key or "",
                 )
             if not sent and guest_query_id and (response_media or has_buttons):
                 # Inline queries may have no chat_id, so payload delivery can fail.
@@ -2753,6 +3204,9 @@ def _handle_guest_update(update_obj: dict) -> None:
                     media=response_media,
                     buttons_payload=response_buttons,
                     viewer_user_id=sender_id,
+                    disable_web_page_preview=disable_preview,
+                    source_user_id=sender_id,
+                    source_cmd_key=cmd_key or "",
                 )
             if not sent and cmd_key:
                 if not _send_owner_problem_report(conn, _BOT_USERNAME, cmd_key, "failed to deliver response", text):
@@ -2762,6 +3216,7 @@ def _handle_guest_update(update_obj: dict) -> None:
         ai_access_mode = _get_ai_access_mode(conn, _BOT_USERNAME)
         if not _is_sender_allowed_for_ai(sender_id, owner_user_id, ai_access_mode):
             return
+        ai_provider = _get_ai_provider(conn, _BOT_USERNAME)
         min_words = (
             _AI_MIN_WORD_COUNT_OWNER_DEV
             if _is_owner_or_dev_sender(sender_id, owner_user_id)
@@ -2771,7 +3226,8 @@ def _handle_guest_update(update_obj: dict) -> None:
             return
         is_owner_sender = bool(owner_user_id and sender_id == owner_user_id)
         owner_intent = _detect_owner_intent(text) if is_owner_sender else None
-        ai_result = _AI_SERVICE.generate_reply_result(
+        ai_service = _get_ai_service(ai_provider)
+        ai_result = ai_service.generate_reply_result(
             text,
             is_owner_sender=is_owner_sender,
             owner_intent=owner_intent,
@@ -2788,13 +3244,14 @@ def _handle_guest_update(update_obj: dict) -> None:
             )
         sent = False
         if guest_query_id:
-            sent = _answer_guest_query(guest_query_id, ai_text)
+            sent = _answer_guest_query(guest_query_id, ai_text, disable_web_page_preview=True)
         if not sent and chat_id:
             sent = _send_message_response(
                 chat_id=chat_id,
                 response_text=ai_text,
                 reply_to_message_id=reply_to_message_id,
                 message_thread_id=message_thread_id,
+                disable_web_page_preview=True,
             )
         if sent:
             if not ai_result.ok:
