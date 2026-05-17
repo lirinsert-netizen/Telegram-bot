@@ -2240,13 +2240,13 @@ def _handle_pm_message(msg: dict, sender_id: int, conn: sqlite3.Connection) -> b
 
     owner_user_id = _get_owner_user_id(conn, _BOT_USERNAME)
     normalized_text = _normalize_space(text).lower()
-    model_text_to_provider = {
+    provider_selection_commands = {
         "groq": _AI_PROVIDER_GROQ,
         "gemini google ai studio": _AI_PROVIDER_GEMINI,
         "режим ии groq": _AI_PROVIDER_GROQ,
         "режим ии gemini google ai studio": _AI_PROVIDER_GEMINI,
     }
-    requested_provider = model_text_to_provider.get(normalized_text)
+    requested_provider = provider_selection_commands.get(normalized_text)
     if requested_provider:
         if not owner_user_id or sender_id != owner_user_id:
             _rt_send(chat_id, f"{_E_OFF} Выбор модели ИИ доступен только владельцу guest-бота.")
@@ -2534,7 +2534,7 @@ def _handle_guest_button_callback(cq: dict, sender_id: int, conn: sqlite3.Connec
         message_id = int(message.get("message_id") or 0)
     except Exception:
         message_id = 0
-    parts = data.split(":", 4)
+    parts = data.split(":")
     action = parts[1] if len(parts) > 1 else ""
     try:
         viewer_user_id = int(parts[2]) if len(parts) > 2 else 0
@@ -2552,7 +2552,7 @@ def _handle_guest_button_callback(cq: dict, sender_id: int, conn: sqlite3.Connec
             popup_index = -1
         popups = (cached or {}).get("popups") or []
         if (popup_index < 0 or popup_index >= len(popups)) and len(parts) > 4:
-            source_cmd = str(parts[4] or "").strip()
+            source_cmd = ":".join(parts[4:]).strip()
             source_user_id = viewer_user_id if viewer_user_id > 0 else sender_id
             if source_cmd:
                 payload = _resolve_guest_response(conn, _BOT_USERNAME, source_cmd, source_user_id)
@@ -2863,6 +2863,15 @@ def _mention_html_for_user(user_obj: dict, fallback_user_id: int = 0) -> str:
     return label
 
 
+def _build_user_display_name(user_obj: dict | None) -> str:
+    if not isinstance(user_obj, dict):
+        return "Участник"
+    first_name = str(user_obj.get("first_name") or "").strip()
+    last_name = str(user_obj.get("last_name") or "").strip()
+    username = str(user_obj.get("username") or "").strip()
+    return (first_name + (" " + last_name if last_name else "")).strip() or username or "Участник"
+
+
 def _apply_guest_text_variables(
     html_text: str,
     *,
@@ -2883,11 +2892,7 @@ def _apply_guest_text_variables(
         viewer_id = int(viewer.get("id") or 0)
     except Exception:
         viewer_id = 0
-    viewer_name = (
-        (str(viewer.get("first_name") or "").strip() + (" " + str(viewer.get("last_name") or "").strip() if str(viewer.get("last_name") or "").strip() else "")).strip()
-        or str(viewer.get("username") or "").strip()
-        or "Участник"
-    )
+    viewer_name = _build_user_display_name(viewer)
     viewer_mention = _mention_html_for_user(viewer, fallback_user_id=viewer_id)
 
     result = raw
@@ -2903,11 +2908,7 @@ def _apply_guest_text_variables(
             reply_id = int(reply_user_obj.get("id") or 0)
         except Exception:
             reply_id = 0
-        reply_name = (
-            (str(reply_user_obj.get("first_name") or "").strip() + (" " + str(reply_user_obj.get("last_name") or "").strip() if str(reply_user_obj.get("last_name") or "").strip() else "")).strip()
-            or str(reply_user_obj.get("username") or "").strip()
-            or "Участник"
-        )
+        reply_name = _build_user_display_name(reply_user_obj)
         result = result.replace("[REPLY_MENTION]", _mention_html_for_user(reply_user_obj, fallback_user_id=reply_id))
         result = result.replace("[REPLY_ID]", str(reply_id or ""))
         result = result.replace("[REPLY_NAME]", _html.escape(reply_name))
