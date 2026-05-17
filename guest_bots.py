@@ -175,8 +175,8 @@ def autostart_guest_bots() -> None:
         _launch_guest_runtime(entry)
 
 
-def _guest_bots_menu_text(user: types.User) -> str:
-    bots = list_guest_bots(owner_user_id=int(user.id))
+def _guest_bots_menu_text(user: types.User, bots: list[dict] | None = None) -> str:
+    bots = list(bots) if bots is not None else list_guest_bots(owner_user_id=int(user.id))
     hdr = _pe(_EMOJI_LIST, "📋")
     if not bots:
         return (
@@ -203,9 +203,9 @@ def _guest_bots_menu_text(user: types.User) -> str:
     return "\n".join(lines)
 
 
-def _guest_bots_menu_kb(user: types.User, selected_guest_id: int = 0) -> types.InlineKeyboardMarkup:
+def _guest_bots_menu_kb(user: types.User, selected_guest_id: int = 0, bots: list[dict] | None = None) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=1)
-    for item in list_guest_bots(owner_user_id=int(user.id)):
+    for item in (list(bots) if bots is not None else list_guest_bots(owner_user_id=int(user.id))):
         guest_id = int(item.get("id") or 0)
         uname = (item.get("bot_username") or str(guest_id)).strip().lstrip("@")
         kb.add(_btn(f"@{uname}", callback_data=f"guestbot:select:{guest_id}"))
@@ -247,12 +247,13 @@ def _manage_bot_kb(entry: dict) -> types.InlineKeyboardMarkup:
 
 
 def _show_guest_bots_menu(chat_id: int, user: types.User) -> None:
+    bots = list_guest_bots(owner_user_id=int(user.id))
     bot.send_message(
         chat_id,
-        _guest_bots_menu_text(user),
+        _guest_bots_menu_text(user, bots),
         parse_mode="HTML",
         disable_web_page_preview=True,
-        reply_markup=_guest_bots_menu_kb(user, selected_guest_id=0),
+        reply_markup=_guest_bots_menu_kb(user, selected_guest_id=0, bots=bots),
     )
 
 
@@ -326,14 +327,15 @@ def guest_bots_callback(call: types.CallbackQuery):
     uid = int(call.from_user.id)
 
     def _edit_menu(selected_guest_id: int = 0):
+        bots = list_guest_bots(owner_user_id=int(call.from_user.id))
         try:
             bot.edit_message_text(
-                _guest_bots_menu_text(call.from_user),
+                _guest_bots_menu_text(call.from_user, bots),
                 chat_id,
                 msg_id,
                 parse_mode="HTML",
                 disable_web_page_preview=True,
-                reply_markup=_guest_bots_menu_kb(call.from_user, selected_guest_id=selected_guest_id),
+                reply_markup=_guest_bots_menu_kb(call.from_user, selected_guest_id=selected_guest_id, bots=bots),
             )
         except Exception:
             _show_guest_bots_menu(chat_id, call.from_user)
