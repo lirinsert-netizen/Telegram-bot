@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import html as _html
 import logging
 import re
@@ -43,6 +44,13 @@ _SHORT_QUERY_WORD_LIMIT = 4
 _COMPACT_QUERY_WORD_LIMIT = 6
 _HTTP_USER_AGENT = (
     "Mozilla/5.0 (compatible; TelegramBotGuestAI/1.0; +https://telegram.org)"
+)
+
+# Shared thread pool for concurrent source searching and fetching.
+# Using daemon threads so the pool does not prevent process exit.
+_SEARCH_EXECUTOR: concurrent.futures.ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=8,
+    thread_name_prefix="guest-ai-search",
 )
 
 _BASE_SYSTEM_PROMPT = (
@@ -730,35 +738,56 @@ class GuestAIService:
         variants = _expand_query_variants(query)
         merged: list[GroundingSource] = []
         for variant in variants:
-            merged = _merge_sources(
-                merged,
-                _search_wikipedia(
-                    variant,
-                    self._session,
-                    _SEARCH_TIMEOUT,
-                    api_url=_WIKIPEDIA_SEARCH_API_URL,
-                    page_url_template=_WIKIPEDIA_PAGE_URL_TEMPLATE,
-                    provider="wikipedia_ru",
-                ),
-                _search_wikipedia(
-                    variant,
-                    self._session,
-                    _SEARCH_TIMEOUT,
-                    api_url=_WIKIPEDIA_EN_SEARCH_API_URL,
-                    page_url_template=_WIKIPEDIA_EN_PAGE_URL_TEMPLATE,
-                    provider="wikipedia_en",
-                ),
-                _search_duckduckgo_instant(variant, self._session, _SEARCH_TIMEOUT),
-                _search_duckduckgo_html(variant, self._session, _SEARCH_TIMEOUT),
+            # Run all four searches concurrently for this variant.
+            fut_wiki_ru = _SEARCH_EXECUTOR.submit(
+                _search_wikipedia,
+                variant,
+                self._session,
+                _SEARCH_TIMEOUT,
+                api_url=_WIKIPEDIA_SEARCH_API_URL,
+                page_url_template=_WIKIPEDIA_PAGE_URL_TEMPLATE,
+                provider="wikipedia_ru",
             )
+            fut_wiki_en = _SEARCH_EXECUTOR.submit(
+                _search_wikipedia,
+                variant,
+                self._session,
+                _SEARCH_TIMEOUT,
+                api_url=_WIKIPEDIA_EN_SEARCH_API_URL,
+                page_url_template=_WIKIPEDIA_EN_PAGE_URL_TEMPLATE,
+                provider="wikipedia_en",
+            )
+            fut_ddg_instant = _SEARCH_EXECUTOR.submit(
+                _search_duckduckgo_instant, variant, self._session, _SEARCH_TIMEOUT
+            )
+            fut_ddg_html = _SEARCH_EXECUTOR.submit(
+                _search_duckduckgo_html, variant, self._session, _SEARCH_TIMEOUT
+            )
+            groups: list[list[GroundingSource]] = []
+            for fut in (fut_wiki_ru, fut_wiki_en, fut_ddg_instant, fut_ddg_html):
+                try:
+                    groups.append(fut.result())
+                except Exception as exc:
+                    logger.debug("[GUEST AI] search future error for variant=%r: %s", variant, exc)
+                    groups.append([])
+            merged = _merge_sources(merged, *groups)
             if len(merged) >= _MAX_SEARCH_RESULTS:
                 break
         if not merged:
             return []
 
+        # Fetch source page content in parallel.
+        sources_to_fetch = merged[:_MAX_FETCHED_SOURCES]
+        fetch_futs = [
+            _SEARCH_EXECUTOR.submit(_fetch_source_context, s, self._session, _SOURCE_FETCH_TIMEOUT)
+            for s in sources_to_fetch
+        ]
         enriched: list[GroundingSource] = []
-        for source in merged[:_MAX_FETCHED_SOURCES]:
-            enriched.append(_fetch_source_context(source, self._session, _SOURCE_FETCH_TIMEOUT))
+        for fut in fetch_futs:
+            try:
+                enriched.append(fut.result())
+            except Exception as exc:
+                logger.debug("[GUEST AI] source fetch future error: %s", exc)
 
         leftover = merged[_MAX_FETCHED_SOURCES:]
         final_sources = enriched + leftover
