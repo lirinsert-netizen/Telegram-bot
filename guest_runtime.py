@@ -3354,6 +3354,16 @@ def _handle_guest_update(update_obj: dict) -> None:
                 pass
 
 
+def _log_future_exception(fut: concurrent.futures.Future) -> None:
+    """Callback to log any unhandled exception from a submitted update-handler future."""
+    try:
+        exc = fut.exception()
+        if exc is not None:
+            logger.warning("[GUEST RUNTIME] unhandled exception in update worker: %s", exc)
+    except concurrent.futures.CancelledError:
+        pass
+
+
 def _run_guest_polling_loop() -> None:
     global _UPDATE_EXECUTOR
     _UPDATE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
@@ -3375,9 +3385,12 @@ def _run_guest_polling_loop() -> None:
                         offset = int(update_id) + 1
                     except Exception:
                         pass
-                _UPDATE_EXECUTOR.submit(_handle_guest_update, update_obj)
+                fut = _UPDATE_EXECUTOR.submit(_handle_guest_update, update_obj)
+                fut.add_done_callback(_log_future_exception)
     finally:
-        _UPDATE_EXECUTOR.shutdown(wait=False)
+        # Allow in-flight updates to finish (up to a reasonable time); Telegram
+        # will re-deliver any updates that were not acknowledged on the next start.
+        _UPDATE_EXECUTOR.shutdown(wait=True, cancel_futures=False)
 
 
 def _wait_until_disabled() -> None:
