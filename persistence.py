@@ -12,26 +12,21 @@ import queue
 from collections import Counter
 
 from config import (
-    # stdlib re-exports нужны для typing внутри этого модуля
     os, json, sqlite3, Any,
-    # настройки
     DATA_DIR, SQLITE_DB_FILE, SQLITE_JSON_FALLBACK_WRITE,
     DB_FLUSH_INTERVAL_SECONDS, GLOBAL_LAST_SEEN_UPDATE_SECONDS,
     TG_CACHE_MEMBER_TTL, TG_CACHE_CHAT_TTL,
-    # bot для кеша
     bot,
-    # file paths
     GROUP_STATS_FILE, GROUP_SETTINGS_FILE, PROFILES_FILE, USERS_FILE,
     VERIFY_ADMINS_FILE, VERIFY_DEV_FILE, GLOBAL_USERS_FILE,
     CHAT_SETTINGS_FILE, MODERATION_FILE, DEV_CONTACT_INBOX_FILE,
     DEV_CONTACT_META_FILE, PENDING_GROUPS_FILE,
     CLOSE_CHAT_FILE, CHAT_ROLES_FILE, ROLE_PERMS_FILE,
     CLONES_FILE,
-    # types
     types,
 )
 
-# ─────────────────────────── STATS (Перенесён наверх!) ───────────────────────────────────
+# ─────────────────────────── STATS (Наверху для счетчиков ошибок) ───────────────────────────────────
 
 STATS: dict[str, Any] = {
     'users': set(),
@@ -51,11 +46,10 @@ def _stats_increment(key: str, delta: int = 1) -> None:
     STATS[key] = int(STATS.get(key) or 0) + delta
 
 
-# ─────────────────────────── SQLite / JSON ───────────────────────────────────
+# ─────────────────────────── SQLite / JSON (Оригинальная надежная логика) ───────────────────────────────────
 
 _DB_LOCK = threading.RLock()
 _DB_CONN: sqlite3.Connection | None = None
-_SQLITE_RO_TLS = threading.local()
 
 # ── Message-event buffer (per-message stats for time periods) ────────────────
 _MSG_EVENTS_BUFFER: list[tuple[int, int, int, Any]] = []
@@ -84,7 +78,6 @@ def _db_connect() -> sqlite3.Connection:
             )
             """
         )
-        # ── Per-message stats tables (time-period queries) ──────────────────
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS msg_events (
@@ -115,7 +108,6 @@ def _db_connect() -> sqlite3.Connection:
             )
             """
         )
-        # ── Привязка бота к группе (один бот на группу) ─────────────────────
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS chat_bot_assignment (
@@ -165,34 +157,31 @@ def _db_connect() -> sqlite3.Connection:
             )
             """
         )
-        # Migration: add owner_only column to existing tables
         try:
             conn.execute("ALTER TABLE guest_commands ADD COLUMN owner_only INTEGER NOT NULL DEFAULT 0")
             conn.commit()
         except Exception:
-            pass  # Column already exists
+            pass
         try:
             conn.execute("ALTER TABLE guest_commands ADD COLUMN media_items TEXT NOT NULL DEFAULT '[]'")
             conn.commit()
         except Exception:
-            pass  # Column already exists
+            pass
         try:
             conn.execute("""ALTER TABLE guest_commands ADD COLUMN buttons_json TEXT NOT NULL DEFAULT '{"rows":[],"popups":[]}'""")
             conn.commit()
         except Exception:
-            pass  # Column already exists
-        # Migration: add ai_access_mode for guest AI access policy
+            pass
         try:
             conn.execute("ALTER TABLE guest_bots ADD COLUMN ai_access_mode TEXT NOT NULL DEFAULT 'all'")
             conn.commit()
         except Exception:
-            pass  # Column already exists
+            pass
         try:
             conn.execute("ALTER TABLE guest_bots ADD COLUMN ai_provider TEXT NOT NULL DEFAULT 'groq'")
             conn.commit()
         except Exception:
-            pass  # Column already exists
-        # Migration: add user_id to guest_commands and rebuild UNIQUE constraint
+            pass
         try:
             cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(guest_commands)").fetchall()}
             if "user_id" not in cols:
@@ -230,7 +219,6 @@ def _db_connect() -> sqlite3.Connection:
                 conn.commit()
         except Exception as _e:
             print(f"[MIGRATION user_id] Error: {_e}")
-        # Migration: move legacy user_id=0 commands to the bot owner so old commands keep working.
         try:
             ts = int(time.time())
             conn.execute(
@@ -315,7 +303,6 @@ def _legacy_json_load(path: str, default: Any):
 
 
 def _legacy_json_save(path: str, data: Any):
-    """Атомарный fallback-save в legacy JSON."""
     try:
         tmp = path + ".tmp"
         with open(tmp, 'w', encoding='utf-8') as f:
@@ -402,27 +389,24 @@ def get_sqlite_status() -> dict[str, Any]:
     return status
 
 
-def _get_ro_db_conn() -> sqlite3.Connection:
-    conn = getattr(_SQLITE_RO_TLS, "conn", None)
-    if conn is None:
-        _db_connect()  # <-- ГАРАНТИЯ СОЗДАНИЯ ТАБЛИЦ ПЕРЕД ЧТЕНИЕМ
-        conn = sqlite3.connect(SQLITE_DB_FILE, timeout=5.0)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        _SQLITE_RO_TLS.conn = conn
-    return conn
-
-
 def load_json_file(path, default):
     key = _db_key(path)
-    try:
-        conn = _get_ro_db_conn()
-        row = conn.execute(
-            "SELECT payload_json FROM kv_store WHERE store_key = ?", (key,)
-        ).fetchone()
-        if row:
-            return json.loads(row[0])
-    except Exception:
-        _stats_increment("sqlite_errors")
+    for attempt in range(2):
+        try:
+            with _DB_LOCK:
+                conn = _db_connect()
+                row = conn.execute(
+                    "SELECT payload_json FROM kv_store WHERE store_key = ?", (key,)
+                ).fetchone()
+            if row:
+                return json.loads(row[0])
+            break
+        except Exception:
+            _stats_increment("sqlite_errors")
+            if attempt == 0:
+                _reset_db_connection()
+                continue
+            break
 
     legacy = _legacy_json_load(path, default)
     try:
@@ -663,7 +647,7 @@ _FLUSH_THREAD = threading.Thread(target=_periodic_flush_worker, daemon=True)
 _FLUSH_THREAD.start()
 atexit.register(_shutdown_persistence)
 
-# ─────────────────────────── TG кеш / дедупликация ──────────────────────────
+# ─────────────────────────── TG кеш / дедупликация (Single-Flight оптимизация) ──────────────────────────
 
 _TG_CACHE_LOCK = threading.Lock()
 _TG_MEMBER_CACHE: dict[tuple[int, int], tuple[float, Any]] = {}
