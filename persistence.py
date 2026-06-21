@@ -31,6 +31,26 @@ from config import (
     types,
 )
 
+# ─────────────────────────── STATS (Перенесён наверх!) ───────────────────────────────────
+
+STATS: dict[str, Any] = {
+    'users': set(),
+    'chats': set(),
+    'messages': 0,
+    'commands_used': {},
+    'start_time': time.time(),
+    'sqlite_errors': 0,
+    'tg_cache_chat_misses': 0,
+    'tg_cache_member_misses': 0,
+    'tg_user_fetch_hits': 0,
+    'tg_user_fetch_misses': 0,
+}
+
+
+def _stats_increment(key: str, delta: int = 1) -> None:
+    STATS[key] = int(STATS.get(key) or 0) + delta
+
+
 # ─────────────────────────── SQLite / JSON ───────────────────────────────────
 
 _DB_LOCK = threading.RLock()
@@ -43,10 +63,6 @@ _MSG_EVENTS_BUFFER_LOCK = threading.Lock()
 _STATS_CLEANUP_LAST_TS: float = 0.0
 _STATS_CLEANUP_INTERVAL: float = 86400.0  # run cleanup at most once per day
 MSG_EVENTS_RETENTION_DAYS: int = 31       # keep events for this many days
-
-
-def _stats_increment(key: str, delta: int = 1) -> None:
-    STATS[key] = int(STATS.get(key) or 0) + delta
 
 
 def _db_connect() -> sqlite3.Connection:
@@ -213,7 +229,7 @@ def _db_connect() -> sqlite3.Connection:
                 conn.execute("PRAGMA foreign_keys = ON")
                 conn.commit()
         except Exception as _e:
-            print(f"[MIGRATION user_id] Error: {_e}")  # Consistent with other print-based error handling in this module
+            print(f"[MIGRATION user_id] Error: {_e}")
         # Migration: move legacy user_id=0 commands to the bot owner so old commands keep working.
         try:
             ts = int(time.time())
@@ -389,7 +405,7 @@ def get_sqlite_status() -> dict[str, Any]:
 def _get_ro_db_conn() -> sqlite3.Connection:
     conn = getattr(_SQLITE_RO_TLS, "conn", None)
     if conn is None:
-        # Независимое RO-соединение для каждого воркера!
+        _db_connect()  # <-- ГАРАНТИЯ СОЗДАНИЯ ТАБЛИЦ ПЕРЕД ЧТЕНИЕМ
         conn = sqlite3.connect(SQLITE_DB_FILE, timeout=5.0)
         conn.execute("PRAGMA journal_mode=WAL;")
         _SQLITE_RO_TLS.conn = conn
@@ -457,10 +473,6 @@ _SAVE_DIRTY_KEYS: set[str] = set()
 
 
 def throttled_save_json_file(path: str, data: Any, key: str, force: bool = False):
-    # Always defer to the background flush thread — never block the calling
-    # (handler) thread with a synchronous SQLite write.  When force=True the
-    # last-written timestamp is cleared so the background thread flushes on
-    # its very next wake-up rather than waiting for the normal interval.
     with _SAVE_LOCK:
         _SAVE_REGISTRY[key] = (path, data)
         _SAVE_DIRTY_KEYS.add(key)
@@ -492,13 +504,11 @@ def _flush_pending_saves(force: bool = False):
 def buffer_msg_event(
     chat_id: int, user_id: int, ts: int, msg_id: int | None = None
 ) -> None:
-    """Buffer one message event for batch SQLite write. O(1), no I/O."""
     with _MSG_EVENTS_BUFFER_LOCK:
         _MSG_EVENTS_BUFFER.append((int(chat_id), int(user_id), int(ts), msg_id))
 
 
 def _flush_msg_events() -> None:
-    """Drain the in-memory event buffer and persist to SQLite in one batch."""
     with _MSG_EVENTS_BUFFER_LOCK:
         if not _MSG_EVENTS_BUFFER:
             return
@@ -536,7 +546,6 @@ def _flush_msg_events() -> None:
 
 
 def _cleanup_old_msg_events() -> None:
-    """Delete msg_events older than 31 days. Self-throttled to once per day."""
     global _STATS_CLEANUP_LAST_TS
     now = time.monotonic()
     if now - _STATS_CLEANUP_LAST_TS < _STATS_CLEANUP_INTERVAL:
@@ -556,11 +565,6 @@ def _cleanup_old_msg_events() -> None:
 def get_stats_for_period(
     chat_id: int, since_ts: int
 ) -> list[tuple[int, int, Any]]:
-    """
-    Return (user_id, count, last_msg_id) sorted by count DESC.
-    since_ts == 0 → reads from msg_alltime (all-time, O(log N)).
-    since_ts  > 0 → aggregates from msg_events for the given window.
-    """
     try:
         with _DB_LOCK:
             conn = _db_connect()
@@ -592,7 +596,6 @@ def get_stats_for_period(
 
 
 def get_user_msg_count_for_period(chat_id: int, user_id: int, since_ts: int) -> int:
-    """Get message count for a specific user since since_ts (Unix timestamp). O(log N)."""
     try:
         with _DB_LOCK:
             conn = _db_connect()
@@ -613,14 +616,6 @@ def get_user_msg_count_for_period(chat_id: int, user_id: int, since_ts: int) -> 
 def get_stats_by_day(
     chat_id: int, since_ts: int, max_days: int = 100
 ) -> list[tuple[int, int]]:
-    """
-    Return [(day_ts, count)] grouped by UTC day, ordered ASC, limited to max_days.
-    day_ts is the Unix timestamp of midnight UTC for that day.
-
-    Note: the expression ``(ts / 86400) * 86400`` uses SQLite integer division which
-    truncates toward zero — identical to floor division for positive ts values (all
-    real bot events have ts > 0).
-    """
     try:
         with _DB_LOCK:
             conn = _db_connect()
@@ -635,7 +630,6 @@ def get_stats_by_day(
                 """,
                 (int(chat_id), int(since_ts), int(max_days)),
             ).fetchall()
-        # Reverse so result is chronological (ASC)
         return [(int(r[0]), int(r[1])) for r in reversed(rows)]
     except Exception as e:
         print(f"[GET STATS BY DAY] Error: {e}")
@@ -680,20 +674,13 @@ _CALLBACK_DEDUPE: dict[tuple[int, str, int], float] = {}
 
 CALLBACK_DEDUPE_BUCKET_SECONDS = 5
 CALLBACK_DEDUPE_KEEP_BUCKETS = 2
-# Периодическая очистка устаревших ключей dedupe — в отдельном треде,
-# чтобы не итерировать весь словарь под локом при каждом коллбэке.
+
 _CALLBACK_DEDUPE_CLEANUP_LOCK = threading.Lock()
 _CALLBACK_DEDUPE_CLEANUP_STATE: dict[str, float] = {"last": 0.0}
 _CALLBACK_DEDUPE_CLEANUP_INTERVAL: float = 30.0
 
 
 def _callback_dedupe_cleanup_stale() -> None:
-    """Удалить устаревшие бакеты из словаря дедупликации коллбэков.
-
-    Вызывается из отдельного daemon-треда раз в _CALLBACK_DEDUPE_CLEANUP_INTERVAL секунд.
-    Сначала берём снимок ключей под локом, затем фильтруем и удаляем — каждый этап
-    занимает минимальное время под локом.
-    """
     current_bucket = int(time.time() // CALLBACK_DEDUPE_BUCKET_SECONDS)
     min_bucket = current_bucket - CALLBACK_DEDUPE_KEEP_BUCKETS
     with _CALLBACK_DEDUPE_LOCK:
@@ -723,7 +710,6 @@ def tg_get_chat(chat_ref: Any):
         if cached and (now - cached[0]) < TG_CACHE_CHAT_TTL:
             return cached[1]
             
-        # Паттерн Single-Flight (Один в поле)
         event = _TG_FETCH_PROMISES.get(key)
         if event is None:
             event = threading.Event()
@@ -733,11 +719,10 @@ def tg_get_chat(chat_ref: Any):
             is_leader = False
 
     if not is_leader:
-        event.wait()  # Ждем, пока поток-лидер сходит в сеть
+        event.wait()
         with _TG_CACHE_LOCK:
             return _TG_CHAT_CACHE.get(key, (0, None))[1]
 
-    # Мы — поток-лидер, идем в сеть
     _stats_increment("tg_cache_chat_misses")
     try:
         chat = bot.get_chat(chat_ref)
@@ -746,7 +731,7 @@ def tg_get_chat(chat_ref: Any):
             if 'chat' in locals():
                 _TG_CHAT_CACHE[key] = (time.monotonic(), chat)
             _TG_FETCH_PROMISES.pop(key, None)
-            event.set()  # Будим всех ждущих собратьев
+            event.set()
 
     return chat
 
@@ -804,24 +789,16 @@ def tg_invalidate_chat_member_caches(chat_id: int, user_id: int) -> None:
     tg_invalidate_chat_cache(chat_id)
 
 
-# ─────────── Кеш bot.get_chat(user_id) на время одной задачи воркера ─────────
-# Сбрасывается в начале каждой задачи TeleBot (см. install_telebot_user_fetch_cache_hooks).
-# Не TTL: в рамках одного апдейта повторные запросы того же user_id не бьют API.
 _USER_FETCH_TLS = threading.local()
 
 
 def tg_user_fetch_scope_reset() -> None:
-    """Очистить кеш get_user для текущего потока (новая задача воркера / новый апдейт)."""
     d = getattr(_USER_FETCH_TLS, "by_id", None)
     if d is not None:
         d.clear()
 
 
 def tg_get_user_by_id_cached(user_id: int) -> Any:
-    """
-    bot.get_chat(user_id) для числового ID с дедупликацией в рамках текущей задачи воркера.
-    При ошибке API — тот же fallback, что и раньше в helpers (минимальный User).
-    """
     uid = int(user_id)
     d = getattr(_USER_FETCH_TLS, "by_id", None)
     if d is None:
@@ -841,10 +818,6 @@ def tg_get_user_by_id_cached(user_id: int) -> Any:
 
 
 def install_telebot_user_fetch_cache_hooks() -> None:
-    """
-    Патчит TeleBot._exec_task: перед каждым обработчиком в воркере сбрасывается кеш пользователей.
-    Вызывается автоматически при импорте persistence (после загрузки state).
-    """
     from telebot import TeleBot
 
     if getattr(TeleBot, "_user_fetch_cache_patched", False):
@@ -852,11 +825,9 @@ def install_telebot_user_fetch_cache_hooks() -> None:
 
     def _exec_task(self, task, *args, **kwargs):
         if self.threaded:
-
             def wrapped(*a, **kw):
                 tg_user_fetch_scope_reset()
                 return task(*a, **kw)
-
             self.worker_pool.put(wrapped, *args, **kwargs)
         else:
             try:
@@ -867,7 +838,7 @@ def install_telebot_user_fetch_cache_hooks() -> None:
                 if not handled:
                     raise e
 
-    TeleBot._exec_task = _exec_task  # type: ignore[assignment]
+    TeleBot._exec_task = _exec_task
     TeleBot._user_fetch_cache_patched = True
 
 
@@ -897,9 +868,6 @@ def _is_duplicate_callback_query(call: types.CallbackQuery) -> bool:
     user_id = int(getattr(call.from_user, "id", 0) or 0)
     bucket = int(time.time() // CALLBACK_DEDUPE_BUCKET_SECONDS)
     key = (user_id, data, bucket)
-    # Периодически запускаем очистку в фоне.
-    # Атомарный check-and-set через отдельный лок исключает дублирующие треды
-    # при конкурентных коллбэках.
     now_mono = time.monotonic()
     should_cleanup = False
     with _CALLBACK_DEDUPE_CLEANUP_LOCK:
@@ -949,14 +917,12 @@ PROFILES: dict = load_json_file(PROFILES_FILE, {})
 CHAT_ROLES: dict = load_json_file(CHAT_ROLES_FILE, {})
 ROLE_PERMS: dict = load_json_file(ROLE_PERMS_FILE, {})
 
-# Volatile state (не персистируется)
 PENDING_DEV_CONTACT_FROM_USER: dict[int, dict] = {}
 PENDING_DEV_REPLY_FROM_OWNER: dict[int, dict] = {}
 BROADCAST_DRAFTS: dict[int, dict] = {}
 BROADCAST_PENDING_INPUT: dict[int, dict] = {}
 SENDPM_DRAFTS: dict[int, dict] = {}
 SENDPM_PENDING_INPUT: dict[int, dict] = {}
-# user_id -> {"chat_id": int}  — pending log-channel setup (volatile)
 PENDING_LOG_CHANNEL_SETUP: dict[int, dict] = {}
 
 _OPERATION_QUEUE: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -967,19 +933,6 @@ _OPERATION_QUEUE_NEXT_ID = 0
 OPERATION_QUEUE_MAX_RETRIES = 4
 OPERATION_QUEUE_MAX_BACKOFF_SECONDS = 30
 
-# STATS (определён здесь, _stats_increment использует его напрямую)
-STATS: dict[str, Any] = {
-    'users': set(),
-    'chats': set(),
-    'messages': 0,
-    'commands_used': {},
-    'start_time': time.time(),
-    'sqlite_errors': 0,
-    'tg_cache_chat_misses': 0,
-    'tg_cache_member_misses': 0,
-    'tg_user_fetch_hits': 0,
-    'tg_user_fetch_misses': 0,
-}
 
 # ─────────────────────────── Чистые save-функции ─────────────────────────────
 
@@ -1035,8 +988,6 @@ def save_clones():
 # ──────────────────── chat_bot_assignment helpers ────────────────────────────
 
 def assign_bot_to_chat(chat_id: int, bot_id: int, bot_username: str) -> bool:
-    """Записывает привязку бот→группа. Возвращает True если запись создана,
-    False если группа уже привязана к другому боту (вызывающий должен покинуть группу)."""
     ts = int(time.time())
     try:
         with _DB_LOCK:
@@ -1056,11 +1007,10 @@ def assign_bot_to_chat(chat_id: int, bot_id: int, bot_username: str) -> bool:
         return True
     except Exception as e:
         print(f"[ASSIGN BOT] Error: {e}")
-        return True  # при ошибке DB не покидаем — безопаснее оставаться
+        return True
 
 
 def unassign_bot_from_chat(chat_id: int) -> None:
-    """Удаляет привязку бота к группе (при выходе бота из группы)."""
     try:
         with _DB_LOCK:
             conn = _db_connect()
@@ -1074,7 +1024,6 @@ def unassign_bot_from_chat(chat_id: int) -> None:
 
 
 def get_chat_assignment(chat_id: int) -> dict | None:
-    """Возвращает {bot_id, bot_username, assigned_at} или None."""
     try:
         with _DB_LOCK:
             conn = _db_connect()
@@ -1091,7 +1040,6 @@ def get_chat_assignment(chat_id: int) -> dict | None:
 
 
 def get_all_bot_chat_ids() -> list[int]:
-    """Returns all chat_ids currently assigned to any bot (from chat_bot_assignment)."""
     try:
         with _DB_LOCK:
             conn = _db_connect()
@@ -1103,7 +1051,6 @@ def get_all_bot_chat_ids() -> list[int]:
 
 
 def reassign_bot_in_chat(chat_id: int, bot_id: int, bot_username: str) -> None:
-    """Принудительно переписывает привязку (используется при /clone_unlink)."""
     ts = int(time.time())
     try:
         with _DB_LOCK:
@@ -1156,20 +1103,9 @@ def _guest_bot_row_to_dict(row: sqlite3.Row | tuple | None) -> dict | None:
     if not row:
         return None
     (
-        gid,
-        owner_uid,
-        bot_id,
-        bot_username,
-        bot_token,
-        display_name,
-        status,
-        enabled,
-        runtime_pid,
-        ai_access_mode,
-        ai_provider,
-        created_at,
-        updated_at,
-        linked_modules_json,
+        gid, owner_uid, bot_id, bot_username, bot_token, display_name,
+        status, enabled, runtime_pid, ai_access_mode, ai_provider,
+        created_at, updated_at, linked_modules_json,
     ) = row
     data = {
         "id": int(gid),
@@ -1267,12 +1203,8 @@ def get_guest_bot_by_username(bot_username: str) -> dict | None:
 
 
 def create_guest_bot(
-    owner_user_id: int,
-    bot_id: int,
-    bot_username: str,
-    bot_token: str,
-    display_name: str,
-    linked_modules: list[str] | None = None,
+    owner_user_id: int, bot_id: int, bot_username: str, bot_token: str,
+    display_name: str, linked_modules: list[str] | None = None,
 ) -> tuple[bool, str, dict | None]:
     uname = str(bot_username or "").strip().lstrip("@").lower()
     token = str(bot_token or "").strip()
@@ -1305,16 +1237,7 @@ def create_guest_bot(
                     status, enabled, linked_modules_json, ai_access_mode, ai_provider, runtime_pid, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, 'active', 1, ?, 'all', 'groq', 0, ?, ?)
                 """,
-                (
-                    int(owner_user_id),
-                    int(bot_id),
-                    uname,
-                    token,
-                    str(display_name or uname),
-                    modules_json,
-                    ts,
-                    ts,
-                ),
+                (int(owner_user_id), int(bot_id), uname, token, str(display_name or uname), modules_json, ts, ts),
             )
             guest_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
             conn.commit()
@@ -1330,11 +1253,7 @@ def set_guest_bot_enabled(guest_bot_id: int, enabled: bool) -> bool:
         with _DB_LOCK:
             conn = _db_connect()
             conn.execute(
-                """
-                UPDATE guest_bots
-                SET enabled = ?, status = ?, updated_at = ?
-                WHERE id = ?
-                """,
+                "UPDATE guest_bots SET enabled = ?, status = ?, updated_at = ? WHERE id = ?",
                 (1 if enabled else 0, "active" if enabled else "disabled", ts, int(guest_bot_id)),
             )
             conn.commit()
@@ -1350,11 +1269,7 @@ def update_guest_bot_modules(guest_bot_id: int, linked_modules: list[str]) -> bo
         with _DB_LOCK:
             conn = _db_connect()
             conn.execute(
-                """
-                UPDATE guest_bots
-                SET linked_modules_json = ?, updated_at = ?
-                WHERE id = ?
-                """,
+                "UPDATE guest_bots SET linked_modules_json = ?, updated_at = ? WHERE id = ?",
                 (_guest_modules_to_json(linked_modules), ts, int(guest_bot_id)),
             )
             conn.commit()
@@ -1384,10 +1299,7 @@ def delete_guest_bot(guest_bot_id: int) -> bool:
     try:
         with _DB_LOCK:
             conn = _db_connect()
-            conn.execute(
-                "DELETE FROM guest_bots WHERE id = ?",
-                (int(guest_bot_id),),
-            )
+            conn.execute("DELETE FROM guest_bots WHERE id = ?", (int(guest_bot_id),))
             conn.commit()
         return True
     except Exception as e:
@@ -1417,21 +1329,13 @@ def list_guest_commands(guest_bot_id: int, enabled_only: bool = False, user_id: 
             ).fetchall()
         out: list[dict] = []
         for row in rows:
-            out.append(
-                {
-                    "id": int(row[0]),
-                    "guest_bot_id": int(row[1]),
-                    "user_id": int(row[2] or 0),
-                    "name": str(row[3] or ""),
-                    "response_text": str(row[4] or ""),
-                    "media_items": str(row[5] or "[]"),
-                    "buttons_json": str(row[6] or '{"rows":[],"popups":[]}'),
-                    "enabled": bool(int(row[7] or 0)),
-                    "owner_only": bool(int(row[8] or 0)),
-                    "created_at": int(row[9] or 0),
-                    "updated_at": int(row[10] or 0),
-                }
-            )
+            out.append({
+                "id": int(row[0]), "guest_bot_id": int(row[1]), "user_id": int(row[2] or 0),
+                "name": str(row[3] or ""), "response_text": str(row[4] or ""),
+                "media_items": str(row[5] or "[]"), "buttons_json": str(row[6] or '{"rows":[],"popups":[]}'),
+                "enabled": bool(int(row[7] or 0)), "owner_only": bool(int(row[8] or 0)),
+                "created_at": int(row[9] or 0), "updated_at": int(row[10] or 0),
+            })
         return out
     except Exception as e:
         print(f"[LIST GUEST COMMANDS] Error: {e}")
@@ -1439,14 +1343,9 @@ def list_guest_commands(guest_bot_id: int, enabled_only: bool = False, user_id: 
 
 
 def upsert_guest_command(
-    guest_bot_id: int,
-    name: str,
-    response_text: str,
-    enabled: bool = True,
-    owner_only: bool = False,
-    media_items: str = "[]",
-    buttons_json: str = '{"rows":[],"popups":[]}',
-    user_id: int = 0,
+    guest_bot_id: int, name: str, response_text: str, enabled: bool = True,
+    owner_only: bool = False, media_items: str = "[]",
+    buttons_json: str = '{"rows":[],"popups":[]}', user_id: int = 0,
 ) -> bool:
     cmd_name = str(name or "").strip().lower()
     if not cmd_name:
@@ -1468,18 +1367,8 @@ def upsert_guest_command(
                     owner_only = excluded.owner_only,
                     updated_at = excluded.updated_at
                 """,
-                (
-                    int(guest_bot_id),
-                    uid,
-                    cmd_name,
-                    str(response_text or ""),
-                    str(media_items or "[]"),
-                    str(buttons_json or '{"rows":[],"popups":[]}'),
-                    1 if enabled else 0,
-                    1 if owner_only else 0,
-                    ts,
-                    ts,
-                ),
+                (int(guest_bot_id), uid, cmd_name, str(response_text or ""), str(media_items or "[]"),
+                 str(buttons_json or '{"rows":[],"popups":[]}'), 1 if enabled else 0, 1 if owner_only else 0, ts, ts),
             )
             conn.commit()
         return True
@@ -1496,10 +1385,7 @@ def delete_guest_command(guest_bot_id: int, name: str, user_id: int = 0) -> bool
     try:
         with _DB_LOCK:
             conn = _db_connect()
-            conn.execute(
-                "DELETE FROM guest_commands WHERE guest_bot_id = ? AND user_id = ? AND name = ?",
-                (int(guest_bot_id), uid, cmd_name),
-            )
+            conn.execute("DELETE FROM guest_commands WHERE guest_bot_id = ? AND user_id = ? AND name = ?", (int(guest_bot_id), uid, cmd_name))
             conn.commit()
         return True
     except Exception as e:
@@ -1517,11 +1403,7 @@ def set_guest_command_enabled(guest_bot_id: int, name: str, enabled: bool, user_
         with _DB_LOCK:
             conn = _db_connect()
             conn.execute(
-                """
-                UPDATE guest_commands
-                SET enabled = ?, updated_at = ?
-                WHERE guest_bot_id = ? AND user_id = ? AND name = ?
-                """,
+                "UPDATE guest_commands SET enabled = ?, updated_at = ? WHERE guest_bot_id = ? AND user_id = ? AND name = ?",
                 (1 if enabled else 0, ts, int(guest_bot_id), uid, cmd_name),
             )
             conn.commit()
@@ -1533,15 +1415,11 @@ def set_guest_command_enabled(guest_bot_id: int, name: str, enabled: bool, user_
 
 # ──────────────────── log_channels helpers ───────────────────────────────────
 
-# Default events enabled for a new log channel (all on by default).
 LOG_CHANNEL_ALL_EVENTS: frozenset[str] = frozenset([
     "ban", "unban", "mute", "unmute", "kick", "warn", "unwarn",
-    "chat_closed", "chat_opened",
-    "join", "leave",
-    "antiflood", "antispam", "antiraid",
-    "settings",
-    "verify", "role", "role_change",
-    "manual_punish",
+    "chat_closed", "chat_opened", "join", "leave",
+    "antiflood", "antispam", "antiraid", "settings",
+    "verify", "role", "role_change", "manual_punish",
 ])
 
 
@@ -1550,19 +1428,12 @@ def _lc_default_events() -> dict[str, bool]:
 
 
 def set_log_channel(chat_id: int, channel_id: int, channel_title: str = "") -> bool:
-    """Сохраняет (или обновляет) лог-канал для группы chat_id."""
     ts = int(time.time())
     try:
         with _DB_LOCK:
             conn = _db_connect()
-            existing = conn.execute(
-                "SELECT events FROM log_channels WHERE chat_id = ?", (int(chat_id),)
-            ).fetchone()
-            if existing:
-                # Сохраняем уже настроенные события
-                events_json = existing[0]
-            else:
-                events_json = json.dumps(_lc_default_events(), ensure_ascii=False)
+            existing = conn.execute("SELECT events FROM log_channels WHERE chat_id = ?", (int(chat_id),)).fetchone()
+            events_json = existing[0] if existing else json.dumps(_lc_default_events(), ensure_ascii=False)
             conn.execute(
                 """
                 INSERT INTO log_channels(chat_id, channel_id, channel_title, events, created_at)
@@ -1573,8 +1444,7 @@ def set_log_channel(chat_id: int, channel_id: int, channel_title: str = "") -> b
                     events        = ?,
                     created_at    = excluded.created_at
                 """,
-                (int(chat_id), int(channel_id), str(channel_title), events_json, ts,
-                 events_json),
+                (int(chat_id), int(channel_id), str(channel_title), events_json, ts, events_json),
             )
             conn.commit()
         return True
@@ -1584,7 +1454,6 @@ def set_log_channel(chat_id: int, channel_id: int, channel_title: str = "") -> b
 
 
 def remove_log_channel(chat_id: int) -> bool:
-    """Удаляет лог-канал для группы chat_id."""
     try:
         with _DB_LOCK:
             conn = _db_connect()
@@ -1597,29 +1466,18 @@ def remove_log_channel(chat_id: int) -> bool:
 
 
 def get_log_channel(chat_id: int) -> dict | None:
-    """Возвращает {channel_id, channel_title, events, created_at} или None."""
     try:
         with _DB_LOCK:
             conn = _db_connect()
-            row = conn.execute(
-                "SELECT channel_id, channel_title, events, created_at "
-                "FROM log_channels WHERE chat_id = ?",
-                (int(chat_id),),
-            ).fetchone()
+            row = conn.execute("SELECT channel_id, channel_title, events, created_at FROM log_channels WHERE chat_id = ?", (int(chat_id),)).fetchone()
         if row:
             try:
                 events = json.loads(row[2] or "{}")
             except Exception:
                 events = {}
-            # Заполняем отсутствующие события значением True
             for ev in LOG_CHANNEL_ALL_EVENTS:
                 events.setdefault(ev, True)
-            return {
-                "channel_id": int(row[0]),
-                "channel_title": str(row[1] or ""),
-                "events": events,
-                "created_at": int(row[3]),
-            }
+            return {"channel_id": int(row[0]), "channel_title": str(row[1] or ""), "events": events, "created_at": int(row[3])}
         return None
     except Exception as e:
         print(f"[GET LOG CHANNEL] Error: {e}")
@@ -1627,26 +1485,17 @@ def get_log_channel(chat_id: int) -> dict | None:
 
 
 def set_log_channel_event(chat_id: int, event: str, enabled: bool) -> bool:
-    """Включает/выключает конкретное событие в лог-канале группы."""
     try:
         with _DB_LOCK:
             conn = _db_connect()
-            row = conn.execute(
-                "SELECT events FROM log_channels WHERE chat_id = ?", (int(chat_id),)
-            ).fetchone()
+            row = conn.execute("SELECT events FROM log_channels WHERE chat_id = ?", (int(chat_id),)).fetchone()
             if not row:
                 return False
-            try:
-                events = json.loads(row[0] or "{}")
-            except Exception:
-                events = {}
+            events = json.loads(row[0] or "{}") if row else {}
             for ev in LOG_CHANNEL_ALL_EVENTS:
                 events.setdefault(ev, True)
             events[event] = bool(enabled)
-            conn.execute(
-                "UPDATE log_channels SET events = ? WHERE chat_id = ?",
-                (json.dumps(events, ensure_ascii=False), int(chat_id)),
-            )
+            conn.execute("UPDATE log_channels SET events = ? WHERE chat_id = ?", (json.dumps(events, ensure_ascii=False), int(chat_id)))
             conn.commit()
         return True
     except Exception as e:
@@ -1654,23 +1503,13 @@ def set_log_channel_event(chat_id: int, event: str, enabled: bool) -> bool:
         return False
 
 
-def send_log_event(chat_id: int, event: str, text: str,
-                   forward_from_chat_id: int | None = None,
-                   forward_message_id: int | None = None) -> bool:
-    """Отправляет лог-сообщение в лог-канал группы (если настроен и событие включено)."""
+def send_log_event(chat_id: int, event: str, text: str, forward_from_chat_id: int | None = None, forward_message_id: int | None = None) -> bool:
     lc = get_log_channel(chat_id)
-    if not lc:
-        return False
-    if not lc.get("events", {}).get(event, True):
+    if not lc or not lc.get("events", {}).get(event, True):
         return False
     channel_id = lc["channel_id"]
     try:
-        bot.send_message(
-            channel_id,
-            text,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+        bot.send_message(channel_id, text, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         print(f"[SEND LOG EVENT] chat={chat_id} event={event}: {e}")
         return False
@@ -1682,12 +1521,10 @@ def send_log_event(chat_id: int, event: str, text: str,
     return True
 
 
-# Реестр клонов: {"clones": [{bot_id, username, name, token, pid, status, created_at}, ...]}
 _clones_default: dict = {"clones": []}
 CLONES: dict = load_json_file(CLONES_FILE, _clones_default)
 if not isinstance(CLONES, dict):
     CLONES = _clones_default
 CLONES.setdefault("clones", [])
-
 
 install_telebot_user_fetch_cache_hooks()
