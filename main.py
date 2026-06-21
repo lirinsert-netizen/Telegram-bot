@@ -126,5 +126,8 @@ if __name__ == "__main__":
 
     logger.info("[Polling] Запуск long polling…")
     from telebot.util import ThreadPool
-    bot.worker_pool = ThreadPool(num_threads=32)  # <-- РАСШИРИЛИ ПУЛ В 16 РАЗ
+    
+    # ИСПРАВЛЕННАЯ СТРОКА: передали объект bot первым аргументом!
+    bot.worker_pool = ThreadPool(telebot=bot, num_threads=32)
+    
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
