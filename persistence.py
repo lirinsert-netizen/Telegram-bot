@@ -16,7 +16,7 @@ from config import (
     DATA_DIR, SQLITE_DB_FILE, SQLITE_JSON_FALLBACK_WRITE,
     DB_FLUSH_INTERVAL_SECONDS, GLOBAL_LAST_SEEN_UPDATE_SECONDS,
     TG_CACHE_MEMBER_TTL, TG_CACHE_CHAT_TTL,
-    bot,
+    # Объект bot ОТСЮДА УБРАН!
     GROUP_STATS_FILE, GROUP_SETTINGS_FILE, PROFILES_FILE, USERS_FILE,
     VERIFY_ADMINS_FILE, VERIFY_DEV_FILE, GLOBAL_USERS_FILE,
     CHAT_SETTINGS_FILE, MODERATION_FILE, DEV_CONTACT_INBOX_FILE,
@@ -25,8 +25,6 @@ from config import (
     CLONES_FILE,
     types,
 )
-
-# ─────────────────────────── STATS (Наверху для счетчиков ошибок) ───────────────────────────────────
 
 STATS: dict[str, Any] = {
     'users': set(),
@@ -46,17 +44,14 @@ def _stats_increment(key: str, delta: int = 1) -> None:
     STATS[key] = int(STATS.get(key) or 0) + delta
 
 
-# ─────────────────────────── SQLite / JSON (Оригинальная надежная логика) ───────────────────────────────────
-
 _DB_LOCK = threading.RLock()
 _DB_CONN: sqlite3.Connection | None = None
 
-# ── Message-event buffer (per-message stats for time periods) ────────────────
 _MSG_EVENTS_BUFFER: list[tuple[int, int, int, Any]] = []
 _MSG_EVENTS_BUFFER_LOCK = threading.Lock()
 _STATS_CLEANUP_LAST_TS: float = 0.0
-_STATS_CLEANUP_INTERVAL: float = 86400.0  # run cleanup at most once per day
-MSG_EVENTS_RETENTION_DAYS: int = 31       # keep events for this many days
+_STATS_CLEANUP_INTERVAL: float = 86400.0  
+MSG_EVENTS_RETENTION_DAYS: int = 31       
 
 
 def _db_connect() -> sqlite3.Connection:
@@ -448,8 +443,6 @@ def save_json_file(path, data):
     return False
 
 
-# ─────────────────────────── Throttled saves ─────────────────────────────────
-
 _SAVE_LOCK = threading.Lock()
 _SAVE_LAST_TS: dict[str, float] = {}
 _SAVE_REGISTRY: dict[str, tuple[str, Any]] = {}
@@ -482,8 +475,6 @@ def _flush_pending_saves(force: bool = False):
     for path, data in to_write:
         save_json_file(path, data)
 
-
-# ─────────────────────── Message-event stats helpers ─────────────────────────
 
 def buffer_msg_event(
     chat_id: int, user_id: int, ts: int, msg_id: int | None = None
@@ -647,7 +638,7 @@ _FLUSH_THREAD = threading.Thread(target=_periodic_flush_worker, daemon=True)
 _FLUSH_THREAD.start()
 atexit.register(_shutdown_persistence)
 
-# ─────────────────────────── TG кеш / дедупликация (Single-Flight оптимизация) ──────────────────────────
+# ─────────────────────────── TG кеш / дедупликация (Ленивый импорт bot!) ──────────────────────────
 
 _TG_CACHE_LOCK = threading.Lock()
 _TG_MEMBER_CACHE: dict[tuple[int, int], tuple[float, Any]] = {}
@@ -686,6 +677,7 @@ def _tg_chat_cache_key(chat_ref: Any) -> str:
 
 
 def tg_get_chat(chat_ref: Any):
+    from config import bot  # <-- ЛЕНИВЫЙ ИМПОРТ
     key = _tg_chat_cache_key(chat_ref)
     now = time.monotonic()
     
@@ -721,6 +713,7 @@ def tg_get_chat(chat_ref: Any):
 
 
 def tg_get_chat_member(chat_id: int, user_id: int):
+    from config import bot  # <-- ЛЕНИВЫЙ ИМПОРТ
     key = (int(chat_id), int(user_id))
     now = time.monotonic()
     
@@ -783,6 +776,7 @@ def tg_user_fetch_scope_reset() -> None:
 
 
 def tg_get_user_by_id_cached(user_id: int) -> Any:
+    from config import bot  # <-- ЛЕНИВЫЙ ИМПОРТ
     uid = int(user_id)
     d = getattr(_USER_FETCH_TLS, "by_id", None)
     if d is None:
@@ -846,6 +840,7 @@ def get_tg_cache_stats() -> dict[str, int]:
 
 
 def _is_duplicate_callback_query(call: types.CallbackQuery) -> bool:
+    from config import bot  # <-- ЛЕНИВЫЙ ИМПОРТ
     data = (call.data or "").strip()
     if not data:
         return False
@@ -870,7 +865,6 @@ def _is_duplicate_callback_query(call: types.CallbackQuery) -> bool:
         _CALLBACK_DEDUPE[key] = time.monotonic()
     return False
 
-# ─────────────────────────── Загрузка state-словарей ─────────────────────────
 
 VERIFY_ADMINS: dict = load_json_file(VERIFY_ADMINS_FILE, {})
 VERIFY_DEV: set = set(load_json_file(VERIFY_DEV_FILE, []))
@@ -917,8 +911,6 @@ _OPERATION_QUEUE_NEXT_ID = 0
 OPERATION_QUEUE_MAX_RETRIES = 4
 OPERATION_QUEUE_MAX_BACKOFF_SECONDS = 30
 
-
-# ─────────────────────────── Чистые save-функции ─────────────────────────────
 
 def save_verify_admins():
     throttled_save_json_file(VERIFY_ADMINS_FILE, VERIFY_ADMINS, "verify_admins")
@@ -968,8 +960,6 @@ def save_role_perms():
 def save_clones():
     save_json_file(CLONES_FILE, CLONES)
 
-
-# ──────────────────── chat_bot_assignment helpers ────────────────────────────
 
 def assign_bot_to_chat(chat_id: int, bot_id: int, bot_username: str) -> bool:
     ts = int(time.time())
@@ -1054,8 +1044,6 @@ def reassign_bot_in_chat(chat_id: int, bot_id: int, bot_username: str) -> None:
     except Exception as e:
         print(f"[REASSIGN BOT] Error: {e}")
 
-
-# ──────────────────── guest_bots helpers ──────────────────────────────────────
 
 def _guest_modules_to_json(modules: list[str] | None) -> str:
     norm: list[str] = []
@@ -1397,8 +1385,6 @@ def set_guest_command_enabled(guest_bot_id: int, name: str, enabled: bool, user_
         return False
 
 
-# ──────────────────── log_channels helpers ───────────────────────────────────
-
 LOG_CHANNEL_ALL_EVENTS: frozenset[str] = frozenset([
     "ban", "unban", "mute", "unmute", "kick", "warn", "unwarn",
     "chat_closed", "chat_opened", "join", "leave",
@@ -1488,6 +1474,7 @@ def set_log_channel_event(chat_id: int, event: str, enabled: bool) -> bool:
 
 
 def send_log_event(chat_id: int, event: str, text: str, forward_from_chat_id: int | None = None, forward_message_id: int | None = None) -> bool:
+    from config import bot  # <-- ЛЕНИВЫЙ ИМПОРТ
     lc = get_log_channel(chat_id)
     if not lc or not lc.get("events", {}).get(event, True):
         return False
