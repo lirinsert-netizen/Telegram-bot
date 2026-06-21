@@ -175,6 +175,10 @@ def _log_mod_action(chat_id: int, event: str, actor_id: int, target_id: int,
 def _mod_get_chat(chat_id: int) -> dict:
     cid = str(chat_id)
     ch = MODERATION.get(cid)
+    
+    if ch and ch.get("_validated"):
+        return ch
+    
     if ch is None:
         ch = {
             "settings": {
@@ -412,6 +416,7 @@ def _mod_get_chat(chat_id: int) -> dict:
     ch["logs"].setdefault("warn", [])
     ch["logs"].setdefault("kick", [])
 
+    ch["_validated"] = True
     MODERATION[cid] = ch
     return ch
 

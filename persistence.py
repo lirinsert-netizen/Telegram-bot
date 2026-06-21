@@ -35,6 +35,7 @@ from config import (
 
 _DB_LOCK = threading.RLock()
 _DB_CONN: sqlite3.Connection | None = None
+_SQLITE_RO_TLS = threading.local()
 
 # ── Message-event buffer (per-message stats for time periods) ────────────────
 _MSG_EVENTS_BUFFER: list[tuple[int, int, int, Any]] = []
@@ -385,24 +386,27 @@ def get_sqlite_status() -> dict[str, Any]:
     return status
 
 
+def _get_ro_db_conn() -> sqlite3.Connection:
+    conn = getattr(_SQLITE_RO_TLS, "conn", None)
+    if conn is None:
+        # Независимое RO-соединение для каждого воркера!
+        conn = sqlite3.connect(SQLITE_DB_FILE, timeout=5.0)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        _SQLITE_RO_TLS.conn = conn
+    return conn
+
+
 def load_json_file(path, default):
     key = _db_key(path)
-    for attempt in range(2):
-        try:
-            with _DB_LOCK:
-                conn = _db_connect()
-                row = conn.execute(
-                    "SELECT payload_json FROM kv_store WHERE store_key = ?", (key,)
-                ).fetchone()
-            if row:
-                return json.loads(row[0])
-            break
-        except Exception:
-            _stats_increment("sqlite_errors")
-            if attempt == 0:
-                _reset_db_connection()
-                continue
-            break
+    try:
+        conn = _get_ro_db_conn()
+        row = conn.execute(
+            "SELECT payload_json FROM kv_store WHERE store_key = ?", (key,)
+        ).fetchone()
+        if row:
+            return json.loads(row[0])
+    except Exception:
+        _stats_increment("sqlite_errors")
 
     legacy = _legacy_json_load(path, default)
     try:
@@ -670,6 +674,7 @@ atexit.register(_shutdown_persistence)
 _TG_CACHE_LOCK = threading.Lock()
 _TG_MEMBER_CACHE: dict[tuple[int, int], tuple[float, Any]] = {}
 _TG_CHAT_CACHE: dict[str, tuple[float, Any]] = {}
+_TG_FETCH_PROMISES: dict[Any, threading.Event] = {}
 _CALLBACK_DEDUPE_LOCK = threading.Lock()
 _CALLBACK_DEDUPE: dict[tuple[int, str, int], float] = {}
 
@@ -712,28 +717,73 @@ def _tg_chat_cache_key(chat_ref: Any) -> str:
 def tg_get_chat(chat_ref: Any):
     key = _tg_chat_cache_key(chat_ref)
     now = time.monotonic()
+    
     with _TG_CACHE_LOCK:
         cached = _TG_CHAT_CACHE.get(key)
         if cached and (now - cached[0]) < TG_CACHE_CHAT_TTL:
             return cached[1]
+            
+        # Паттерн Single-Flight (Один в поле)
+        event = _TG_FETCH_PROMISES.get(key)
+        if event is None:
+            event = threading.Event()
+            _TG_FETCH_PROMISES[key] = event
+            is_leader = True
+        else:
+            is_leader = False
+
+    if not is_leader:
+        event.wait()  # Ждем, пока поток-лидер сходит в сеть
+        with _TG_CACHE_LOCK:
+            return _TG_CHAT_CACHE.get(key, (0, None))[1]
+
+    # Мы — поток-лидер, идем в сеть
     _stats_increment("tg_cache_chat_misses")
-    chat = bot.get_chat(chat_ref)
-    with _TG_CACHE_LOCK:
-        _TG_CHAT_CACHE[key] = (now, chat)
+    try:
+        chat = bot.get_chat(chat_ref)
+    finally:
+        with _TG_CACHE_LOCK:
+            if 'chat' in locals():
+                _TG_CHAT_CACHE[key] = (time.monotonic(), chat)
+            _TG_FETCH_PROMISES.pop(key, None)
+            event.set()  # Будим всех ждущих собратьев
+
     return chat
 
 
 def tg_get_chat_member(chat_id: int, user_id: int):
     key = (int(chat_id), int(user_id))
     now = time.monotonic()
+    
     with _TG_CACHE_LOCK:
         cached = _TG_MEMBER_CACHE.get(key)
         if cached and (now - cached[0]) < TG_CACHE_MEMBER_TTL:
             return cached[1]
+            
+        promise_key = f"m:{chat_id}:{user_id}"
+        event = _TG_FETCH_PROMISES.get(promise_key)
+        if event is None:
+            event = threading.Event()
+            _TG_FETCH_PROMISES[promise_key] = event
+            is_leader = True
+        else:
+            is_leader = False
+
+    if not is_leader:
+        event.wait()
+        with _TG_CACHE_LOCK:
+            return _TG_MEMBER_CACHE.get(key, (0, None))[1]
+
     _stats_increment("tg_cache_member_misses")
-    member = bot.get_chat_member(chat_id, user_id)
-    with _TG_CACHE_LOCK:
-        _TG_MEMBER_CACHE[key] = (now, member)
+    try:
+        member = bot.get_chat_member(chat_id, user_id)
+    finally:
+        with _TG_CACHE_LOCK:
+            if 'member' in locals():
+                _TG_MEMBER_CACHE[key] = (time.monotonic(), member)
+            _TG_FETCH_PROMISES.pop(promise_key, None)
+            event.set()
+
     return member
 
 
